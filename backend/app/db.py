@@ -76,6 +76,79 @@ CREATE INDEX IF NOT EXISTS idx_memory_change_log_source
 ALTER TABLE memory_change_log ADD COLUMN request_fingerprint TEXT;
 CREATE INDEX IF NOT EXISTS idx_memory_change_log_fingerprint
     ON memory_change_log(request_fingerprint);
+""",
+5: """
+CREATE TABLE IF NOT EXISTS memory_change_proposals (
+    id TEXT PRIMARY KEY,
+    proposal_type TEXT NOT NULL CHECK (proposal_type IN ('correction', 'update', 'invalidation', 'expiration')),
+    target_memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL,
+    proposed_memory_type TEXT NOT NULL CHECK (proposed_memory_type IN ('user_preference', 'relationship', 'event', 'goal', 'growth')),
+    proposed_content TEXT NOT NULL,
+    proposed_canonical_key TEXT NOT NULL,
+    evidence_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    correction_intent TEXT NOT NULL CHECK (correction_intent IN ('none', 'explicit_correction', 'long_term_change', 'temporary_experiment', 'ambiguous_change', 'coexisting_information')),
+    relation TEXT NOT NULL CHECK (relation IN ('conflict', 'potential_conflict', 'coexisting', 'unrelated', 'needs_review')),
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    evidence TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected', 'cancelled', 'expired')),
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_idempotency
+    ON memory_change_proposals(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_proposals_status_created
+    ON memory_change_proposals(status, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_memory_proposals_target
+    ON memory_change_proposals(target_memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_proposals_evidence
+    ON memory_change_proposals(evidence_message_id);
+CREATE TABLE IF NOT EXISTS memory_proposal_change_log (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL REFERENCES memory_change_proposals(id) ON DELETE CASCADE,
+    action TEXT NOT NULL CHECK (action IN ('created', 'accepted', 'rejected', 'cancelled', 'expired')),
+    old_status TEXT,
+    new_status TEXT NOT NULL,
+    reason TEXT,
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'system_rule', 'admin')),
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposal_log_idempotency
+    ON memory_proposal_change_log(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_proposal_log_proposal_created
+    ON memory_proposal_change_log(proposal_id, created_at, id);
+""",
+6: """
+ALTER TABLE memory_change_proposals ADD COLUMN application_status TEXT NOT NULL DEFAULT 'not_applied' CHECK (application_status IN ('not_applied', 'applied'));
+ALTER TABLE memory_change_proposals ADD COLUMN target_memory_updated_at TEXT;
+ALTER TABLE memory_change_proposals ADD COLUMN applied_at TEXT;
+ALTER TABLE memory_change_proposals ADD COLUMN applied_memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL;
+ALTER TABLE memory_change_proposals ADD COLUMN replacement_memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL;
+ALTER TABLE memory_change_log ADD COLUMN proposal_id TEXT REFERENCES memory_change_proposals(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_proposals_application_status
+    ON memory_change_proposals(application_status, status, created_at);
+CREATE TABLE IF NOT EXISTS memory_proposal_application_log (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES memory_change_proposals(id) ON DELETE CASCADE,
+    application_status TEXT NOT NULL CHECK (application_status IN ('applied')),
+    applied_memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL,
+    replacement_memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL,
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'system_rule', 'admin')),
+    reason TEXT,
+    idempotency_key TEXT,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposal_application_idempotency
+    ON memory_proposal_application_log(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_proposal_application_created
+    ON memory_proposal_application_log(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_memory_change_log_proposal
+    ON memory_change_log(proposal_id, created_at, id);
 """}
 
 
@@ -91,8 +164,16 @@ class Database:
             current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
             for version, sql in sorted(MIGRATIONS.items()):
                 if version > current:
-                    connection.executescript(sql)
-                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))", (version,))
+                    # Keep each migration and its marker atomic. If any DDL or
+                    # the marker insert fails, the connection context rolls
+                    # back the whole migration instead of leaving a half-schema.
+                    connection.executescript(
+                        "BEGIN;\n"
+                        + sql
+                        + "\nINSERT INTO schema_migrations(version, applied_at) VALUES ("
+                        + str(version)
+                        + ", datetime('now'));\nCOMMIT;"
+                    )
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

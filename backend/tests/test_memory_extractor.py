@@ -2,7 +2,7 @@ import pytest
 
 from app.chat_service import ChatService
 from app.db import Database
-from app.memory import DeterministicMemoryExtractor, MemoryRepository, MemoryService, MemoryType
+from app.memory import CorrectionIntent, DeterministicMemoryExtractor, MemoryRepository, MemoryService, MemoryType
 from app.repositories import ConversationRepository, MessageRepository
 
 
@@ -69,6 +69,37 @@ def test_correction_is_marked_without_guessing_replacement(extractor):
     assert len(candidates) == 1
     assert candidates[0].evidence_type.value == "correction"
     assert candidates[0].confidence == 0.95
+    assert candidates[0].intent is CorrectionIntent.EXPLICIT_CORRECTION
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("我现在更喜欢 Rust 了。", CorrectionIntent.LONG_TERM_CHANGE),
+    ("这周我想试试 Rust。", CorrectionIntent.TEMPORARY_EXPERIMENT),
+    ("Rust 好像也不错。", CorrectionIntent.AMBIGUOUS_CHANGE),
+    ("我喜欢 Python，也喜欢 Rust。", CorrectionIntent.COEXISTING_INFORMATION),
+    ("我喜欢 Python。", CorrectionIntent.NONE),
+])
+def test_correction_intent_categories_are_deterministic(extractor, text, expected):
+    candidates = extractor.extract_text(text)
+    assert candidates
+    assert {candidate.intent for candidate in candidates} == {expected}
+
+
+def test_intent_priority_prefers_explicit_correction_and_temporary_experiment(extractor):
+    assert extractor.classify_intent("我之前说错了，这周我想试试 Rust。") is CorrectionIntent.EXPLICIT_CORRECTION
+    assert extractor.classify_intent("今天我已经改成先看代码。") is CorrectionIntent.TEMPORARY_EXPERIMENT
+
+
+@pytest.mark.asyncio
+async def test_special_intent_candidates_are_not_persisted_as_active_memory(memory_chat):
+    _, conversations, messages, memory_service, _ = memory_chat
+    conversation = conversations.create()
+    user_message = messages.add(conversation["id"], "user", "我之前说错了，我其实更喜欢 Rust。")
+    candidate = DeterministicMemoryExtractor().extract(user_message)[0]
+
+    assert candidate.intent is CorrectionIntent.EXPLICIT_CORRECTION
+    assert memory_service.persist_candidate(candidate, user_message) is None
+    assert memory_service.list_memories() == []
 
 
 def test_non_user_message_is_never_extracted(extractor):

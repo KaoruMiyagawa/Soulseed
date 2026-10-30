@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.db import Database
+import app.db as db_module
 from app.memory import (
     EvidenceType,
     MemoryCreate,
@@ -35,7 +36,7 @@ def test_new_database_migration_creates_memory_tables(tmp_path):
     with database.connection() as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"memory_items", "memory_sources"}.issubset(tables)
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
 
 
 def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path):
@@ -52,7 +53,7 @@ def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path
     with before.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == conversation_count
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == message_count
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
 
 
 def test_migration_is_idempotent(memory_context):
@@ -60,8 +61,22 @@ def test_migration_is_idempotent(memory_context):
     database.initialize()
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'").fetchone()[0] == 1
+
+
+def test_failed_migration_rolls_back_schema_and_marker(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "failed-migration.db"))
+    database.initialize()
+    broken_version = max(db_module.MIGRATIONS) + 1
+    monkeypatch.setitem(db_module.MIGRATIONS, broken_version, "CREATE TABLE migration_should_rollback (id TEXT); SELECT * FROM missing_migration_table;")
+
+    with pytest.raises(Exception):
+        database.initialize()
+
+    with database.connection() as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_should_rollback'").fetchone()[0] == 0
 
 
 def test_create_read_update_memory(memory_context):

@@ -31,6 +31,15 @@ class EvidenceType(StrEnum):
     CORRECTION = "correction"
 
 
+class CorrectionIntent(StrEnum):
+    NONE = "none"
+    EXPLICIT_CORRECTION = "explicit_correction"
+    LONG_TERM_CHANGE = "long_term_change"
+    TEMPORARY_EXPERIMENT = "temporary_experiment"
+    AMBIGUOUS_CHANGE = "ambiguous_change"
+    COEXISTING_INFORMATION = "coexisting_information"
+
+
 class MemoryChangeAction(StrEnum):
     CREATED = "created"
     UPDATED = "updated"
@@ -45,6 +54,34 @@ class MemoryActorType(StrEnum):
     USER = "user"
     SYSTEM_RULE = "system_rule"
     ADMIN = "admin"
+
+
+class ProposalType(StrEnum):
+    CORRECTION = "correction"
+    UPDATE = "update"
+    INVALIDATION = "invalidation"
+    EXPIRATION = "expiration"
+
+
+class ProposalStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class ProposalApplicationStatus(StrEnum):
+    NOT_APPLIED = "not_applied"
+    APPLIED = "applied"
+
+
+class ProposalChangeAction(StrEnum):
+    CREATED = "created"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -100,6 +137,61 @@ class MemoryChangeLog:
     new_confidence: float | None
     reason: str | None
     source_message_id: str | None
+    actor_type: MemoryActorType
+    idempotency_key: str | None
+    request_fingerprint: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class MemoryChangeProposal:
+    id: str
+    proposal_type: ProposalType
+    target_memory_id: str | None
+    proposed_memory_type: MemoryType
+    proposed_content: str
+    proposed_canonical_key: str
+    evidence_message_id: str | None
+    correction_intent: CorrectionIntent
+    relation: str
+    confidence: float
+    evidence: str
+    status: ProposalStatus
+    idempotency_key: str | None
+    request_fingerprint: str | None
+    created_at: str
+    resolved_at: str | None
+    resolution_reason: str | None
+    application_status: ProposalApplicationStatus = ProposalApplicationStatus.NOT_APPLIED
+    target_memory_updated_at: str | None = None
+    applied_at: str | None = None
+    applied_memory_id: str | None = None
+    replacement_memory_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ProposalCreate:
+    proposal_type: ProposalType | str
+    target_memory_id: str | None
+    proposed_memory_type: MemoryType | str
+    proposed_content: str
+    proposed_canonical_key: str
+    evidence_message_id: str
+    correction_intent: CorrectionIntent | str
+    relation: str
+    confidence: float
+    evidence: str
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ProposalChangeLog:
+    id: str
+    proposal_id: str
+    action: ProposalChangeAction
+    old_status: ProposalStatus | None
+    new_status: ProposalStatus
+    reason: str | None
     actor_type: MemoryActorType
     idempotency_key: str | None
     request_fingerprint: str | None

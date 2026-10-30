@@ -1,0 +1,31 @@
+from .models import MemoryActorType, MemoryChangeProposal, ProposalChangeLog, ProposalCreate, ProposalStatus
+from .proposal_repositories import MemoryProposalRepository
+
+
+class MemoryProposalService:
+    def __init__(self, repository: MemoryProposalRepository):
+        self.repository = repository
+
+    def create_proposal(self, proposal: ProposalCreate, *, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE) -> MemoryChangeProposal:
+        return self.repository.create(proposal, actor_type=actor_type)
+
+    def get_proposal(self, proposal_id: str) -> MemoryChangeProposal:
+        return self.repository.get(proposal_id)
+
+    def list_proposals(self, *, status: ProposalStatus | str | None = None, limit: int = 50, offset: int = 0) -> list[MemoryChangeProposal]:
+        return self.repository.list(status=status, limit=limit, offset=offset)
+
+    def accept_proposal(self, proposal_id: str, *, reason: str | None = None, actor_type: MemoryActorType | str = MemoryActorType.USER, idempotency_key: str | None = None) -> MemoryChangeProposal:
+        return self.repository.transition(proposal_id, ProposalStatus.ACCEPTED, reason=reason, actor_type=actor_type, idempotency_key=idempotency_key)
+
+    def reject_proposal(self, proposal_id: str, *, reason: str | None = None, actor_type: MemoryActorType | str = MemoryActorType.USER, idempotency_key: str | None = None) -> MemoryChangeProposal:
+        return self.repository.transition(proposal_id, ProposalStatus.REJECTED, reason=reason, actor_type=actor_type, idempotency_key=idempotency_key)
+
+    def cancel_proposal(self, proposal_id: str, *, reason: str | None = None, actor_type: MemoryActorType | str = MemoryActorType.USER, idempotency_key: str | None = None) -> MemoryChangeProposal:
+        return self.repository.transition(proposal_id, ProposalStatus.CANCELLED, reason=reason, actor_type=actor_type, idempotency_key=idempotency_key)
+
+    def expire_proposal(self, proposal_id: str, *, reason: str | None = None, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE, idempotency_key: str | None = None) -> MemoryChangeProposal:
+        return self.repository.transition(proposal_id, ProposalStatus.EXPIRED, reason=reason, actor_type=actor_type, idempotency_key=idempotency_key)
+
+    def list_changes(self, proposal_id: str, *, limit: int = 100, offset: int = 0) -> list[ProposalChangeLog]:
+        return self.repository.list_changes(proposal_id, limit=limit, offset=offset)

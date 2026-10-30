@@ -1,4 +1,4 @@
-from .models import EvidenceType, MemoryActorType, MemoryChangeLog, MemoryCreate, MemoryItem, MemoryStatus, MemoryType, MemoryUpdate, SourceRole
+from .models import CorrectionIntent, EvidenceType, MemoryActorType, MemoryChangeLog, MemoryCreate, MemoryItem, MemoryStatus, MemoryType, MemoryUpdate, SourceRole
 from .repositories import DuplicateMemoryError, MemoryRepository, MemorySource
 
 
@@ -42,10 +42,12 @@ class MemoryService:
     def list_sources(self, memory_id: str) -> list[MemorySource]:
         return self.repository.list_sources(memory_id)
 
-    def persist_candidate(self, candidate, source_message: dict) -> MemoryItem:
+    def persist_candidate(self, candidate, source_message: dict) -> MemoryItem | None:
         """Persist one extractor candidate and attach its real source message."""
         if source_message.get("role") != SourceRole.USER.value:
             raise ValueError("记忆候选只能关联 user 消息")
+        if candidate.intent is not CorrectionIntent.NONE:
+            return None
         try:
             memory = self.create_memory(
                 MemoryCreate(
