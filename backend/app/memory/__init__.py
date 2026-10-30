@@ -1,4 +1,7 @@
 from .models import (
+    MemoryActorType,
+    MemoryChangeAction,
+    MemoryChangeLog,
     EvidenceType,
     MemoryCreate,
     MemoryItem,
@@ -10,15 +13,19 @@ from .models import (
 from .extractor import DeterministicMemoryExtractor, MemoryCandidate
 from .context_builder import MemoryContextBuilder
 from .retriever import MemoryMatch, MemoryRetriever
-from .repositories import MemoryRepository, MemorySource
+from .repositories import IdempotencyConflictError, MemoryRepository, MemorySource
 from .service import MemoryService
 
 __all__ = [
     "EvidenceType",
     "DeterministicMemoryExtractor",
     "MemoryCreate",
+    "MemoryActorType",
+    "MemoryChangeAction",
+    "MemoryChangeLog",
     "MemoryCandidate",
     "MemoryContextBuilder",
+    "IdempotencyConflictError",
     "MemoryMatch",
     "MemoryRetriever",
     "MemoryItem",

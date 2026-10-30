@@ -31,6 +31,22 @@ class EvidenceType(StrEnum):
     CORRECTION = "correction"
 
 
+class MemoryChangeAction(StrEnum):
+    CREATED = "created"
+    UPDATED = "updated"
+    INVALIDATED = "invalidated"
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+    SOFT_DELETED = "soft_deleted"
+    PERMANENTLY_DELETED = "permanently_deleted"
+
+
+class MemoryActorType(StrEnum):
+    USER = "user"
+    SYSTEM_RULE = "system_rule"
+    ADMIN = "admin"
+
+
 @dataclass(frozen=True)
 class MemoryCreate:
     memory_type: MemoryType | str
@@ -65,6 +81,29 @@ class MemoryItem:
     created_at: str
     updated_at: str
     last_accessed_at: str | None
+
+
+@dataclass(frozen=True)
+class MemoryChangeLog:
+    id: str
+    memory_id: str | None
+    action: MemoryChangeAction
+    old_content: str | None
+    new_content: str | None
+    old_canonical_key: str | None
+    new_canonical_key: str | None
+    old_status: MemoryStatus | None
+    new_status: MemoryStatus | None
+    old_importance: float | None
+    new_importance: float | None
+    old_confidence: float | None
+    new_confidence: float | None
+    reason: str | None
+    source_message_id: str | None
+    actor_type: MemoryActorType
+    idempotency_key: str | None
+    request_fingerprint: str | None
+    created_at: str
 
 
 def normalize_canonical_key(value: str) -> str:

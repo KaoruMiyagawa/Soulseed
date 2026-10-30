@@ -35,7 +35,7 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 4
 
 
 @pytest.mark.asyncio

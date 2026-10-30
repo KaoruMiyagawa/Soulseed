@@ -35,7 +35,7 @@ def test_new_database_migration_creates_memory_tables(tmp_path):
     with database.connection() as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"memory_items", "memory_sources"}.issubset(tables)
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
 
 
 def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path):
@@ -52,7 +52,7 @@ def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path
     with before.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == conversation_count
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == message_count
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
 
 
 def test_migration_is_idempotent(memory_context):
@@ -60,7 +60,7 @@ def test_migration_is_idempotent(memory_context):
     database.initialize()
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 4
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'").fetchone()[0] == 1
 
 

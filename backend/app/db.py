@@ -43,6 +43,39 @@ CREATE INDEX IF NOT EXISTS idx_memory_sources_memory
     ON memory_sources(memory_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memory_sources_message
     ON memory_sources(message_id);
+""",
+3: """
+CREATE TABLE IF NOT EXISTS memory_change_log (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL,
+    action TEXT NOT NULL CHECK (action IN ('created', 'updated', 'invalidated', 'expired', 'superseded', 'soft_deleted', 'permanently_deleted')),
+    old_content TEXT,
+    new_content TEXT,
+    old_canonical_key TEXT,
+    new_canonical_key TEXT,
+    old_status TEXT,
+    new_status TEXT,
+    old_importance REAL,
+    new_importance REAL,
+    old_confidence REAL,
+    new_confidence REAL,
+    reason TEXT,
+    source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'system_rule', 'admin')),
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_change_log_idempotency
+    ON memory_change_log(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_change_log_memory_created
+    ON memory_change_log(memory_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_memory_change_log_source
+    ON memory_change_log(source_message_id);
+""",
+4: """
+ALTER TABLE memory_change_log ADD COLUMN request_fingerprint TEXT;
+CREATE INDEX IF NOT EXISTS idx_memory_change_log_fingerprint
+    ON memory_change_log(request_fingerprint);
 """}
 
 
