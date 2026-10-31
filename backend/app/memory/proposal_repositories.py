@@ -76,30 +76,65 @@ class MemoryProposalRepository:
             "expected_target_memory_updated_at": proposal.expected_target_memory_updated_at,
         })
         proposal_id, timestamp = str(uuid4()), now_iso()
-        with self.database.connection() as db:
-            existing_log = self._log_by_idempotency(db, proposal.idempotency_key)
-            if existing_log is not None:
-                self._validate_replay(existing_log, ProposalChangeAction.CREATED, None, fingerprint)
-                return ProposalCreationResult(
-                    proposal=self._proposal_from_row(self._proposal_row(db, existing_log.proposal_id)),
-                    created=False,
+        try:
+            with self.database.connection() as db:
+                existing_log = self._log_by_idempotency(db, proposal.idempotency_key)
+                if existing_log is not None:
+                    self._validate_replay(existing_log, ProposalChangeAction.CREATED, None, fingerprint)
+                    return ProposalCreationResult(
+                        proposal=self._proposal_from_row(self._proposal_row(db, existing_log.proposal_id)),
+                        created=False,
+                    )
+                target_memory_updated_at = self._validate_references(
+                    db,
+                    proposal.target_memory_id,
+                    proposal.evidence_message_id,
+                    expected_target_memory_updated_at=proposal.expected_target_memory_updated_at,
                 )
-            target_memory_updated_at = self._validate_references(
-                db,
-                proposal.target_memory_id,
-                proposal.evidence_message_id,
-                expected_target_memory_updated_at=proposal.expected_target_memory_updated_at,
-            )
-            db.execute(
-                "INSERT INTO memory_change_proposals (id, proposal_type, target_memory_id, proposed_memory_type, proposed_content, proposed_canonical_key, evidence_message_id, correction_intent, relation, confidence, evidence, status, idempotency_key, request_fingerprint, created_at, resolved_at, resolution_reason, target_memory_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (proposal_id, proposal_type.value, proposal.target_memory_id, memory_type.value, content, canonical_key, proposal.evidence_message_id, intent.value, proposal.relation, confidence, evidence, ProposalStatus.PENDING.value, proposal.idempotency_key, fingerprint, timestamp, None, None, target_memory_updated_at),
-            )
-            self._insert_log(db, proposal_id, ProposalChangeAction.CREATED, None, ProposalStatus.PENDING, None, actor_type, proposal.idempotency_key, fingerprint, timestamp)
+                db.execute(
+                    "INSERT INTO memory_change_proposals (id, proposal_type, target_memory_id, proposed_memory_type, proposed_content, proposed_canonical_key, evidence_message_id, correction_intent, relation, confidence, evidence, status, idempotency_key, request_fingerprint, created_at, resolved_at, resolution_reason, target_memory_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (proposal_id, proposal_type.value, proposal.target_memory_id, memory_type.value, content, canonical_key, proposal.evidence_message_id, intent.value, proposal.relation, confidence, evidence, ProposalStatus.PENDING.value, proposal.idempotency_key, fingerprint, timestamp, None, None, target_memory_updated_at),
+                )
+                self._insert_log(db, proposal_id, ProposalChangeAction.CREATED, None, ProposalStatus.PENDING, None, actor_type, proposal.idempotency_key, fingerprint, timestamp)
+        except sqlite3.IntegrityError as exc:
+            if not self._is_proposal_idempotency_conflict(exc, proposal.idempotency_key):
+                raise
+            return self._replay_after_idempotency_conflict(proposal.idempotency_key, fingerprint, exc)
         return ProposalCreationResult(proposal=self.get(proposal_id), created=True)
+
+    @staticmethod
+    def _is_proposal_idempotency_conflict(exc: sqlite3.IntegrityError, idempotency_key: str | None) -> bool:
+        if not idempotency_key:
+            return False
+        message = str(exc)
+        return (
+            "memory_change_proposals.idempotency_key" in message
+            or "memory_proposal_change_log.idempotency_key" in message
+        )
+
+    def _replay_after_idempotency_conflict(self, idempotency_key: str, fingerprint: str, original: sqlite3.IntegrityError) -> ProposalCreationResult:
+        with self.database.connection() as db:
+            existing_log = self._log_by_idempotency(db, idempotency_key)
+            if existing_log is None:
+                raise original
+            self._validate_replay(existing_log, ProposalChangeAction.CREATED, None, fingerprint)
+            return ProposalCreationResult(
+                proposal=self._proposal_from_row(self._proposal_row(db, existing_log.proposal_id)),
+                created=False,
+            )
 
     def get(self, proposal_id: str) -> MemoryChangeProposal:
         with self.database.connection() as db:
             return self._proposal_from_row(self._proposal_row(db, proposal_id))
+
+    def find_by_source_and_candidate(self, evidence_message_id: str, proposed_memory_type: MemoryType | str, proposed_content: str, proposed_canonical_key: str) -> list[MemoryChangeProposal]:
+        memory_type = MemoryType(proposed_memory_type).value
+        with self.database.connection() as db:
+            rows = db.execute(
+                "SELECT * FROM memory_change_proposals WHERE evidence_message_id = ? AND proposed_memory_type = ? AND proposed_content = ? AND proposed_canonical_key = ? ORDER BY created_at, id",
+                (evidence_message_id, memory_type, proposed_content, proposed_canonical_key),
+            ).fetchall()
+        return [self._proposal_from_row(row) for row in rows]
 
     def list(self, *, status: ProposalStatus | str | None = None, limit: int = 50, offset: int = 0) -> list[MemoryChangeProposal]:
         if not 1 <= limit <= 1000:

@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from threading import Barrier, Lock
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -159,3 +161,63 @@ def test_proposal_is_not_returned_by_memory_retriever(proposal_context):
     _, memory_service, service, _, user_message, _ = proposal_context
     service.create_proposal(proposal(user_message["id"]))
     assert MemoryRetriever(memory_service).retrieve("雅思 7 分") == []
+
+
+def _synchronize_first_idempotency_reads(monkeypatch, key):
+    repository = MemoryProposalRepository
+    original = repository._log_by_idempotency
+    barrier = Barrier(2, timeout=5)
+    lock = Lock()
+    calls = {"count": 0}
+
+    def synchronized(db, idempotency_key):
+        result = original(db, idempotency_key)
+        if idempotency_key == key:
+            with lock:
+                calls["count"] += 1
+                should_wait = calls["count"] <= 2
+            if should_wait:
+                barrier.wait()
+        return result
+
+    monkeypatch.setattr(repository, "_log_by_idempotency", staticmethod(synchronized))
+
+
+def test_concurrent_same_idempotency_key_replays_existing_proposal(proposal_context, monkeypatch):
+    database, _, service, _, user_message, _ = proposal_context
+    key = "proposal:concurrent:same"
+    value = proposal(user_message["id"], key=key)
+    _synchronize_first_idempotency_reads(monkeypatch, key)
+
+    def create_once():
+        return MemoryProposalService(MemoryProposalRepository(database)).create_proposal_with_outcome(value)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: create_once(), range(2)))
+
+    assert sorted(result.created for result in results) == [False, True]
+    assert len({result.proposal.id for result in results}) == 1
+    assert len(service.list_proposals()) == 1
+    assert len(service.list_changes(results[0].proposal.id)) == 1
+
+
+def test_concurrent_same_idempotency_key_with_different_fingerprint_conflicts(proposal_context, monkeypatch):
+    database, _, service, _, user_message, _ = proposal_context
+    key = "proposal:concurrent:conflict"
+    first = proposal(user_message["id"], key=key, content="我的目标是雅思 7 分。")
+    second = proposal(user_message["id"], key=key, content="我的目标是雅思 8 分。")
+    _synchronize_first_idempotency_reads(monkeypatch, key)
+
+    def create_once(value):
+        try:
+            return ("ok", MemoryProposalService(MemoryProposalRepository(database)).create_proposal_with_outcome(value))
+        except IdempotencyConflictError:
+            return ("conflict", None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create_once, (first, second)))
+
+    assert sorted(result[0] for result in results) == ["conflict", "ok"]
+    assert len(service.list_proposals()) == 1
+    proposal_id = next(result[1].proposal.id for result in results if result[1] is not None)
+    assert len(service.list_changes(proposal_id)) == 1

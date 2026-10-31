@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Iterable
@@ -11,6 +12,8 @@ from .models import CorrectionIntent, MemoryActorType, ProposalApplicationStatus
 from .proposal_service import MemoryProposalService
 from .proposal_repositories import ProposalTargetInactiveError, ProposalTargetVersionConflictError
 from .service import MemoryService
+
+logger = logging.getLogger(__name__)
 
 
 class CorrectionFlowStatus(StrEnum):
@@ -85,7 +88,14 @@ class CorrectionFlowService:
         candidates: Iterable[MemoryCandidate],
     ) -> tuple[CorrectionFlowResult, ...]:
         """Process already-extracted candidates in input order."""
-        return tuple(self.process_candidate(user_message, candidate) for candidate in candidates)
+        results: list[CorrectionFlowResult] = []
+        for index, candidate in enumerate(candidates):
+            try:
+                results.append(self.process_candidate(user_message, candidate))
+            except Exception as exc:
+                logger.exception("纠正候选处理发生未预期异常 candidate_index=%s", index)
+                results.append(self._failure("纠正候选处理失败", "candidate_processing_failed", exc))
+        return tuple(results)
 
     def process_candidate(
         self,
@@ -95,6 +105,34 @@ class CorrectionFlowService:
         """Process one candidate and return a public, non-database result."""
         if candidate.intent is CorrectionIntent.NONE:
             return self._no_action("候选没有纠正意图")
+
+        message_id = user_message.get("id")
+        replay_lookup = getattr(self.proposal_service, "find_by_source_and_candidate", None)
+        if candidate.intent in self._proposal_intents and callable(replay_lookup) and user_message.get("role") == "user" and message_id:
+            try:
+                previous = replay_lookup(
+                    message_id,
+                    candidate.memory_type,
+                    candidate.content,
+                    candidate.canonical_key,
+                )
+            except Exception as exc:
+                return self._failure("查询历史纠正 Proposal 失败", "proposal_replay_lookup_failed", exc)
+            if len(previous) == 1 and previous[0].target_memory_id is not None:
+                existing = previous[0]
+                summary = CorrectionProposalSummary(
+                    proposal_id=existing.id,
+                    target_memory_id=existing.target_memory_id,
+                    relation=MemoryRelation(existing.relation),
+                    confidence=existing.confidence,
+                    evidence=(existing.evidence,),
+                )
+                return self._replayed_result(existing, summary)
+            if len(previous) > 1:
+                return self._clarification(
+                    "同一来源消息已有多个纠正 Proposal，不能自动选择历史目标",
+                    tuple(f"历史 Proposal：{proposal.id}" for proposal in previous),
+                )
 
         try:
             memories = self.memory_service.list_memories(
@@ -173,7 +211,6 @@ class CorrectionFlowService:
                 "target_changed_during_detection",
             )
 
-        message_id = user_message.get("id")
         if user_message.get("role") != "user" or not message_id:
             return self._failure(
                 "Proposal 来源必须是已经持久化的 user 消息",

@@ -8,7 +8,7 @@ from .chat_service import ChatService
 from .config import get_settings
 from .db import Database
 from .model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
-from .memory import DeterministicMemoryExtractor, MemoryContextBuilder, MemoryRepository, MemoryRetriever, MemoryService
+from .memory import CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
 from .persona import resolve_system_prompt
 from .repositories import ConversationRepository, MessageRepository
 
@@ -26,6 +26,8 @@ database = Database(settings.database_path)
 conversations = ConversationRepository(database)
 messages = MessageRepository(database)
 memory_service = MemoryService(MemoryRepository(database))
+proposal_service = MemoryProposalService(MemoryProposalRepository(database))
+correction_flow = CorrectionFlowService(memory_service, proposal_service)
 memory_retriever = MemoryRetriever(memory_service)
 chat = ChatService(
     conversations,
@@ -40,6 +42,7 @@ chat = ChatService(
         max_items=settings.memory_context_max_items,
         max_item_chars=settings.memory_item_max_chars,
     ),
+    correction_flow=correction_flow,
 )
 
 

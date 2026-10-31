@@ -28,6 +28,7 @@ async def test_chat_persists_user_and_assistant_messages(repositories):
     conversation = conversations.create()
     result = await ChatService(conversations, messages, FakeModel(), assemble_system_prompt()).send(conversation["id"], "你好")
     assert result["content"] == "收到。"
+    assert result["correction"] == {"status": "no_action", "items": []}
     assert [m["role"] for m in messages.list_for_conversation(conversation["id"])] == ["user", "assistant"]
 
 

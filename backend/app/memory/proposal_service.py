@@ -1,4 +1,4 @@
-from .models import MemoryActorType, MemoryChangeProposal, ProposalChangeLog, ProposalCreate, ProposalCreationResult, ProposalStatus
+from .models import MemoryActorType, MemoryChangeProposal, MemoryType, ProposalChangeLog, ProposalCreate, ProposalCreationResult, ProposalStatus
 from .proposal_repositories import MemoryProposalRepository
 
 
@@ -14,6 +14,9 @@ class MemoryProposalService:
 
     def get_proposal(self, proposal_id: str) -> MemoryChangeProposal:
         return self.repository.get(proposal_id)
+
+    def find_by_source_and_candidate(self, evidence_message_id: str, proposed_memory_type: MemoryType | str, proposed_content: str, proposed_canonical_key: str) -> list[MemoryChangeProposal]:
+        return self.repository.find_by_source_and_candidate(evidence_message_id, proposed_memory_type, proposed_content, proposed_canonical_key)
 
     def list_proposals(self, *, status: ProposalStatus | str | None = None, limit: int = 50, offset: int = 0) -> list[MemoryChangeProposal]:
         return self.repository.list(status=status, limit=limit, offset=offset)

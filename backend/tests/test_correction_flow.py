@@ -7,6 +7,7 @@ from app.memory import (
     CorrectionIntent,
     DeterministicMemoryExtractor,
     EvidenceType,
+    MemoryCorrectionService,
     MemoryCreate,
     MemoryCandidate,
     MemoryProposalRepository,
@@ -408,3 +409,53 @@ def test_inactive_memories_are_not_targets(flow_context):
     assert result.status is CorrectionFlowStatus.NO_ACTION
     assert proposal_service.list_proposals() == []
     assert memory_service.get_memory(old.id, include_inactive=True).status is MemoryStatus.INVALID
+
+
+def test_process_isolates_unexpected_candidate_failure_and_preserves_order(flow_context, monkeypatch):
+    _, _, messages, memory_service, proposal_service, flow, conversation = flow_context
+    add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")
+    add_memory(memory_service, MemoryType.USER_PREFERENCE, "我喜欢 Python。", "preference:python")
+    message = add_user_message(messages, conversation, "组合纠正")
+    first = candidate("我之前说错了，我的目标是雅思 7 分。")
+    second = candidate("我之前说错了，我喜欢 Go。")
+    third = candidate("我之前说错了，我喜欢 Rust。")
+    original = flow.process_candidate
+
+    def process_one(user_message, current):
+        if current is second:
+            raise RuntimeError("synthetic candidate failure")
+        return original(user_message, current)
+
+    monkeypatch.setattr(flow, "process_candidate", process_one)
+    results = flow.process(message, [first, second, third])
+
+    assert len(results) == 3
+    assert [result.status for result in results] == [
+        CorrectionFlowStatus.PROPOSAL_CREATED,
+        CorrectionFlowStatus.PROCESSING_FAILED,
+        CorrectionFlowStatus.PROPOSAL_CREATED,
+    ]
+    assert results[0].proposal is not None
+    assert results[2].proposal is not None
+    assert results[0].proposal.proposal_id != results[2].proposal.proposal_id
+    assert len(proposal_service.list_proposals()) == 2
+
+
+def test_applied_proposal_replay_returns_applied_without_new_proposal(flow_context):
+    database, _, messages, memory_service, proposal_service, flow, conversation = flow_context
+    old = add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")
+    message = add_user_message(messages, conversation, "我之前说错了，我的目标是雅思 7 分。")
+    extracted = candidate(message["content"])
+
+    created = flow.process(message, [extracted])[0]
+    proposal_id = created.proposal.proposal_id
+    proposal_service.accept_proposal(proposal_id)
+    MemoryCorrectionService(database).apply_proposal(proposal_id)
+
+    replay = flow.process(message, [extracted])[0]
+
+    assert replay.status is CorrectionFlowStatus.PROPOSAL_APPLIED
+    assert replay.proposal.proposal_id == proposal_id
+    assert len(proposal_service.list_proposals()) == 1
+    assert len(proposal_service.list_changes(proposal_id)) == 2
+    assert memory_service.get_memory(old.id, include_inactive=True).status is MemoryStatus.SUPERSEDED
