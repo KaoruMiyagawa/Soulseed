@@ -6,6 +6,7 @@ from .models import (
     ProposalChangeAction,
     ProposalChangeLog,
     ProposalCreate,
+    ProposalCreationResult,
     ProposalApplicationStatus,
     ProposalStatus,
     ProposalType,
@@ -24,9 +25,10 @@ from .retriever import MemoryMatch, MemoryRetriever
 from .repositories import IdempotencyConflictError, MemoryRepository, MemorySource
 from .service import MemoryService
 from .conflict_detector import MemoryConflictDetector, MemoryConflictResult, MemoryRelation, RecommendedAction
-from .proposal_repositories import MemoryProposalRepository, ProposalNotFoundError, ProposalStateError
+from .proposal_repositories import MemoryProposalRepository, ProposalNotFoundError, ProposalStateError, ProposalTargetInactiveError, ProposalTargetVersionConflictError
 from .proposal_service import MemoryProposalService
 from .correction_service import CorrectionApplicationResult, MemoryCorrectionService, ProposalApplicationError
+from .correction_flow_service import CorrectionFlowResult, CorrectionFlowStatus, CorrectionFlowService, CorrectionProposalSummary
 
 __all__ = [
     "EvidenceType",
@@ -40,6 +42,7 @@ __all__ = [
     "ProposalChangeAction",
     "ProposalChangeLog",
     "ProposalCreate",
+    "ProposalCreationResult",
     "ProposalApplicationStatus",
     "ProposalStatus",
     "ProposalType",
@@ -60,8 +63,14 @@ __all__ = [
     "MemoryCorrectionService",
     "CorrectionApplicationResult",
     "ProposalApplicationError",
+    "CorrectionFlowResult",
+    "CorrectionFlowStatus",
+    "CorrectionFlowService",
+    "CorrectionProposalSummary",
     "ProposalNotFoundError",
     "ProposalStateError",
+    "ProposalTargetInactiveError",
+    "ProposalTargetVersionConflictError",
     "MemorySource",
     "MemoryStatus",
     "MemoryType",

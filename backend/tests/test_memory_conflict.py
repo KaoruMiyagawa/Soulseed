@@ -4,7 +4,9 @@ from app.db import Database
 from app.memory import (
     CorrectionIntent,
     DeterministicMemoryExtractor,
+    EvidenceType,
     MemoryConflictDetector,
+    MemoryCandidate,
     MemoryItem,
     MemoryRelation,
     MemoryStatus,
@@ -24,6 +26,19 @@ def candidate(text):
     extracted = DeterministicMemoryExtractor().extract_text(text)
     assert extracted, text
     return extracted[0]
+
+
+def long_term_candidate(content, memory_type):
+    return MemoryCandidate(
+        memory_type=memory_type,
+        content=content,
+        canonical_key=f"{memory_type.value}:candidate",
+        importance=0.7,
+        confidence=0.9,
+        evidence_type=EvidenceType.EXPLICIT_FACT,
+        excerpt=content,
+        intent=CorrectionIntent.LONG_TERM_CHANGE,
+    )
 
 
 def test_explicit_correction_matches_one_goal():
@@ -126,3 +141,50 @@ def test_detector_does_not_write_database(tmp_path):
     assert result
     assert service.get_memory(memory.id).status is MemoryStatus.ACTIVE
     assert service.list_change_log() == before
+
+
+def test_long_term_learning_objects_are_not_treated_as_same_attribute():
+    result = MemoryConflictDetector().detect(
+        long_term_candidate("我现在已经改为学习 Rust。", MemoryType.GROWTH),
+        [make_memory("old", "我正在学习 C++。", memory_type=MemoryType.GROWTH)],
+    )
+
+    assert len(result) == 1
+    assert result[0].same_slot is True
+    assert result[0].same_attribute is False
+    assert result[0].relation is MemoryRelation.NEEDS_REVIEW
+    assert result[0].recommended_action is RecommendedAction.REQUEST_CONFIRMATION
+
+
+def test_long_term_replacement_of_same_preference_attribute_is_proposable():
+    result = MemoryConflictDetector().detect(
+        long_term_candidate("我已经永久换成 Linux 作为主要开发环境。", MemoryType.USER_PREFERENCE),
+        [make_memory("old", "我主要使用 Windows 作为开发环境。", memory_type=MemoryType.USER_PREFERENCE)],
+    )
+
+    assert len(result) == 1
+    assert result[0].same_attribute is True
+    assert result[0].explicit_replacement_signal is True
+    assert result[0].relation is MemoryRelation.POTENTIAL_CONFLICT
+    assert result[0].recommended_action is RecommendedAction.PROPOSE_CORRECTION
+
+
+def test_external_long_term_label_does_not_turn_temporary_python_attempt_into_conflict():
+    result = MemoryConflictDetector().detect(
+        long_term_candidate("我最近尝试了 Python。", MemoryType.GOAL),
+        [make_memory("old", "我计划学习 Python。", memory_type=MemoryType.GOAL)],
+    )
+
+    assert len(result) == 1
+    assert result[0].temporary_signal is True
+    assert result[0].relation is MemoryRelation.COEXISTING
+    assert result[0].recommended_action is RecommendedAction.PRESERVE_BOTH
+
+
+def test_generic_user_subject_does_not_create_related_signal():
+    result = MemoryConflictDetector().detect(
+        long_term_candidate("用户最近在 Linux 上运行过一次程序。", MemoryType.USER_PREFERENCE),
+        [make_memory("old", "用户主要使用 Windows。", memory_type=MemoryType.USER_PREFERENCE)],
+    )
+
+    assert result == []

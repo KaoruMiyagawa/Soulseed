@@ -1,4 +1,4 @@
-from .models import MemoryActorType, MemoryChangeProposal, ProposalChangeLog, ProposalCreate, ProposalStatus
+from .models import MemoryActorType, MemoryChangeProposal, ProposalChangeLog, ProposalCreate, ProposalCreationResult, ProposalStatus
 from .proposal_repositories import MemoryProposalRepository
 
 
@@ -8,6 +8,9 @@ class MemoryProposalService:
 
     def create_proposal(self, proposal: ProposalCreate, *, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE) -> MemoryChangeProposal:
         return self.repository.create(proposal, actor_type=actor_type)
+
+    def create_proposal_with_outcome(self, proposal: ProposalCreate, *, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE) -> ProposalCreationResult:
+        return self.repository.create_with_outcome(proposal, actor_type=actor_type)
 
     def get_proposal(self, proposal_id: str) -> MemoryChangeProposal:
         return self.repository.get(proposal_id)

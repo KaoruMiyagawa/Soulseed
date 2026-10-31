@@ -182,6 +182,7 @@ class ProposalCreate:
     confidence: float
     evidence: str
     idempotency_key: str | None = None
+    expected_target_memory_updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,12 @@ class ProposalChangeLog:
     idempotency_key: str | None
     request_fingerprint: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class ProposalCreationResult:
+    proposal: MemoryChangeProposal
+    created: bool
 
 
 def normalize_canonical_key(value: str) -> str:

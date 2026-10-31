@@ -1,6 +1,6 @@
 # Soulseed 技术版本档案
 
-> 本文档记录 Soulseed 从 v1.0.1 到 v1.1.0 的记忆系统技术演进。它同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
+> 本文档记录 Soulseed 从 v1.0.1 到 v1.2.0 阶段 1 的记忆系统技术演进。它同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
 >
 > 重要的历史边界：当前 Git 仓库没有 v1.0.1–v1.1.0 的逐版本 Tag，也没有为每个版本建立独立 Commit。Git 中可以直接确认的主要提交是基础实现、审计与幂等加固、原子 Proposal 纠正三个阶段。因此，本文对逐版本的归属严格区分代码证据、现有开发报告和无法进一步确认的历史信息；无法拆分的内容不会伪造 Commit 映射。
 
@@ -18,6 +18,7 @@
 - [v1.0.8 — 只读冲突检测器](#v108--只读冲突检测器)
 - [v1.0.9 — Proposal 存储与生命周期](#v109--proposal-存储与生命周期)
 - [v1.1.0 — 用户确认后的原子记忆纠正服务](#v110--用户确认后的原子记忆纠正服务)
+- [v1.2.0 — 记忆纠正流程编排层（开发中，阶段 1）](#v120--记忆纠正流程编排层开发中阶段-1)
 - [当前已知限制与后续方向](#当前已知限制与后续方向)
 
 ## 文档范围与证据约定
@@ -82,6 +83,110 @@ flowchart LR
 6. Proposal 将“发现候选变更”和“应用正式变更”分开，v1.1.0 才把确认后的应用动作纳入一个原子事务。
 
 记忆系统始终是人格理解和对话的辅助基础设施。它可以补充与用户相关的事实，但不应该反过来覆盖“大肥鱼”的核心人格、关系边界、成长原则和诚实边界。`MemoryContextBuilder` 明确将记忆包装为参考资料，并声明它不是指令、不能覆盖核心人格或用户当前明确表达；`persona.py` 也保证运行时补充提示只能追加，不能替换人格资料。
+
+---
+
+## v1.2.0 — 记忆纠正流程编排层（开发中，阶段 1）
+
+### 版本信息
+
+- 版本名称：记忆纠正流程编排层
+- 当前状态：v1.2.0 仍在开发中，本次仅完成阶段 1 及其一致性与误创建防护修复
+- 阶段范围：CorrectionFlowService 编排、Proposal 创建快照校验、长期变化目标定位和回归测试
+- 后端完整测试：`133 passed`
+
+本阶段没有接入 `ChatService`、HTTP API 或前端，也没有形成完整的聊天纠正闭环。后续阶段仍需由聊天主链路统一提取候选、接入纠正编排，并实现 Proposal 确认交互。
+
+### 阶段 1 已完成能力
+
+阶段 1 新增独立的 `CorrectionFlowService`，将已存在的确定性记忆候选、`CorrectionIntent`、只读冲突检测和 Proposal 服务组织成独立的后端编排层。它接收已经持久化的真实 user message 和外部候选，不重复提取消息，也不直接修改正式记忆。
+
+当前流程边界为：
+
+```text
+已提取候选
+  -> 意图分流
+  -> 查询 active 记忆
+  -> 只读冲突检测
+  -> Proposal 创建或澄清
+  -> 等待后续用户确认
+```
+
+`CorrectionFlowService` 返回结构化结果，区分：
+
+- `no_action`
+- `proposal_created`
+- `proposal_reused`
+- `proposal_accepted`
+- `proposal_applied`
+- `proposal_rejected`
+- `proposal_cancelled`
+- `proposal_expired`
+- `clarification_needed`
+- `coexisting`
+- `processing_failed`
+
+历史 Proposal 被幂等复用时会保留真实状态，不再把 accepted、rejected、cancelled 或 expired Proposal 伪装成新创建的 Proposal。
+
+### Proposal 创建时的目标版本一致性
+
+`ProposalCreate` 增加可选的 `expected_target_memory_updated_at`。`CorrectionFlowService` 创建纠正 Proposal 时，显式传入冲突检测实际使用的目标版本。
+
+`MemoryProposalRepository` 在创建事务中重新读取目标，并同时校验：
+
+1. 目标记录存在；
+2. 目标仍然是 `active`；
+3. 当前 `updated_at` 与 expected version 完全一致。
+
+校验失败时不会自动改用最新版本，也不会自动重试。目标变化和目标失效分别返回可识别的处理失败结果，避免出现“旧冲突证据对应新目标快照”的 Proposal。
+
+该机制只强化纠正编排使用的 Proposal 创建流程。没有 expected version 的既有普通 Proposal 创建调用继续保留原有兼容语义。
+
+### 结构化冲突匹配信号
+
+`MemoryConflictResult` 新增结构化匹配信号：
+
+- `exact_key_match`
+- `shared_terms`
+- `same_slot`
+- `same_attribute`
+- `temporary_signal`
+- `explicit_replacement_signal`
+
+这些字段用于区分主题相关、同一事实属性、临时行为和明确替代，不让编排层解析中文 evidence 字符串。
+
+当前长期变化的安全判断不再仅依据：
+
+```python
+related = exact_key or bool(shared_terms) or same_slot
+```
+
+`LONG_TERM_CHANGE` 还必须具备：
+
+- 可靠的同一事实属性信号；
+- 明确的长期替代表达；
+- `recommended_action = PROPOSE_CORRECTION`；
+- 没有临时或一次性行为信号。
+
+因此，学习 C++ 与学习 Rust 不会仅因共同出现“学习”而创建替代 Proposal；“最近尝试 Python”和“在 Linux 上运行过一次程序”也不会仅凭主题或外部错误的长期变化标记绕过防护。
+
+明确长期改变同一属性，例如主要开发环境从 Windows 永久换成 Linux，仍然可以创建 pending Proposal，等待用户确认后再由 v1.1.0 的 `MemoryCorrectionService` 原子应用。
+
+### 与 v1.1.0 的边界
+
+本阶段保留 `EXPLICIT_CORRECTION` 的既有行为和 Proposal 幂等机制，没有重写 v1.1.0 的 `MemoryCorrectionService`，没有改变正式记忆的原子应用流程。
+
+本阶段没有新增数据库 Migration，也没有执行真实数据库迁移。Proposal 创建一致性、正式记忆替代、来源写入、审计和事务回滚仍由已有 v1.1.0 服务负责。
+
+### 当前未完成内容
+
+以下内容不属于本阶段已完成能力：
+
+- 尚未接入 `ChatService`；
+- 尚无完整 Proposal HTTP API；
+- 尚无前端记忆纠正确认界面；
+- 尚未实现从聊天消息到 Proposal 确认再到正式记忆更新的完整闭环；
+- 尚未扩展多用户权限、真实环境迁移或其他交互通道。
 
 ---
 

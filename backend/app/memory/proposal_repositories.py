@@ -17,6 +17,7 @@ from .models import (
     ProposalChangeAction,
     ProposalChangeLog,
     ProposalCreate,
+    ProposalCreationResult,
     ProposalStatus,
     ProposalType,
     normalize_canonical_key,
@@ -34,6 +35,14 @@ class ProposalStateError(ValueError):
     pass
 
 
+class ProposalTargetVersionConflictError(ProposalStateError):
+    pass
+
+
+class ProposalTargetInactiveError(ProposalStateError):
+    pass
+
+
 class MemoryProposalRepository:
     _relations = {"conflict", "potential_conflict", "coexisting", "unrelated", "needs_review"}
 
@@ -41,6 +50,9 @@ class MemoryProposalRepository:
         self.database = database
 
     def create(self, proposal: ProposalCreate, *, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE) -> MemoryChangeProposal:
+        return self.create_with_outcome(proposal, actor_type=actor_type).proposal
+
+    def create_with_outcome(self, proposal: ProposalCreate, *, actor_type: MemoryActorType | str = MemoryActorType.SYSTEM_RULE) -> ProposalCreationResult:
         proposal_type = ProposalType(proposal.proposal_type)
         memory_type = MemoryType(proposal.proposed_memory_type)
         intent = CorrectionIntent(proposal.correction_intent)
@@ -61,20 +73,29 @@ class MemoryProposalRepository:
             "relation": proposal.relation,
             "confidence": confidence,
             "evidence": evidence,
+            "expected_target_memory_updated_at": proposal.expected_target_memory_updated_at,
         })
         proposal_id, timestamp = str(uuid4()), now_iso()
         with self.database.connection() as db:
             existing_log = self._log_by_idempotency(db, proposal.idempotency_key)
             if existing_log is not None:
                 self._validate_replay(existing_log, ProposalChangeAction.CREATED, None, fingerprint)
-                return self._proposal_from_row(self._proposal_row(db, existing_log.proposal_id))
-            target_memory_updated_at = self._validate_references(db, proposal.target_memory_id, proposal.evidence_message_id)
+                return ProposalCreationResult(
+                    proposal=self._proposal_from_row(self._proposal_row(db, existing_log.proposal_id)),
+                    created=False,
+                )
+            target_memory_updated_at = self._validate_references(
+                db,
+                proposal.target_memory_id,
+                proposal.evidence_message_id,
+                expected_target_memory_updated_at=proposal.expected_target_memory_updated_at,
+            )
             db.execute(
                 "INSERT INTO memory_change_proposals (id, proposal_type, target_memory_id, proposed_memory_type, proposed_content, proposed_canonical_key, evidence_message_id, correction_intent, relation, confidence, evidence, status, idempotency_key, request_fingerprint, created_at, resolved_at, resolution_reason, target_memory_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (proposal_id, proposal_type.value, proposal.target_memory_id, memory_type.value, content, canonical_key, proposal.evidence_message_id, intent.value, proposal.relation, confidence, evidence, ProposalStatus.PENDING.value, proposal.idempotency_key, fingerprint, timestamp, None, None, target_memory_updated_at),
             )
             self._insert_log(db, proposal_id, ProposalChangeAction.CREATED, None, ProposalStatus.PENDING, None, actor_type, proposal.idempotency_key, fingerprint, timestamp)
-        return self.get(proposal_id)
+        return ProposalCreationResult(proposal=self.get(proposal_id), created=True)
 
     def get(self, proposal_id: str) -> MemoryChangeProposal:
         with self.database.connection() as db:
@@ -159,13 +180,26 @@ class MemoryProposalRepository:
             raise IdempotencyConflictError("Proposal 幂等键对应的请求参数不一致")
 
     @staticmethod
-    def _validate_references(db: sqlite3.Connection, target_memory_id: str | None, evidence_message_id: str) -> str | None:
+    def _validate_references(
+        db: sqlite3.Connection,
+        target_memory_id: str | None,
+        evidence_message_id: str,
+        *,
+        expected_target_memory_updated_at: str | None = None,
+    ) -> str | None:
         target_updated_at = None
         if target_memory_id is not None:
-            target = db.execute("SELECT id, updated_at FROM memory_items WHERE id = ?", (target_memory_id,)).fetchone()
+            target = db.execute("SELECT id, status, updated_at FROM memory_items WHERE id = ?", (target_memory_id,)).fetchone()
             if target is None:
                 raise MemoryNotFoundError(target_memory_id)
-            target_updated_at = target["updated_at"]
+            if expected_target_memory_updated_at is not None:
+                if target["status"] != MemoryStatus.ACTIVE.value:
+                    raise ProposalTargetInactiveError("目标记忆在 Proposal 创建时已不是 active")
+                if target["updated_at"] != expected_target_memory_updated_at:
+                    raise ProposalTargetVersionConflictError("目标记忆在 Proposal 创建时已发生变化")
+                target_updated_at = expected_target_memory_updated_at
+            else:
+                target_updated_at = target["updated_at"]
         message = db.execute("SELECT role FROM messages WHERE id = ?", (evidence_message_id,)).fetchone()
         if message is None:
             raise MessageNotFoundError(evidence_message_id)
