@@ -1,6 +1,6 @@
 # Soulseed 技术版本档案
 
-> 本文档记录 Soulseed 从 v1.0.1 到 v1.2.0 阶段 2.6 的记忆系统技术演进。v1.2.0 仍在开发中，阶段 2.6 的完成不代表整个版本发布。本文同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
+> 本文档记录 Soulseed 从 v1.0.1 到 v1.2.0 阶段 2.7.3.1 的记忆系统技术演进。v1.2.0 仍在开发中，阶段 2.7 后端 API 完成不代表整个版本发布。本文同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
 >
 > 重要的历史边界：当前 Git 仓库没有 v1.0.1–v1.1.0 的逐版本 Tag，也没有为每个版本建立独立 Commit。Git 中可以直接确认的主要提交是基础实现、审计与幂等加固、原子 Proposal 纠正三个阶段。因此，本文对逐版本的归属严格区分代码证据、现有开发报告和无法进一步确认的历史信息；无法拆分的内容不会伪造 Commit 映射。
 
@@ -86,17 +86,18 @@ flowchart LR
 
 ---
 
-## v1.2.0 — 记忆纠正闭环（开发中，阶段 1–2.6）
+## v1.2.0 — 记忆纠正闭环（开发中，阶段 1–2.7.3.1）
 
 ### 版本信息
 
 - 版本名称：记忆纠正流程编排层
-- 当前状态：v1.2.0 仍在开发中，目前完成阶段 1 和阶段 2.1–2.6；不是 v1.2.0 整体发布
-- 阶段范围：CorrectionFlowService 编排、ChatService 接入、候选级异常隔离、Proposal 幂等与历史重放安全
+- 当前状态：v1.2.0 仍在开发中，目前完成阶段 1、阶段 2.1–2.6 和阶段 2.7.1–2.7.3.1 后端 API；不是 v1.2.0 整体发布
+- 阶段范围：CorrectionFlowService 编排、ChatService 接入、候选级异常隔离、Proposal 生命周期与历史重放安全、Proposal HTTP API
 - 阶段 1 验证记录：后端完整测试 `133 passed`
 - 阶段 2.6 最终独立复核：后端完整测试 `158 passed, 0 failed, 0 skipped`；存在一条 Starlette/httpx 弃用警告
+- 阶段 2.7.3.1 验证记录：后端完整测试 `224 passed, 0 failed, 0 skipped`；存在一条 Starlette/httpx 弃用警告
 
-阶段 1 本身没有接入 `ChatService`、HTTP API 或前端。阶段 2.1–2.6 随后将纠正候选编排接入聊天主链路，但当前仍没有 Proposal HTTP API、前端确认与应用交互，也没有形成完整的聊天纠正闭环。
+阶段 1 本身没有接入 `ChatService`、HTTP API 或前端。阶段 2.1–2.6 随后将纠正候选编排接入聊天主链路；阶段 2.7 增加了 Proposal 后端 API。前端确认与应用交互仍未实现，因此尚未形成完整的聊天纠正闭环。
 
 ### 阶段 1 已完成能力
 
@@ -194,12 +195,22 @@ related = exact_key or bool(shared_terms) or same_slot
 - 模型调用失败不自动接受或应用已创建 Proposal；assistant 消息保存失败不生成虚假的完整聊天成功响应，也不回滚或改写 Proposal 的真实状态。
 - 阶段 2.6 最终验证执行后端完整测试 `158 passed, 0 failed, 0 skipped`，`compileall` 通过，`git diff --check` 通过；测试报告有一条 Starlette/httpx 弃用警告。
 
+### 阶段 2.7.1–2.7.3.1：Proposal 后端 API 与安全边界
+
+- 增加 Proposal 列表、详情和应用状态查询 API；详情通过单个 SQLite 读取事务读取 Proposal、目标记忆及来源消息，提供一致快照，且查询不写入记忆访问时间或审计记录。
+- 增加独立的 accept、reject API，操作者由服务端固定为 `USER`。生命周期转换使用原子事务；accept 与正式应用是分开的操作。
+- 增加显式 apply API，唯一调用入口仍为 v1.1.0 `MemoryCorrectionService.apply_proposal()`。目标版本、目标状态、来源 user 消息校验和正式记忆替换、应用日志、审计均由该服务在 `BEGIN IMMEDIATE` 事务中完成；API 不重新实现记忆变更。
+- Proposal 创建与状态转换的并发幂等使用仓储的唯一约束和事务保护；并发重放不会重复创建 Proposal、终态审计或正式记忆应用效果。
+- 已应用 Proposal 的重放严格比较 fingerprint 和规范化幂等键，区分键缺失与有值。相同请求可返回既有结果，键或 reason、actor 不匹配时拒绝重放，不产生额外记忆或日志。
+- API 使用显式 Pydantic 请求与响应模型，隐藏内部 fingerprint 和幂等数据；拒绝客户端传入 actor、目标记忆或建议内容。业务冲突、参数错误及意外服务错误按对应 HTTP 状态处理。
+- 阶段 2.7.3.1 完整后端验证为 `224 passed, 0 failed, 0 skipped`；`compileall` 与 `git diff --check` 通过。测试使用临时 SQLite，不调用真实模型 API。
+
 ### 当前未完成内容
 
 以下内容仍未实现，不应视为 v1.2.0 已完成：
 
 - 尚无 HTTP 请求级幂等键；当前业务级重放保护依赖已持久化的来源 message_id；
-- 尚无 Proposal HTTP API 和完整的前端确认、拒绝及应用交互；
+- 尚无前端 Proposal 确认、拒绝及应用交互；
 - 尚未实现从聊天消息、Proposal 确认到正式记忆更新的完整用户可操作闭环；
 - 尚未实现多用户认证或公网部署安全；当前不能据此宣称适用于公网多用户环境；
 - 尚未进行真实模型 API 端到端验证；阶段测试不调用真实模型 API；

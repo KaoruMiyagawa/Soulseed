@@ -8,8 +8,9 @@ from .chat_service import ChatService
 from .config import get_settings
 from .db import Database
 from .model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
-from .memory import CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
+from .memory import CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryCorrectionService, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
 from .persona import resolve_system_prompt
+from .proposal_api import create_proposal_router
 from .repositories import ConversationRepository, MessageRepository
 
 
@@ -27,6 +28,7 @@ conversations = ConversationRepository(database)
 messages = MessageRepository(database)
 memory_service = MemoryService(MemoryRepository(database))
 proposal_service = MemoryProposalService(MemoryProposalRepository(database))
+memory_correction_service = MemoryCorrectionService(database)
 correction_flow = CorrectionFlowService(memory_service, proposal_service)
 memory_retriever = MemoryRetriever(memory_service)
 chat = ChatService(
@@ -59,6 +61,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+
+def get_proposal_service() -> MemoryProposalService:
+    return proposal_service
+
+
+def get_memory_correction_service() -> MemoryCorrectionService:
+    return memory_correction_service
+
+
+app.include_router(create_proposal_router(get_proposal_service, get_memory_correction_service))
 
 
 @app.get("/api/health")

@@ -15,6 +15,9 @@ class MemoryProposalService:
     def get_proposal(self, proposal_id: str) -> MemoryChangeProposal:
         return self.repository.get(proposal_id)
 
+    def get_proposal_with_related_read_data(self, proposal_id: str) -> tuple[MemoryChangeProposal, dict | None, dict | None]:
+        return self.repository.get_with_related_read_data(proposal_id)
+
     def find_by_source_and_candidate(self, evidence_message_id: str, proposed_memory_type: MemoryType | str, proposed_content: str, proposed_canonical_key: str) -> list[MemoryChangeProposal]:
         return self.repository.find_by_source_and_candidate(evidence_message_id, proposed_memory_type, proposed_content, proposed_canonical_key)
 

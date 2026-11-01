@@ -170,8 +170,17 @@ class MemoryCorrectionService:
 
     def _validate_replay(self, db: sqlite3.Connection, proposal_id: str, fingerprint: str, idempotency_key: str | None) -> None:
         row = db.execute("SELECT request_fingerprint, idempotency_key FROM memory_proposal_application_log WHERE proposal_id = ?", (proposal_id,)).fetchone()
-        if row is None or row["request_fingerprint"] != fingerprint or (idempotency_key and row["idempotency_key"] != idempotency_key):
+        stored_key = self._normalize_idempotency_key(row["idempotency_key"]) if row is not None else None
+        requested_key = self._normalize_idempotency_key(idempotency_key)
+        if row is None or row["request_fingerprint"] != fingerprint or stored_key != requested_key:
             raise IdempotencyConflictError("Proposal 已应用，但重试请求参数不一致")
+
+    @staticmethod
+    def _normalize_idempotency_key(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
     def _result(self, db: sqlite3.Connection, proposal_id: str) -> CorrectionApplicationResult:
         proposal = MemoryProposalRepository._proposal_from_row(self._proposal_row(db, proposal_id))

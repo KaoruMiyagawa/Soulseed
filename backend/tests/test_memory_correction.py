@@ -21,6 +21,7 @@ from app.memory import (
     ProposalType,
 )
 from app.repositories import ConversationRepository, MessageRepository
+from app.memory.repositories import IdempotencyConflictError
 
 
 @pytest.fixture
@@ -100,6 +101,65 @@ def test_repeated_application_is_idempotent(correction_context):
     with database.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log WHERE proposal_id = ?", (proposal.id,)).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("first_key", "retry_key", "first_reason", "retry_reason", "first_actor", "retry_actor", "should_replay"),
+    [
+        ("key-A", "key-A", "same", "same", "user", "user", True),
+        (" key-A ", "key-A", "same", "same", "user", "user", True),
+        ("key-A", None, "same", "same", "user", "user", False),
+        (None, "key-A", "same", "same", "user", "user", False),
+        (None, None, "same", "same", "user", "user", True),
+        ("key-A", "key-B", "same", "same", "user", "user", False),
+        ("key-A", "key-A", "first", "changed", "user", "user", False),
+        ("key-A", "key-A", "same", "same", "user", "admin", False),
+    ],
+)
+def test_apply_replay_requires_exact_normalized_key_and_same_parameters(
+    correction_context,
+    first_key,
+    retry_key,
+    first_reason,
+    retry_reason,
+    first_actor,
+    retry_actor,
+    should_replay,
+):
+    database, memories, proposals, correction, _, message = correction_context
+    proposal = proposals.create_proposal(make_proposal(message["id"], key=f"apply-replay:{first_key}:{retry_key}:{first_reason}:{retry_reason}:{first_actor}:{retry_actor}"))
+    proposals.accept_proposal(proposal.id)
+    first = correction.apply_proposal(
+        proposal.id,
+        reason=first_reason,
+        actor_type=first_actor,
+        idempotency_key=first_key,
+    )
+    before = proposals.get_proposal(proposal.id)
+
+    if should_replay:
+        replay = correction.apply_proposal(
+            proposal.id,
+            reason=retry_reason,
+            actor_type=retry_actor,
+            idempotency_key=retry_key,
+        )
+        assert replay.proposal.applied_memory_id == first.proposal.applied_memory_id
+    else:
+        with pytest.raises(IdempotencyConflictError):
+            correction.apply_proposal(
+                proposal.id,
+                reason=retry_reason,
+                actor_type=retry_actor,
+                idempotency_key=retry_key,
+            )
+
+    after = proposals.get_proposal(proposal.id)
+    assert after == before
+    assert len(memories.list_memories(include_inactive=True)) == 1
+    with database.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log WHERE proposal_id = ?", (proposal.id,)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM memory_change_log WHERE proposal_id = ?", (proposal.id,)).fetchone()[0] == 1
 
 
 def test_concurrent_application_has_one_effect(correction_context):

@@ -127,6 +127,32 @@ class MemoryProposalRepository:
         with self.database.connection() as db:
             return self._proposal_from_row(self._proposal_row(db, proposal_id))
 
+    def get_with_related_read_data(self, proposal_id: str) -> tuple[MemoryChangeProposal, dict | None, dict | None]:
+        """Read a proposal and its linked records from one read transaction."""
+        with self.database.connection() as db:
+            # sqlite3's default transaction mode does not begin a transaction
+            # for SELECT statements. Pin the snapshot before reading any rows.
+            db.execute("BEGIN")
+            proposal = self._proposal_row(db, proposal_id)
+            target = None
+            if proposal["target_memory_id"] is not None:
+                row = db.execute(
+                    "SELECT id, content, status, updated_at FROM memory_items WHERE id = ?",
+                    (proposal["target_memory_id"],),
+                ).fetchone()
+                if row is not None:
+                    target = dict(row)
+            source = None
+            if proposal["evidence_message_id"] is not None:
+                row = db.execute(
+                    "SELECT id, role, content FROM messages WHERE id = ?",
+                    (proposal["evidence_message_id"],),
+                ).fetchone()
+                if row is not None:
+                    source = dict(row)
+            proposal_model = self._proposal_from_row(proposal)
+        return proposal_model, target, source
+
     def find_by_source_and_candidate(self, evidence_message_id: str, proposed_memory_type: MemoryType | str, proposed_content: str, proposed_canonical_key: str) -> list[MemoryChangeProposal]:
         memory_type = MemoryType(proposed_memory_type).value
         with self.database.connection() as db:
@@ -163,6 +189,9 @@ class MemoryProposalRepository:
             raise ProposalStateError("Proposal 只能转换到终态")
         fingerprint = self._fingerprint("transition", {"proposal_id": proposal_id, "target_status": target_status.value, "reason": reason or ""})
         with self.database.connection() as db:
+            # Serialize the read-check-write sequence so competing terminal
+            # transitions cannot both observe pending and overwrite each other.
+            db.execute("BEGIN IMMEDIATE")
             existing_log = self._log_by_idempotency(db, idempotency_key)
             if existing_log is not None:
                 self._validate_replay(existing_log, action, proposal_id, fingerprint)
