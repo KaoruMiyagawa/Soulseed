@@ -191,7 +191,10 @@ class MemoryConflictDetector:
 
     @staticmethod
     def _has_explicit_replacement_signal(text: str) -> bool:
-        return any(marker in (text or "") for marker in ("现在更", "现在已经", "已经改成", "已经改为", "已经换成", "永久改为", "永久换成", "长期改为", "从现在起", "不再"))
+        return any(marker in (text or "") for marker in (
+            "现在更", "现在已经", "已经改成", "已经改为", "已经换成", "永久改为", "永久改用",
+            "永久换成", "永久转为", "长期改为", "从现在起", "不再",
+        ))
 
     @staticmethod
     def _is_eligible(memory: MemoryItem) -> bool:

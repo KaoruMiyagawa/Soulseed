@@ -46,6 +46,7 @@ class CorrectionFlowResult:
     proposal: CorrectionProposalSummary | None = None
     clarification: tuple[str, ...] = ()
     error_code: str | None = None
+    clarification_context: dict | None = None
 
 
 class CorrectionFlowService:
@@ -153,9 +154,13 @@ class CorrectionFlowService:
             return self._failure("读取记忆或执行冲突检测失败", "conflict_detection_failed", exc)
 
         if candidate.intent is CorrectionIntent.AMBIGUOUS_CHANGE:
+            context = self._clarification_context(candidate, memories, conflicts, "候选表达存在不确定性")
+            if context is None:
+                return self._no_action("没有可核验的相关 active 记忆，不启动澄清")
             return self._clarification(
                 "表达包含不确定变化，不能直接修改长期记忆",
                 ("请确认这是长期变化，还是暂时尝试。",),
+                context,
             )
 
         if candidate.intent in (CorrectionIntent.TEMPORARY_EXPERIMENT, CorrectionIntent.COEXISTING_INFORMATION):
@@ -172,9 +177,13 @@ class CorrectionFlowService:
                     status=CorrectionFlowStatus.COEXISTING,
                     reason="候选包含临时或一次性行为信号，不替代长期记忆",
                 )
+            context = self._clarification_context(candidate, memories, conflicts, "候选包含临时或一次性行为信号")
+            if context is None:
+                return self._no_action("临时信号没有关联到可核验的 active 记忆")
             return self._clarification(
                 "候选包含临时或一次性行为信号，不能替代长期记忆",
                 ("请确认这是长期变化，还是暂时尝试。",),
+                context,
             )
 
         if candidate.intent not in self._proposal_intents:
@@ -187,18 +196,25 @@ class CorrectionFlowService:
         )
 
         if len(reviewable) > 1:
+            context = self._clarification_context(candidate, memories, reviewable, "存在多个可能的旧记忆")
             return self._clarification(
                 "存在多个可能的旧记忆，不能自动选择目标",
                 tuple(f"候选目标：{result.matched_memory_id}" for result in reviewable),
+                context,
             )
 
         eligible = tuple(result for result in reviewable if self._allows_proposal(candidate.intent, result))
         if not eligible:
-            if not memories:
+            related = tuple(result for result in conflicts if result.relation is not MemoryRelation.UNRELATED)
+            if not related:
                 return self._no_action("没有相关的 active 记忆")
+            context = self._clarification_context(candidate, memories, related, "冲突证据不足以安全定位")
+            if context is None:
+                return self._no_action("冲突结果缺少可核验上下文，不启动澄清")
             return self._clarification(
                 "找到了 active 记忆，但没有足够可靠的冲突证据定位目标",
                 ("请明确要替代哪一条已有记忆。",),
+                context,
             )
 
         conflict = eligible[0]
@@ -258,12 +274,70 @@ class CorrectionFlowService:
             evidence=conflict.evidence,
         )
         if not outcome.created:
-            return self._replayed_result(created, summary)
+            replayed = self._replayed_result(created, summary)
+            if replayed.status is CorrectionFlowStatus.PROPOSAL_REUSED:
+                replayed = CorrectionFlowResult(
+                    status=replayed.status,
+                    reason=replayed.reason,
+                    proposal=replayed.proposal,
+                    clarification_context=self._proposal_context(candidate, target, conflict, replayed.reason),
+                )
+            return replayed
         return CorrectionFlowResult(
             status=CorrectionFlowStatus.PROPOSAL_CREATED,
             reason="已创建待确认的纠正 Proposal，尚未修改正式记忆",
             proposal=summary,
+            clarification_context=self._proposal_context(candidate, target, conflict, "需要理解这次长期变化的具体含义"),
         )
+
+    @staticmethod
+    def _proposal_context(candidate: MemoryCandidate, target, conflict, reason: str) -> dict:
+        return {
+            "candidate": {
+                "memory_type": candidate.memory_type.value,
+                "content": candidate.content,
+                "canonical_key": candidate.canonical_key,
+            },
+            "matched_memories": [{"id": target.id, "content": target.content, "updated_at": target.updated_at}],
+            "relation": conflict.relation.value,
+            "evidence": list(conflict.evidence),
+            "reason": reason,
+        }
+
+    @classmethod
+    def _clarification_context(cls, candidate, memories, conflicts, reason: str) -> dict | None:
+        by_id = {memory.id: memory for memory in memories}
+        matched = []
+        evidence = []
+        relations = set()
+        for conflict in conflicts:
+            if conflict.relation is MemoryRelation.UNRELATED:
+                continue
+            memory = by_id.get(conflict.matched_memory_id)
+            if memory is None:
+                continue
+            matched.append({"id": memory.id, "content": memory.content, "updated_at": memory.updated_at})
+            evidence.extend(conflict.evidence)
+            relations.add(conflict.relation)
+        unique = {item["id"]: item for item in matched}
+        if not unique or not evidence:
+            return None
+        relation = (
+            next(iter(relations)).value
+            if len(unique) == 1 and len(relations) == 1
+            else MemoryRelation.NEEDS_REVIEW.value
+        )
+        return {
+            "candidate": {
+                "memory_type": candidate.memory_type.value,
+                "content": candidate.content,
+                "canonical_key": candidate.canonical_key,
+            },
+            "matched_memories": list(unique.values()),
+            "relation": relation,
+            "evidence": list(dict.fromkeys(evidence)),
+            "reason": reason,
+        }
 
     @classmethod
     def _allows_proposal(cls, intent: CorrectionIntent, result) -> bool:
@@ -319,8 +393,13 @@ class CorrectionFlowService:
         return CorrectionFlowResult(CorrectionFlowStatus.NO_ACTION, reason)
 
     @staticmethod
-    def _clarification(reason: str, clarification: tuple[str, ...]) -> CorrectionFlowResult:
-        return CorrectionFlowResult(CorrectionFlowStatus.CLARIFICATION_NEEDED, reason, clarification=clarification)
+    def _clarification(reason: str, clarification: tuple[str, ...], context: dict | None = None) -> CorrectionFlowResult:
+        return CorrectionFlowResult(
+            CorrectionFlowStatus.CLARIFICATION_NEEDED,
+            reason,
+            clarification=clarification,
+            clarification_context=context,
+        )
 
     @staticmethod
     def _failure(reason: str, error_code: str, exc: Exception | None = None) -> CorrectionFlowResult:

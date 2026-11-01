@@ -1,4 +1,7 @@
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
+import json
 from typing import Protocol
 
 import httpx
@@ -21,6 +24,36 @@ class ModelTimeoutError(ModelRequestError):
         super().__init__("硅基流动模型请求超时，请稍后重试。", status_code=504)
 
 
+class StructuredOutputError(RuntimeError):
+    pass
+
+
+class ClarificationAction(StrEnum):
+    ASK = "ask"
+    DEFER = "defer"
+    NORMAL = "normal"
+
+
+class ClarificationResolution(StrEnum):
+    NONE = "none"
+    EXPLICIT_CHANGE = "explicit_change"
+    ORIGINAL_WAS_WRONG = "original_was_wrong"
+    COEXISTING = "coexisting"
+    DENIED = "denied"
+    TEMPORARY = "temporary"
+    UNCLEAR = "unclear"
+    OFF_TOPIC = "off_topic"
+
+
+@dataclass(frozen=True)
+class StructuredChatReply:
+    content: str
+    clarification_id: str | None
+    action: ClarificationAction
+    resolution: ClarificationResolution
+    evidence_excerpt: str | None
+
+
 class ModelAdapter(Protocol):
     async def reply(self, messages: list[dict[str, str]]) -> str: ...
 
@@ -31,6 +64,40 @@ class OpenAICompatibleAdapter:
         self.client_factory = client_factory
 
     async def reply(self, messages: list[dict[str, str]]) -> str:
+        content = await self._request_content(messages)
+        return content
+
+    async def reply_structured(self, messages: list[dict[str, str]]) -> StructuredChatReply:
+        content = await self._request_content(messages, structured=True)
+        try:
+            payload = json.loads(content)
+            if not isinstance(payload, dict) or set(payload) != {"reply", "clarification"}:
+                raise ValueError("unexpected top-level fields")
+            reply = payload["reply"]
+            decision = payload["clarification"]
+            if not isinstance(reply, str) or not reply.strip() or len(reply) > 20000:
+                raise ValueError("invalid reply")
+            if not isinstance(decision, dict) or set(decision) != {
+                "clarification_id", "action", "resolution", "evidence_excerpt"
+            }:
+                raise ValueError("invalid clarification fields")
+            clarification_id = decision["clarification_id"]
+            evidence_excerpt = decision["evidence_excerpt"]
+            if clarification_id is not None and not isinstance(clarification_id, str):
+                raise ValueError("invalid clarification id")
+            if evidence_excerpt is not None and not isinstance(evidence_excerpt, str):
+                raise ValueError("invalid evidence excerpt")
+            return StructuredChatReply(
+                content=reply.strip(),
+                clarification_id=clarification_id,
+                action=ClarificationAction(decision["action"]),
+                resolution=ClarificationResolution(decision["resolution"]),
+                evidence_excerpt=evidence_excerpt,
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise StructuredOutputError("模型未返回符合约束的澄清结构") from exc
+
+    async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False) -> str:
         if not self.settings.model_api_key:
             raise ModelConfigurationError("模型 API 密钥未配置。请在 .env 中设置 SOULSEED_MODEL_API_KEY。")
         if not self.settings.model_name:
@@ -38,10 +105,13 @@ class OpenAICompatibleAdapter:
         url = self.settings.model_base_url.rstrip("/") + "/chat/completions"
         try:
             async with self.client_factory(timeout=self.settings.model_timeout_seconds) as client:
+                body = {"model": self.settings.model_name, "messages": messages}
+                if structured:
+                    body["response_format"] = {"type": "json_object"}
                 response = await client.post(
                     url,
                     headers={"Authorization": f"Bearer {self.settings.model_api_key}"},
-                    json={"model": self.settings.model_name, "messages": messages},
+                    json=body,
                 )
         except httpx.TimeoutException as exc:
             raise ModelTimeoutError() from exc

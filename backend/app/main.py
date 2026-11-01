@@ -8,7 +8,7 @@ from .chat_service import ChatService
 from .config import get_settings
 from .db import Database
 from .model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
-from .memory import CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryCorrectionService, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
+from .memory import ClarificationApplicationService, ClarificationRepository, CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryCorrectionService, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
 from .persona import resolve_system_prompt
 from .proposal_api import create_proposal_router
 from .repositories import ConversationRepository, MessageRepository
@@ -30,6 +30,10 @@ memory_service = MemoryService(MemoryRepository(database))
 proposal_service = MemoryProposalService(MemoryProposalRepository(database))
 memory_correction_service = MemoryCorrectionService(database)
 correction_flow = CorrectionFlowService(memory_service, proposal_service)
+clarification_repository = ClarificationRepository(database)
+clarification_application = ClarificationApplicationService(
+    clarification_repository, proposal_service, memory_correction_service
+)
 memory_retriever = MemoryRetriever(memory_service)
 chat = ChatService(
     conversations,
@@ -45,12 +49,23 @@ chat = ChatService(
         max_item_chars=settings.memory_item_max_chars,
     ),
     correction_flow=correction_flow,
+    clarification_repository=clarification_repository,
+    proposal_service=proposal_service,
+    clarification_application=clarification_application,
+    memory_correction_service=memory_correction_service,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize()
+    recovery_clarifications = ClarificationRepository(database)
+    recovery_proposals = MemoryProposalService(MemoryProposalRepository(database))
+    ClarificationApplicationService(
+        recovery_clarifications,
+        recovery_proposals,
+        MemoryCorrectionService(database),
+    ).recover_after_restart()
     yield
 
 

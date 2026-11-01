@@ -4,7 +4,14 @@ import httpx
 from app.chat_service import ChatService
 from app.config import Settings
 from app.db import Database
-from app.model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
+from app.model_adapter import (
+    ClarificationAction,
+    ClarificationResolution,
+    ModelConfigurationError,
+    ModelRequestError,
+    OpenAICompatibleAdapter,
+    StructuredOutputError,
+)
 from app.persona import assemble_system_prompt, load_persona_profile
 from app.repositories import ConversationRepository, MessageRepository
 
@@ -36,7 +43,7 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
 
 
 @pytest.mark.asyncio
@@ -124,6 +131,46 @@ async def test_reasoning_content_is_not_used_as_final_reply():
     response = httpx.Response(200, json={"choices": [{"message": {"content": "最终回答", "reasoning_content": "内部推理"}}]})
     result = await adapter_with_response(response).reply([])
     assert result == "最终回答"
+
+
+@pytest.mark.asyncio
+async def test_structured_model_reply_is_strictly_parsed_and_requests_json_mode():
+    captured = {}
+
+    class CapturingClient(FakeClient):
+        async def post(self, _url, **kwargs):
+            captured.update(kwargs)
+            return self.response
+
+    payload = {
+        "reply": "你想讲讲这次变化吗？",
+        "clarification": {
+            "clarification_id": "clarification-test",
+            "action": "ask",
+            "resolution": "none",
+            "evidence_excerpt": None,
+        },
+    }
+    response = httpx.Response(200, json={"choices": [{"message": {"content": __import__("json").dumps(payload, ensure_ascii=False)}}]})
+    adapter = OpenAICompatibleAdapter(
+        Settings(model_api_key="test-key", model_name="test"),
+        client_factory=lambda **kwargs: CapturingClient(response, **kwargs),
+    )
+    result = await adapter.reply_structured([{"role": "user", "content": "我换了环境"}])
+    assert result.content == payload["reply"]
+    assert result.action is ClarificationAction.ASK
+    assert result.resolution is ClarificationResolution.NONE
+    assert captured["json"]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_structured_model_reply_rejects_extra_fields():
+    response = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": '{"reply":"你好","clarification":{},"proposal_id":"leak"}'}}]},
+    )
+    with pytest.raises(StructuredOutputError):
+        await adapter_with_response(response).reply_structured([])
 
 
 def test_persona_profile_contains_required_sections():

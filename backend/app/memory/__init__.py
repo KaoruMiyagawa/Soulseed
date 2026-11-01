@@ -29,6 +29,8 @@ from .proposal_repositories import MemoryProposalRepository, ProposalNotFoundErr
 from .proposal_service import MemoryProposalService
 from .correction_service import CorrectionApplicationResult, MemoryCorrectionService, ProposalApplicationError
 from .correction_flow_service import CorrectionFlowResult, CorrectionFlowStatus, CorrectionFlowService, CorrectionProposalSummary
+from .clarification_repository import ClarificationClaim, ClarificationNotFoundError, ClarificationRecord, ClarificationRepository, ClarificationStateError, ClarificationStatus
+from .clarification_application_service import ClarificationApplicationService
 
 __all__ = [
     "EvidenceType",
@@ -67,6 +69,13 @@ __all__ = [
     "CorrectionFlowStatus",
     "CorrectionFlowService",
     "CorrectionProposalSummary",
+    "ClarificationClaim",
+    "ClarificationApplicationService",
+    "ClarificationNotFoundError",
+    "ClarificationRecord",
+    "ClarificationRepository",
+    "ClarificationStateError",
+    "ClarificationStatus",
     "ProposalNotFoundError",
     "ProposalStateError",
     "ProposalTargetInactiveError",

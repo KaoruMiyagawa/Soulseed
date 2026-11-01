@@ -149,6 +149,45 @@ CREATE INDEX IF NOT EXISTS idx_memory_proposal_application_created
     ON memory_proposal_application_log(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_memory_change_log_proposal
     ON memory_change_log(proposal_id, created_at, id);
+""",
+7: """
+CREATE TABLE IF NOT EXISTS memory_correction_clarifications (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    trigger_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source_proposal_id TEXT REFERENCES memory_change_proposals(id) ON DELETE SET NULL,
+    conflict_context TEXT NOT NULL CHECK (json_valid(conflict_context) AND json_type(conflict_context) = 'object'),
+    assistant_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+    response_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+    application_proposal_id TEXT REFERENCES memory_change_proposals(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN (
+        'preparing', 'awaiting_user', 'processing', 'continue', 'deferred',
+        'explained', 'denied', 'temporary', 'applied', 'failed'
+    )),
+    version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+    processing_token TEXT,
+    lease_expires_at TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (status = 'processing' AND processing_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status <> 'processing' AND processing_token IS NULL AND lease_expires_at IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_clarifications_source_proposal
+    ON memory_correction_clarifications(source_proposal_id) WHERE source_proposal_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_clarifications_assistant_message
+    ON memory_correction_clarifications(assistant_message_id) WHERE assistant_message_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_clarifications_response_message
+    ON memory_correction_clarifications(response_message_id) WHERE response_message_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_clarifications_application_proposal
+    ON memory_correction_clarifications(application_proposal_id) WHERE application_proposal_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_clarifications_conversation_status
+    ON memory_correction_clarifications(conversation_id, status, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_memory_clarifications_recovery
+    ON memory_correction_clarifications(status, lease_expires_at, updated_at);
 """}
 
 

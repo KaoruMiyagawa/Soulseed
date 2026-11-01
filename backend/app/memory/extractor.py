@@ -72,7 +72,10 @@ class DeterministicMemoryExtractor:
 
     @staticmethod
     def _contains_long_term_change_marker(text: str) -> bool:
-        return any(marker in text for marker in ("现在更", "现在已经", "已经改成", "已经换成", "不再", "逐渐习惯", "长期改为", "从现在起"))
+        return any(marker in text for marker in (
+            "现在更", "现在已经", "已经改成", "已经换成", "永久改用", "永久换成", "永久转为",
+            "不再", "逐渐习惯", "长期改为", "从现在起",
+        ))
 
     @staticmethod
     def _contains_ambiguous_marker(text: str) -> bool:
