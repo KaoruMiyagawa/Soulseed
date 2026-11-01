@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from threading import Barrier, Lock
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import pytest
 
@@ -122,6 +123,26 @@ def test_target_memory_is_set_null_after_permanent_delete(proposal_context):
     assert messages.list_for_conversation(user_message["conversation_id"])[0]["id"] == user_message["id"]
     with database.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM memory_change_proposals WHERE id = ?", (created.id,)).fetchone()[0] == 1
+
+
+def test_historical_candidate_lookup_only_returns_correction_proposals(proposal_context):
+    _, _, service, _, user_message, _ = proposal_context
+    non_correction = service.create_proposal(
+        replace(
+            proposal(user_message["id"], key="proposal:update:same-candidate"),
+            proposal_type=ProposalType.UPDATE,
+        )
+    )
+
+    matches = service.find_by_source_and_candidate(
+        user_message["id"],
+        non_correction.proposed_memory_type,
+        non_correction.proposed_content,
+        non_correction.proposed_canonical_key,
+    )
+
+    assert non_correction.proposal_type is ProposalType.UPDATE
+    assert matches == []
 
 
 def test_accept_only_changes_proposal_and_does_not_create_or_replace_memory(proposal_context):

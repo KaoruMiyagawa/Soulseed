@@ -61,6 +61,8 @@ class MemoryCorrectionService:
                 return self._result(db, proposal_id)
             if row["status"] != ProposalStatus.ACCEPTED.value:
                 raise ProposalStateError("只有 accepted Proposal 才能应用")
+            if row["target_memory_id"] is None and row["target_memory_updated_at"] is not None:
+                raise ProposalApplicationError("Proposal 的原目标记忆已删除，不能按无目标 Proposal 应用")
             if row["target_memory_id"] is not None and row["target_memory_updated_at"] is None:
                 raise ProposalApplicationError("Proposal 缺少目标记忆快照，需要重新生成 Proposal")
 

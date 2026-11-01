@@ -377,6 +377,86 @@ def test_terminal_proposal_replay_preserves_terminal_status(flow_context, termin
     assert replay.proposal.proposal_id == proposal_id
 
 
+@pytest.mark.parametrize(
+    ("terminal", "expected_status", "transition_name"),
+    [
+        (ProposalStatus.REJECTED, CorrectionFlowStatus.PROPOSAL_REJECTED, "reject_proposal"),
+        (ProposalStatus.CANCELLED, CorrectionFlowStatus.PROPOSAL_CANCELLED, "cancel_proposal"),
+        (ProposalStatus.EXPIRED, CorrectionFlowStatus.PROPOSAL_EXPIRED, "expire_proposal"),
+    ],
+)
+def test_new_message_can_reopen_correction_after_terminal_proposal(flow_context, terminal, expected_status, transition_name):
+    _, _, messages, memory_service, proposal_service, flow, conversation = flow_context
+    old = add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")
+    content = "我之前说错了，我的目标是雅思 7 分。"
+    message_a = add_user_message(messages, conversation, content)
+    candidate_a = candidate(content)
+
+    first = flow.process(message_a, [candidate_a])[0]
+    proposal_a_id = first.proposal.proposal_id
+    getattr(proposal_service, transition_name)(proposal_a_id)
+
+    replay_a = flow.process(message_a, [candidate_a])[0]
+    assert replay_a.status is expected_status
+    assert replay_a.proposal.proposal_id == proposal_a_id
+
+    message_b = add_user_message(messages, conversation, content)
+    assert message_b["id"] != message_a["id"]
+    second = flow.process(message_b, [candidate(content)])[0]
+
+    assert second.status is CorrectionFlowStatus.PROPOSAL_CREATED
+    proposal_b = proposal_service.get_proposal(second.proposal.proposal_id)
+    assert proposal_b.id != proposal_a_id
+    assert proposal_b.evidence_message_id == message_b["id"]
+    assert proposal_service.get_proposal(proposal_a_id).evidence_message_id == message_a["id"]
+    assert proposal_service.get_proposal(proposal_a_id).status is terminal
+    assert len(proposal_service.list_proposals()) == 2
+    assert len(proposal_service.list_changes(proposal_a_id)) == 2
+    assert len(proposal_service.list_changes(proposal_b.id)) == 1
+    assert memory_service.get_memory(old.id).status is MemoryStatus.ACTIVE
+
+
+def test_missing_historical_target_replay_does_not_create_replacement_proposal(flow_context):
+    database, _, messages, memory_service, proposal_service, flow, conversation = flow_context
+    old = add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")
+    message = add_user_message(messages, conversation, "我之前说错了，我的目标是雅思 7 分。")
+    extracted = candidate(message["content"])
+    first = flow.process(message, [extracted])[0]
+    proposal_id = first.proposal.proposal_id
+    proposal_service.reject_proposal(proposal_id)
+    memory_service.permanently_delete_memory(old.id)
+
+    historical = proposal_service.get_proposal(proposal_id)
+    assert historical.target_memory_id is None
+    replay = flow.process(message, [extracted])[0]
+
+    assert replay.status is CorrectionFlowStatus.PROPOSAL_REJECTED
+    assert replay.proposal.proposal_id == proposal_id
+    assert replay.proposal.target_memory_id is None
+    assert len(proposal_service.list_proposals()) == 1
+    assert len(proposal_service.list_changes(proposal_id)) == 2
+    assert memory_service.list_memories(include_inactive=True) == []
+
+
+def test_pending_historical_proposal_with_missing_target_fails_without_retargeting(flow_context):
+    _, _, messages, memory_service, proposal_service, flow, conversation = flow_context
+    old = add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")
+    message = add_user_message(messages, conversation, "我之前说错了，我的目标是雅思 7 分。")
+    extracted = candidate(message["content"])
+    first = flow.process(message, [extracted])[0]
+    proposal_id = first.proposal.proposal_id
+    memory_service.permanently_delete_memory(old.id)
+
+    replay = flow.process(message, [extracted])[0]
+
+    assert replay.status is CorrectionFlowStatus.PROCESSING_FAILED
+    assert replay.error_code == "historical_target_memory_missing"
+    assert replay.proposal is None
+    assert len(proposal_service.list_proposals()) == 1
+    assert proposal_service.get_proposal(proposal_id).target_memory_id is None
+    assert memory_service.list_memories(include_inactive=True) == []
+
+
 def test_flow_does_not_modify_formal_memory(flow_context):
     database, _, messages, memory_service, proposal_service, flow, conversation = flow_context
     old = add_memory(memory_service, MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5")

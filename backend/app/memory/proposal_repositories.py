@@ -131,8 +131,8 @@ class MemoryProposalRepository:
         memory_type = MemoryType(proposed_memory_type).value
         with self.database.connection() as db:
             rows = db.execute(
-                "SELECT * FROM memory_change_proposals WHERE evidence_message_id = ? AND proposed_memory_type = ? AND proposed_content = ? AND proposed_canonical_key = ? ORDER BY created_at, id",
-                (evidence_message_id, memory_type, proposed_content, proposed_canonical_key),
+                "SELECT * FROM memory_change_proposals WHERE proposal_type = ? AND evidence_message_id = ? AND proposed_memory_type = ? AND proposed_content = ? AND proposed_canonical_key = ? ORDER BY created_at, id",
+                (ProposalType.CORRECTION.value, evidence_message_id, memory_type, proposed_content, proposed_canonical_key),
             ).fetchall()
         return [self._proposal_from_row(row) for row in rows]
 

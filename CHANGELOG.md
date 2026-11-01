@@ -1,6 +1,6 @@
 # Soulseed 技术版本档案
 
-> 本文档记录 Soulseed 从 v1.0.1 到 v1.2.0 阶段 1 的记忆系统技术演进。它同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
+> 本文档记录 Soulseed 从 v1.0.1 到 v1.2.0 阶段 2.6 的记忆系统技术演进。v1.2.0 仍在开发中，阶段 2.6 的完成不代表整个版本发布。本文同时服务于版本回顾、架构复盘、问题追溯和后续开发规划。
 >
 > 重要的历史边界：当前 Git 仓库没有 v1.0.1–v1.1.0 的逐版本 Tag，也没有为每个版本建立独立 Commit。Git 中可以直接确认的主要提交是基础实现、审计与幂等加固、原子 Proposal 纠正三个阶段。因此，本文对逐版本的归属严格区分代码证据、现有开发报告和无法进一步确认的历史信息；无法拆分的内容不会伪造 Commit 映射。
 
@@ -18,7 +18,7 @@
 - [v1.0.8 — 只读冲突检测器](#v108--只读冲突检测器)
 - [v1.0.9 — Proposal 存储与生命周期](#v109--proposal-存储与生命周期)
 - [v1.1.0 — 用户确认后的原子记忆纠正服务](#v110--用户确认后的原子记忆纠正服务)
-- [v1.2.0 — 记忆纠正流程编排层（开发中，阶段 1）](#v120--记忆纠正流程编排层开发中阶段-1)
+- [v1.2.0 — 记忆纠正闭环（开发中，阶段 1–2.6）](#v120--记忆纠正闭环开发中阶段-12)
 - [当前已知限制与后续方向](#当前已知限制与后续方向)
 
 ## 文档范围与证据约定
@@ -86,16 +86,17 @@ flowchart LR
 
 ---
 
-## v1.2.0 — 记忆纠正流程编排层（开发中，阶段 1）
+## v1.2.0 — 记忆纠正闭环（开发中，阶段 1–2.6）
 
 ### 版本信息
 
 - 版本名称：记忆纠正流程编排层
-- 当前状态：v1.2.0 仍在开发中，本次仅完成阶段 1 及其一致性与误创建防护修复
-- 阶段范围：CorrectionFlowService 编排、Proposal 创建快照校验、长期变化目标定位和回归测试
-- 后端完整测试：`133 passed`
+- 当前状态：v1.2.0 仍在开发中，目前完成阶段 1 和阶段 2.1–2.6；不是 v1.2.0 整体发布
+- 阶段范围：CorrectionFlowService 编排、ChatService 接入、候选级异常隔离、Proposal 幂等与历史重放安全
+- 阶段 1 验证记录：后端完整测试 `133 passed`
+- 阶段 2.6 最终独立复核：后端完整测试 `158 passed, 0 failed, 0 skipped`；存在一条 Starlette/httpx 弃用警告
 
-本阶段没有接入 `ChatService`、HTTP API 或前端，也没有形成完整的聊天纠正闭环。后续阶段仍需由聊天主链路统一提取候选、接入纠正编排，并实现 Proposal 确认交互。
+阶段 1 本身没有接入 `ChatService`、HTTP API 或前端。阶段 2.1–2.6 随后将纠正候选编排接入聊天主链路，但当前仍没有 Proposal HTTP API、前端确认与应用交互，也没有形成完整的聊天纠正闭环。
 
 ### 阶段 1 已完成能力
 
@@ -178,15 +179,31 @@ related = exact_key or bool(shared_terms) or same_slot
 
 本阶段没有新增数据库 Migration，也没有执行真实数据库迁移。Proposal 创建一致性、正式记忆替代、来源写入、审计和事务回滚仍由已有 v1.1.0 服务负责。
 
+### 阶段 2.1–2.5：ChatService 主链路接入
+
+`ChatService` 在持久化 user message 后调用确定性提取器一次，并将 `CorrectionIntent.NONE` 候选交给普通记忆持久化路径，将纠正候选交给 `CorrectionFlowService`。纠正流程失败会记录日志并在聊天 correction 摘要中保留失败状态；普通聊天仍可继续。纠正 Proposal 的创建与后续用户确认、正式应用保持分离。
+
+聊天响应保留原 assistant message 字段，并增加结构化 `correction` 摘要。摘要包含顶层状态和逐候选 `items`；Proposal 已创建或复用时包含真实 Proposal ID，澄清和失败状态不会伪造 Proposal ID。候选状态不一致时顶层使用 `mixed`。
+
+### 阶段 2.6：候选隔离、并发幂等与历史重放安全
+
+- `CorrectionFlowService.process()` 对每个候选独立处理；一个候选出现未预期异常时返回该候选的 `processing_failed`，继续处理后续候选，并保留已成功候选的 Proposal ID 和顺序。
+- Proposal 并发创建遇到幂等唯一键冲突时，仓储回滚失败事务，在新连接中按幂等键查询已提交记录，并核对 request fingerprint；相同请求复用既有 Proposal，不同请求参数报告幂等冲突，其他数据库完整性错误不会被冒充为复用成功。
+- 历史重放按来源消息、候选和 correction 类型识别既有 Proposal，并保留 pending、accepted、applied、rejected、cancelled、expired 等真实生命周期状态。同一来源消息重放保持幂等；不同来源消息可以重新发起纠正。
+- 历史目标因外键 `ON DELETE SET NULL` 被删除后，重放仍识别原 Proposal；apply 会在原子事务内验证目标快照，拒绝将已删除的原目标伪装为无目标 Proposal。应用失败不会留下 replacement、正式记忆变更或 application log。
+- 模型调用失败不自动接受或应用已创建 Proposal；assistant 消息保存失败不生成虚假的完整聊天成功响应，也不回滚或改写 Proposal 的真实状态。
+- 阶段 2.6 最终验证执行后端完整测试 `158 passed, 0 failed, 0 skipped`，`compileall` 通过，`git diff --check` 通过；测试报告有一条 Starlette/httpx 弃用警告。
+
 ### 当前未完成内容
 
-以下内容不属于本阶段已完成能力：
+以下内容仍未实现，不应视为 v1.2.0 已完成：
 
-- 尚未接入 `ChatService`；
-- 尚无完整 Proposal HTTP API；
-- 尚无前端记忆纠正确认界面；
-- 尚未实现从聊天消息到 Proposal 确认再到正式记忆更新的完整闭环；
-- 尚未扩展多用户权限、真实环境迁移或其他交互通道。
+- 尚无 HTTP 请求级幂等键；当前业务级重放保护依赖已持久化的来源 message_id；
+- 尚无 Proposal HTTP API 和完整的前端确认、拒绝及应用交互；
+- 尚未实现从聊天消息、Proposal 确认到正式记忆更新的完整用户可操作闭环；
+- 尚未实现多用户认证或公网部署安全；当前不能据此宣称适用于公网多用户环境；
+- 尚未进行真实模型 API 端到端验证；阶段测试不调用真实模型 API；
+- 没有新增 Migration，也没有修改 v1.1.0 `MemoryCorrectionService` 的原子应用语义。
 
 ---
 

@@ -6,6 +6,7 @@ from app.db import Database
 from app.memory import (
     CorrectionIntent,
     MemoryCorrectionService,
+    ProposalApplicationError,
     MemoryCreate,
     MemoryProposalRepository,
     MemoryProposalService,
@@ -131,6 +132,26 @@ def test_changed_target_is_rejected_without_partial_application(correction_conte
     with database.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 1
         assert db.execute("SELECT application_status FROM memory_change_proposals WHERE id = ?", (proposal.id,)).fetchone()[0] == "not_applied"
+
+
+def test_deleted_target_cannot_be_applied_as_targetless_proposal(correction_context):
+    database, memories, proposals, correction, _, message = correction_context
+    old = memories.create_memory(MemoryCreate(MemoryType.GOAL, "我的目标是雅思 6.5 分。", "goal:ielts:6.5"))
+    proposal = proposals.create_proposal(make_proposal(message["id"], target_memory_id=old.id))
+    proposals.accept_proposal(proposal.id)
+    memories.permanently_delete_memory(old.id)
+
+    loaded = proposals.get_proposal(proposal.id)
+    assert loaded.target_memory_id is None
+    assert loaded.target_memory_updated_at is not None
+
+    with pytest.raises(ProposalApplicationError, match="原目标记忆已删除"):
+        correction.apply_proposal(proposal.id)
+
+    assert memories.list_memories(include_inactive=True) == []
+    assert proposals.get_proposal(proposal.id).application_status.value == "not_applied"
+    with database.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log WHERE proposal_id = ?", (proposal.id,)).fetchone()[0] == 0
 
 
 def test_failure_rolls_back_and_can_retry(correction_context, monkeypatch):

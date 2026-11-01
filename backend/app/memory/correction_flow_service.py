@@ -33,7 +33,7 @@ class CorrectionFlowStatus(StrEnum):
 @dataclass(frozen=True)
 class CorrectionProposalSummary:
     proposal_id: str
-    target_memory_id: str
+    target_memory_id: str | None
     relation: MemoryRelation
     confidence: float
     evidence: tuple[str, ...]
@@ -118,7 +118,7 @@ class CorrectionFlowService:
                 )
             except Exception as exc:
                 return self._failure("查询历史纠正 Proposal 失败", "proposal_replay_lookup_failed", exc)
-            if len(previous) == 1 and previous[0].target_memory_id is not None:
+            if len(previous) == 1:
                 existing = previous[0]
                 summary = CorrectionProposalSummary(
                     proposal_id=existing.id,
@@ -127,6 +127,15 @@ class CorrectionFlowService:
                     confidence=existing.confidence,
                     evidence=(existing.evidence,),
                 )
+                if (
+                    existing.target_memory_id is None
+                    and existing.status in (ProposalStatus.PENDING, ProposalStatus.ACCEPTED)
+                    and existing.application_status is not ProposalApplicationStatus.APPLIED
+                ):
+                    return self._failure(
+                        "历史 Proposal 的目标记忆已不存在，不能重新定位或创建 Proposal",
+                        "historical_target_memory_missing",
+                    )
                 return self._replayed_result(existing, summary)
             if len(previous) > 1:
                 return self._clarification(
