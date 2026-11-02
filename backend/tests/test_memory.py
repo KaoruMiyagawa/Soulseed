@@ -1,6 +1,3 @@
-import shutil
-from pathlib import Path
-
 import pytest
 
 from app.db import Database
@@ -36,16 +33,18 @@ def test_new_database_migration_creates_memory_tables(tmp_path):
     with database.connection() as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"memory_items", "memory_sources"}.issubset(tables)
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
 
 
-def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path):
-    source = Path("backend/data/soulseed.db")
-    if not source.exists():
-        pytest.skip("当前工作区没有现有数据库文件")
-    target = tmp_path / "upgraded.db"
-    shutil.copy2(source, target)
-    before = Database(str(target))
+def test_synthetic_legacy_database_upgrade_preserves_conversations_and_messages(tmp_path, monkeypatch):
+    all_migrations = db_module.MIGRATIONS
+    monkeypatch.setattr(db_module, "MIGRATIONS", {version: sql for version, sql in all_migrations.items() if version <= 11})
+    before = Database(str(tmp_path / "synthetic-legacy.db"))
+    before.initialize()
+    with before.connection() as connection:
+        connection.execute("INSERT INTO conversations(id,title,created_at,updated_at) VALUES ('legacy-c','legacy','t','t')")
+        connection.execute("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES ('legacy-m','legacy-c','user','synthetic','t')")
+    monkeypatch.setattr(db_module, "MIGRATIONS", all_migrations)
     with before.connection() as connection:
         conversation_count = connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
         message_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
@@ -53,7 +52,7 @@ def test_existing_database_upgrade_preserves_conversations_and_messages(tmp_path
     with before.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == conversation_count
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == message_count
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
 
 
 def test_migration_is_idempotent(memory_context):
@@ -61,7 +60,7 @@ def test_migration_is_idempotent(memory_context):
     database.initialize()
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'").fetchone()[0] == 1
 
 
@@ -75,7 +74,7 @@ def test_failed_migration_rolls_back_schema_and_marker(tmp_path, monkeypatch):
         database.initialize()
 
     with database.connection() as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_should_rollback'").fetchone()[0] == 0
 
 

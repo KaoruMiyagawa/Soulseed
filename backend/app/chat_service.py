@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -19,6 +20,7 @@ from .model_adapter import (
     ClarificationAction,
     ClarificationResolution,
     ModelAdapter,
+    ModelRequestError,
     StructuredChatReply,
     StructuredOutputError,
 )
@@ -34,6 +36,7 @@ from .memory.repositories import (
 )
 from .memory.proposal_service import MemoryProposalService
 from .repositories import ConversationRepository, MessageRepository
+from .ownership import current_character
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,8 @@ class ChatService:
         proposal_service: MemoryProposalService | None = None,
         clarification_application: ClarificationApplicationService | None = None,
         memory_correction_service: MemoryCorrectionService | None = None,
+        life_repository=None,
+        contact_service=None,
     ):
         self.conversations, self.messages, self.model, self.system_prompt = conversations, messages, model, system_prompt
         self.memory_service, self.memory_extractor = memory_service, memory_extractor
@@ -63,10 +68,17 @@ class ChatService:
         self.proposal_service = proposal_service
         self.clarification_application = clarification_application
         self.memory_correction_service = memory_correction_service
+        self.life_repository = life_repository
+        self.contact_service = contact_service
 
     async def send(self, conversation_id: str, content: str) -> dict:
         self.conversations.get(conversation_id)
         user_message = self.messages.add(conversation_id, "user", content)
+        if self.contact_service is not None:
+            try:
+                self.contact_service.observe_user_message(content, character_id=current_character.get())
+            except Exception:
+                logger.exception("主动联系偏好更新失败 message_id=%s", user_message["id"])
 
         pending: ClarificationRecord | None = None
         claim = None
@@ -97,6 +109,8 @@ class ChatService:
             return {**assistant_message, "correction": self._correction_summary(())}
 
         memory_context = ""
+        share_service = None
+        share_reservation = None
         if self.memory_retriever and self.memory_context_builder:
             try:
                 memory_context = self.memory_context_builder.build(self.memory_retriever.retrieve(content))
@@ -142,6 +156,22 @@ class ChatService:
                                 for _ in correction_candidates
                             )
 
+        if self.life_repository is not None:
+            try:
+                from .life_engine import LifeEngine
+                LifeEngine(self.life_repository).advance(current_character.get())
+                life_context = self.life_repository.context(content, character_id=current_character.get())
+                if life_context:
+                    memory_context = f"{memory_context}\n{life_context}" if memory_context else life_context
+                if not correction_results and not clarification_busy:
+                    from .life_share import LifeShareService
+                    share_service = LifeShareService(self.life_repository)
+                    share_reservation = share_service.reserve_for_chat(content, character_id=current_character.get())
+                    if share_reservation:
+                        candidate = share_reservation["context"]
+                        memory_context = f"{memory_context}\n{candidate}" if memory_context else candidate
+            except Exception:
+                logger.exception("生活状态读取或推进失败，继续执行聊天请求 message_id=%s", user_message["id"])
         model_messages = self._model_messages(conversation_id, memory_context)
         clarification = self._single_clarification_context(correction_results)
         if clarification is not None and self.clarifications is not None:
@@ -167,11 +197,22 @@ class ChatService:
                         record.id, reply, awaiting_user=False
                     )
                 else:
-                    self._validate_decision_binding(answer, record.id, initial=True)
+                    self._validate_decision_binding(answer, record.id, phase="initial")
                     awaiting = answer.action is ClarificationAction.ASK
                     assistant_message, _ = self.clarifications.persist_preparing_reply(
                         record.id, answer.content, awaiting_user=awaiting
                     )
+            except StructuredOutputError as exc:
+                logger.warning(
+                    "首次澄清决策不符合阶段契约 message_id=%s diagnostic=%s",
+                    user_message["id"],
+                    exc.code,
+                )
+                if record is not None:
+                    try:
+                        self.clarifications.defer_preparing(record.id, exc.code)
+                    except Exception:
+                        logger.exception("首次澄清契约错误状态无法持久化 clarification_id=%s", record.id)
             except Exception:
                 logger.exception("澄清生成或持久化失败，未标记为已提问 message_id=%s", user_message["id"])
                 if record is not None:
@@ -183,8 +224,19 @@ class ChatService:
                 self.conversations.touch(conversation_id)
                 return {**assistant_message, "correction": self._correction_summary(correction_results)}
 
-        reply = await self.model.reply(model_messages)
-        assistant_message = self.messages.add(conversation_id, "assistant", reply)
+        try:
+            reply = await self.model.reply(model_messages)
+            with self.messages.database.atomic():
+                assistant_message = self.messages.add(conversation_id, "assistant", reply)
+                if share_reservation and not share_service.commit_chat_selection(share_reservation["token"]):
+                    raise RuntimeError("分享候选保留已过期，聊天消息未保存")
+        except Exception:
+            if share_reservation:
+                try:
+                    share_service.release_chat_reservation(share_reservation["token"])
+                except Exception:
+                    logger.exception("释放生活分享候选保留失败 intent_id=%s", share_reservation["intent_id"])
+            raise
         self.conversations.touch(conversation_id)
         return {**assistant_message, "correction": self._correction_summary(correction_results)}
 
@@ -203,7 +255,25 @@ class ChatService:
                     clarification.id, token or "", reply, ClarificationStatus.DEFERRED, error_code="structured_output_unavailable"
                 )
                 return assistant_message
-            self._validate_decision_binding(answer, clarification.id)
+            try:
+                self._validate_decision_binding(answer, clarification.id, phase="response")
+            except StructuredOutputError as exc:
+                logger.warning(
+                    "澄清答复决策不符合阶段契约 clarification_id=%s diagnostic=%s",
+                    clarification.id,
+                    exc.code,
+                )
+                reply = await self._generate_nonapplication_reply(
+                    model_messages, "unverified_structured_decision", user_message["content"]
+                )
+                assistant_message, _ = self.clarifications.persist_processing_reply(
+                    clarification.id,
+                    token or "",
+                    reply,
+                    ClarificationStatus.DEFERRED,
+                    error_code=exc.code,
+                )
+                return assistant_message
             outcome, error_code, resolution_value, candidates = self._validated_resolution(answer, user_message["content"])
             evidence_excerpt = answer.evidence_excerpt
 
@@ -393,10 +463,30 @@ class ChatService:
         try:
             result = await method(prompt)
             if not isinstance(result, StructuredChatReply):
-                raise StructuredOutputError("结构化模型响应类型无效")
+                raise StructuredOutputError("结构化模型响应类型无效", code="invalid_result_type")
+            if result.ignored_extra_fields:
+                logger.info("结构化澄清输出含可忽略的额外字段 clarification_id=%s", clarification.id)
             return result
-        except Exception:
-            logger.warning("结构化澄清输出不可用，回退普通聊天 clarification_id=%s", clarification.id, exc_info=True)
+        except StructuredOutputError as exc:
+            logger.warning(
+                "结构化澄清输出不可用，回退普通聊天 clarification_id=%s diagnostic=%s",
+                clarification.id,
+                exc.code,
+            )
+            return None
+        except ModelRequestError as exc:
+            logger.warning(
+                "结构化模型请求失败，回退普通聊天 clarification_id=%s http_status=%s",
+                clarification.id,
+                exc.status_code,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "结构化澄清处理不可用，回退普通聊天 clarification_id=%s error_type=%s",
+                clarification.id,
+                type(exc).__name__,
+            )
             return None
 
     def _model_messages(self, conversation_id: str, memory_context: str) -> list[dict[str, str]]:
@@ -450,29 +540,75 @@ class ChatService:
 
     @staticmethod
     def _decision_instruction(record: ClarificationRecord, phase: str, user_text: str) -> str:
-        mode = (
-            "判断这轮回复是否适合自然地询问用户刚表达的变化；也可以暂缓或正常回应。"
-            if phase == "initial"
-            else "判断用户最新回复是在明确解释长期变化、否认变化、表达临时尝试、仍不明确，还是转移话题。可以继续自然询问，也可以暂缓或正常回应。"
+        def example(reply: str, action: str, resolution: str, excerpt: str | None) -> str:
+            return json.dumps(
+                {
+                    "reply": reply,
+                    "clarification": {
+                        "clarification_id": record.id,
+                        "action": action,
+                        "resolution": resolution,
+                        "evidence_excerpt": excerpt,
+                    },
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        common = (
+            "只输出一个 JSON 对象，不得附加 Markdown 代码围栏或对象外说明。"
+            "reply 是给用户看的自然中文；不得在 reply 中提及内部协议、Proposal 或状态。"
+            f"clarification_id 必须原样为 '{record.id}'。action 只能是 ask、defer、normal。"
         )
-        return (
-            "内部输出协议：只生成一个 JSON 对象，不得将协议内容放入 reply。reply 是直接给用户看的自然中文。\n"
-            f"clarification_id 必须原样为 {record.id!r}。{mode}\n"
-            "clarification.action 只能是 ask、defer、normal；resolution 只能是 none、explicit_change、original_was_wrong、coexisting、denied、temporary、unclear、off_topic。"
-            "只有确实提出与这条澄清相关的问题才选 ask；不能按问号或措辞推断是否询问。"
-            "resolution 若不是 none，evidence_excerpt 必须逐字摘录当前用户消息中的依据；否则填 null。"
-            "初次阶段 resolution 应为 none。明确解释必须是用户自己的持续性事实表达；简短附和不能算明确解释。"
-            f"当前需要验证来源的用户原文：{user_text!r}"
-        )
+        if phase == "initial":
+            return (
+                "当前阶段是 initial：系统刚从用户消息发现可能与旧记忆不同的信息，尚未向用户提出并保存本次澄清问题。"
+                "用户当前这句话是触发澄清的原始表达，不是对本次澄清问题的回答；即使用户说了‘已经改变’或‘永久改用’，"
+                "也不得在本阶段把它分类为 explicit_change 或其他答复结论。"
+                "你只决定这轮是否适合自然追问：确实询问这项变化时 action=ask；暂缓时 action=defer；"
+                "优先回应其他话题或不发起澄清时 action=normal。不要强迫每次变化都追问。"
+                "本阶段 resolution 必须为 none，evidence_excerpt 必须为 null。\n"
+                f"ask 示例：{example('咦，你这是已经把主要开发环境换掉了吗？', 'ask', 'none', None)}\n"
+                f"defer 示例：{example('哦，听起来你最近在折腾新的开发环境。', 'defer', 'none', None)}\n"
+                f"normal 示例：{example('Linux 的终端确实挺有意思，你最近在忙什么项目？', 'normal', 'none', None)}\n"
+                f"{common}\n当前触发澄清的用户原文：{user_text!r}"
+            )
+        if phase == "response":
+            return (
+                "当前阶段是 response：这条用户消息已经关联到一条先前实际保存的澄清问题。"
+                "只依据这条最新 user 消息分类，不得把大肥鱼自己的猜测、旧消息或自己的提问当作用户证据。"
+                "resolution 必须且只能是 explicit_change、original_was_wrong、coexisting、denied、temporary、unclear、off_topic 之一；"
+                "none 在本阶段无效。action 表示这轮回复是否继续追问、暂缓或正常回应；不要把 action 当作用户事实分类。"
+                "resolution 不是 none 时，evidence_excerpt 必须逐字取自当前用户答复；证据不足时选 unclear，不能编造摘录。"
+                "明确长期变化或原记忆错误必须由用户直接、清楚地表达；‘嗯’、‘好吧’等简短附和不构成证据。\n"
+                f"明确答复示例（仅当当前用户原话确实包含该句时才可照此摘录）：{example('哦，这下我听明白啦。', 'normal', 'explicit_change', '我已经永久改用 Linux 作为主要开发环境')}\n"
+                f"含糊答复示例：{example('那我再陪你慢慢想想。', 'ask', 'unclear', '我还没想好，可能吧')}\n"
+                f"{common}\n当前需要分类的用户答复原文：{user_text!r}"
+            )
+        raise StructuredOutputError("未知的澄清决策阶段", code="unknown_decision_phase")
 
     @staticmethod
     def _validate_decision_binding(
-        answer: StructuredChatReply, clarification_id: str, *, initial: bool = False
+        answer: StructuredChatReply, clarification_id: str, *, phase: str
     ) -> None:
         if answer.clarification_id != clarification_id:
-            raise StructuredOutputError("结构化决策引用了错误的澄清记录")
-        if initial and answer.resolution is not ClarificationResolution.NONE:
-            raise StructuredOutputError("初次澄清不能将模型判断伪装成用户答复")
+            raise StructuredOutputError(
+                "结构化决策引用了错误的澄清记录", code="clarification_id_mismatch"
+            )
+        if phase == "initial" and answer.resolution is not ClarificationResolution.NONE:
+            raise StructuredOutputError(
+                "首次发现阶段不能分类为用户答复", code="initial_resolution_must_be_none"
+            )
+        if phase == "initial" and answer.evidence_excerpt is not None:
+            raise StructuredOutputError(
+                "首次发现阶段不能提交用户答复证据", code="initial_evidence_must_be_null"
+            )
+        if phase == "response" and answer.resolution is ClarificationResolution.NONE:
+            raise StructuredOutputError(
+                "澄清答复阶段必须提供明确分类", code="response_resolution_required"
+            )
+        if phase not in {"initial", "response"}:
+            raise StructuredOutputError("未知的澄清决策阶段", code="unknown_decision_phase")
 
     def _validated_resolution(
         self, answer: StructuredChatReply, user_text: str

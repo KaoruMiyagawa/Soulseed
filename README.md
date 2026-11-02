@@ -32,7 +32,14 @@ SOULSEED_MODEL_NAME=deepseek-ai/DeepSeek-V4.1-Flash
 
 ## 启动与停止
 
+首次升级到 Migration 12 前，请先阅读 [数据归属与本地配对说明](docs/ownership_and_local_auth.md)：
+旧会话归属需要明确确认，未确认数据会被保留并隔离。
+在本机 `.env` 设置至少 32 字符的随机 `SOULSEED_LOCAL_PAIRING_SECRET`，网页首次进入时输入该口令配对。development 默认使用独立的 `backend/data/soulseed-development.db`；受保护的既有数据需要同时启用 `SOULSEED_ALLOW_PROTECTED_DATABASE_ACCESS=true` 并将 `SOULSEED_PROTECTED_DATABASE_CONFIRMATION` 设置为该数据库规范化后的绝对路径。访问已受保护数据库时，任何待执行迁移仍必须有仓库外字节一致备份及精确版本确认。
+口令不应放入前端配置；未配置时数据接口保持锁定。
+
 在项目根目录打开两个终端：
+
+事故后历史会话的本地只读归属确认工具使用 `python backend\scripts\confirm_legacy_ownership.py` 启动；先运行 `--verify-only` 可只输出快照哈希和聚合数量。工具固定读取已核验的分析副本，交互内容仅在本机终端按需显示；确认清单保存于当前用户本地受限目录，不包含聊天正文，也不执行数据库恢复。
 
 ```powershell
 # 终端 1：后端 API（127.0.0.1:8001）
@@ -46,14 +53,18 @@ npm run dev
 
 访问 http://127.0.0.1:5174。使用各终端的 Ctrl+C 停止服务。后端明确绑定回环地址，不开放公网访问。
 
+一个 SQLite 数据库只允许一个后端进程使用。第二个服务进程会因本机实例锁冲突而拒绝启动；不要用多个 Uvicorn worker、网络文件系统或多台主机共享数据库。锁文件位于数据库旁，服务退出后由操作系统释放锁。可通过已授权的 `GET /api/characters/{character_id}/life` 检查活动 `effective_status`、中断原因与时间。
+
 ## 测试
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-pytest -q backend\tests
+python backend\scripts\run_isolated.py tests
 Set-Location frontend
 npm run build
 ```
+
+后端自动化测试必须通过隔离启动器运行。它为每次运行创建独立临时目录和 SQLite 数据库，测试环境不会读取项目 `.env`；直接运行 `pytest` 会失败即拒绝启动。手工运行隔离 API 可使用 `python backend\scripts\run_isolated.py api --port 18081`，退出后启动器会清理自己创建的临时目录。测试数据库路径必须是系统临时目录下的绝对路径，并且经符号链接/junction 解析后仍位于该目录。
 
 ## 故障排查
 
@@ -64,7 +75,7 @@ npm run build
 - `硅基流动找不到模型`：确认 `SOULSEED_MODEL_NAME` 使用完整模型 ID；当前默认值为 `deepseek-ai/DeepSeek-V4.1-Flash`。
 - `模型服务返回 HTTP ...`：检查 `SOULSEED_MODEL_BASE_URL`、模型名称、网络和供应商配额。
 - 页面无法连接：确认后端在 8001 端口运行，前端请求基地址为 `http://127.0.0.1:8001/api`，且页面来源为 `http://127.0.0.1:5174` 或 `http://localhost:5174`。
-- 数据库迁移：首次启动会在 `backend/data/soulseed.db` 建库并执行版本化迁移；测试使用临时数据库。
+- 数据库迁移：development 环境会自动执行版本化迁移。production 环境不会自动建库；有待执行迁移时必须提供仓库外的完整独立备份路径以及精确版本确认（如 `13->14`）。测试只能使用上述隔离启动器。
 
 ## 当前未实现与接口预留
 

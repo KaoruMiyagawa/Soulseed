@@ -1,10 +1,9 @@
-import shutil
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
 from app.db import Database
+import app.db as db_module
 from app.memory import (
     MemoryActorType,
     MemoryChangeAction,
@@ -167,13 +166,15 @@ def test_expires_at_is_lazy_and_does_not_create_expired_audit(history_context):
     assert [change.action for change in service.list_change_log(memory.id)] == [MemoryChangeAction.CREATED]
 
 
-def test_existing_database_upgrade_preserves_data_and_adds_history_table(tmp_path):
-    source = Path("backend/data/soulseed.db")
-    if not source.exists():
-        pytest.skip("当前工作区没有现有数据库文件")
-    target = tmp_path / "upgraded.db"
-    shutil.copy2(source, target)
-    database = Database(str(target))
+def test_synthetic_legacy_upgrade_preserves_data_and_adds_history_table(tmp_path, monkeypatch):
+    all_migrations = db_module.MIGRATIONS
+    monkeypatch.setattr(db_module, "MIGRATIONS", {version: sql for version, sql in all_migrations.items() if version <= 11})
+    database = Database(str(tmp_path / "synthetic-legacy.db"))
+    database.initialize()
+    with database.connection() as connection:
+        connection.execute("INSERT INTO conversations(id,title,created_at,updated_at) VALUES ('legacy-c','legacy','t','t')")
+        connection.execute("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES ('legacy-m','legacy-c','user','synthetic','t')")
+    monkeypatch.setattr(db_module, "MIGRATIONS", all_migrations)
     with database.connection() as connection:
         before = (
             connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
@@ -183,5 +184,5 @@ def test_existing_database_upgrade_preserves_data_and_adds_history_table(tmp_pat
     with database.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == before[0]
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == before[1]
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_change_log'").fetchone()[0] == 1

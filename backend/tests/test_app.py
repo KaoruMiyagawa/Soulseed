@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import httpx
 
@@ -43,7 +45,7 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
 
 
 @pytest.mark.asyncio
@@ -134,7 +136,7 @@ async def test_reasoning_content_is_not_used_as_final_reply():
 
 
 @pytest.mark.asyncio
-async def test_structured_model_reply_is_strictly_parsed_and_requests_json_mode():
+async def test_structured_model_reply_is_parsed_and_requests_json_mode():
     captured = {}
 
     class CapturingClient(FakeClient):
@@ -151,7 +153,7 @@ async def test_structured_model_reply_is_strictly_parsed_and_requests_json_mode(
             "evidence_excerpt": None,
         },
     }
-    response = httpx.Response(200, json={"choices": [{"message": {"content": __import__("json").dumps(payload, ensure_ascii=False)}}]})
+    response = httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]})
     adapter = OpenAICompatibleAdapter(
         Settings(model_api_key="test-key", model_name="test"),
         client_factory=lambda **kwargs: CapturingClient(response, **kwargs),
@@ -164,22 +166,118 @@ async def test_structured_model_reply_is_strictly_parsed_and_requests_json_mode(
 
 
 @pytest.mark.asyncio
-async def test_structured_model_reply_rejects_extra_fields():
+async def test_structured_model_reply_ignores_additive_unknown_fields():
     response = httpx.Response(
         200,
-        json={"choices": [{"message": {"content": '{"reply":"你好","clarification":{},"proposal_id":"leak"}'}}]},
+        json={"choices": [{"message": {"content": json.dumps({
+            "reply": "你好",
+            "proposal_id": "ignored",
+            "clarification": {
+                "clarification_id": None,
+                "action": "normal",
+                "resolution": "none",
+                "evidence_excerpt": None,
+                "commentary": "ignored",
+            },
+        })}}]},
     )
-    with pytest.raises(StructuredOutputError):
+    result = await adapter_with_response(response).reply_structured([])
+    assert result.content == "你好"
+    assert result.ignored_extra_fields is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "diagnostic"),
+    [
+        ("not json", "json_syntax_error"),
+        ('{"reply":"x","clarification":', "json_truncated"),
+        ('{"reply":"x"}', "missing_top_level_fields"),
+        ('{"reply":"x","clarification":{}}', "missing_clarification_fields"),
+        ('{"reply":"x","clarification":{"clarification_id":null,"action":"maybe","resolution":"none","evidence_excerpt":null}}', "invalid_action_enum"),
+        ('{"reply":"x","clarification":{"clarification_id":null,"action":"normal","resolution":"maybe","evidence_excerpt":null}}', "invalid_resolution_enum"),
+    ],
+)
+async def test_structured_output_errors_have_safe_diagnostic_codes(content, diagnostic):
+    response = httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+    with pytest.raises(StructuredOutputError) as error:
         await adapter_with_response(response).reply_structured([])
+    assert error.value.code == diagnostic
+    assert content not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_structured_output_truncation_finish_reason_is_detected():
+    valid_payload = json.dumps({
+        "reply": "你好",
+        "clarification": {
+            "clarification_id": None,
+            "action": "normal",
+            "resolution": "none",
+            "evidence_excerpt": None,
+        },
+    })
+    response = httpx.Response(200, json={"choices": [{
+        "message": {"content": valid_payload}, "finish_reason": "length"
+    }]})
+    with pytest.raises(StructuredOutputError) as error:
+        await adapter_with_response(response).reply_structured([])
+    assert error.value.code == "json_truncated"
 
 
 def test_persona_profile_contains_required_sections():
     profile = load_persona_profile()
-    for section in ["核心身份", "核心气质", "表达习惯", "关系与情感表达", "人格成长原则", "诚实与能力边界"]:
+    for section in ["核心身份", "核心气质", "表达习惯", "个人声音与真实经历", "关系与情感表达", "人格成长原则", "诚实与能力边界"]:
         assert section in profile
     assert "大肥鱼" in profile
     assert "童真" in profile
     assert "The user says" in profile
+
+
+def test_persona_prioritizes_relationship_and_explicit_help_intent():
+    profile = load_persona_profile()
+    assert "先回应用户此刻的情绪、关系意味或分享本身" in profile
+    assert "技术名词本身不代表用户在请求讲解" in profile
+    assert "只有用户明确要求解释、分析、排错或编程帮助时" in profile
+    assert "不必每次以问题结束" in profile
+    assert "没有记录就坦诚说明，不编造生活日志" in profile
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "吃了吗鱼儿？",
+        "今天好累啊。",
+        "我今天吃了好吃的！",
+        "你在干嘛呢？",
+        "我最近有点想你。",
+        "今天遇到一件特别开心的事。",
+        "我决定换 Linux 了。",
+        "给我解释一下 Linux 文件权限。",
+        "你是不是只会问问题呀？",
+        "我先去吃饭啦，待会儿找你。",
+    ],
+)
+async def test_everyday_and_explicit_help_messages_share_persona_prompt(repositories, user_text):
+    _, conversations, messages = repositories
+    captured = []
+
+    class CapturingModel:
+        async def reply(self, model_messages):
+            captured.extend(model_messages)
+            return "测试模型回复"
+
+    conversation = conversations.create()
+    result = await ChatService(
+        conversations, messages, CapturingModel(), assemble_system_prompt()
+    ).send(conversation["id"], user_text)
+
+    assert result["content"] == "测试模型回复"
+    assert captured[0]["role"] == "system"
+    assert "技术名词本身不代表用户在请求讲解" in captured[0]["content"]
+    assert captured[-1] == {"role": "user", "content": user_text}
+    assert [item["role"] for item in captured[1:]] == ["user"]
 
 
 def test_custom_prompt_is_additive_and_cannot_replace_profile():

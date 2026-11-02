@@ -25,7 +25,11 @@ class ModelTimeoutError(ModelRequestError):
 
 
 class StructuredOutputError(RuntimeError):
-    pass
+    """Safe structured-output failure with a diagnostic code, never raw model text."""
+
+    def __init__(self, message: str, *, code: str = "invalid_structure"):
+        super().__init__(message)
+        self.code = code
 
 
 class ClarificationAction(StrEnum):
@@ -52,6 +56,7 @@ class StructuredChatReply:
     action: ClarificationAction
     resolution: ClarificationResolution
     evidence_excerpt: str | None
+    ignored_extra_fields: bool = False
 
 
 class ModelAdapter(Protocol):
@@ -71,31 +76,67 @@ class OpenAICompatibleAdapter:
         content = await self._request_content(messages, structured=True)
         try:
             payload = json.loads(content)
-            if not isinstance(payload, dict) or set(payload) != {"reply", "clarification"}:
-                raise ValueError("unexpected top-level fields")
-            reply = payload["reply"]
-            decision = payload["clarification"]
-            if not isinstance(reply, str) or not reply.strip() or len(reply) > 20000:
-                raise ValueError("invalid reply")
-            if not isinstance(decision, dict) or set(decision) != {
-                "clarification_id", "action", "resolution", "evidence_excerpt"
-            }:
-                raise ValueError("invalid clarification fields")
-            clarification_id = decision["clarification_id"]
-            evidence_excerpt = decision["evidence_excerpt"]
-            if clarification_id is not None and not isinstance(clarification_id, str):
-                raise ValueError("invalid clarification id")
-            if evidence_excerpt is not None and not isinstance(evidence_excerpt, str):
-                raise ValueError("invalid evidence excerpt")
-            return StructuredChatReply(
-                content=reply.strip(),
-                clarification_id=clarification_id,
-                action=ClarificationAction(decision["action"]),
-                resolution=ClarificationResolution(decision["resolution"]),
-                evidence_excerpt=evidence_excerpt,
+        except json.JSONDecodeError as exc:
+            tail = content.rstrip()
+            truncated = (
+                exc.pos >= max(0, len(tail) - 2)
+                and exc.msg in {
+                    "Expecting value",
+                    "Expecting ',' delimiter",
+                    "Expecting property name enclosed in double quotes",
+                    "Unterminated string starting at",
+                }
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise StructuredOutputError("模型未返回符合约束的澄清结构") from exc
+            raise StructuredOutputError(
+                "模型结构化输出不完整" if truncated else "模型结构化输出不是有效 JSON",
+                code="json_truncated" if truncated else "json_syntax_error",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise StructuredOutputError("结构化输出顶层必须是对象", code="top_level_not_object")
+        missing = {"reply", "clarification"} - payload.keys()
+        if missing:
+            raise StructuredOutputError("结构化输出缺少必需字段", code="missing_top_level_fields")
+
+        reply = payload["reply"]
+        decision = payload["clarification"]
+        if not isinstance(reply, str):
+            raise StructuredOutputError("reply 字段类型无效", code="invalid_reply_type")
+        if not reply.strip():
+            raise StructuredOutputError("reply 字段为空", code="empty_reply")
+        if len(reply) > 20000:
+            raise StructuredOutputError("reply 字段超过长度限制", code="reply_too_long")
+        if not isinstance(decision, dict):
+            raise StructuredOutputError("clarification 字段必须是对象", code="clarification_not_object")
+        missing_decision = {"clarification_id", "action", "resolution", "evidence_excerpt"} - decision.keys()
+        if missing_decision:
+            raise StructuredOutputError("clarification 对象缺少必需字段", code="missing_clarification_fields")
+
+        clarification_id = decision["clarification_id"]
+        evidence_excerpt = decision["evidence_excerpt"]
+        if clarification_id is not None and not isinstance(clarification_id, str):
+            raise StructuredOutputError("clarification_id 类型无效", code="invalid_clarification_id_type")
+        if evidence_excerpt is not None and not isinstance(evidence_excerpt, str):
+            raise StructuredOutputError("evidence_excerpt 类型无效", code="invalid_evidence_excerpt_type")
+        try:
+            action = ClarificationAction(decision["action"])
+        except (TypeError, ValueError) as exc:
+            raise StructuredOutputError("action 不属于支持的枚举值", code="invalid_action_enum") from exc
+        try:
+            resolution = ClarificationResolution(decision["resolution"])
+        except (TypeError, ValueError) as exc:
+            raise StructuredOutputError("resolution 不属于支持的枚举值", code="invalid_resolution_enum") from exc
+
+        return StructuredChatReply(
+            content=reply.strip(),
+            clarification_id=clarification_id,
+            action=action,
+            resolution=resolution,
+            evidence_excerpt=evidence_excerpt,
+            ignored_extra_fields=bool(
+                payload.keys() - {"reply", "clarification"}
+                or decision.keys() - {"clarification_id", "action", "resolution", "evidence_excerpt"}
+            ),
+        )
 
     async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False) -> str:
         if not self.settings.model_api_key:
@@ -130,7 +171,10 @@ class OpenAICompatibleAdapter:
             raise ModelRequestError(f"硅基流动模型请求失败（HTTP {status}）。", status_code=502)
         try:
             # SiliconFlow may also return reasoning_content; only final content is user-visible.
-            content = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            if structured and choice.get("finish_reason") in {"length", "max_tokens"}:
+                raise StructuredOutputError("模型结构化输出达到生成长度上限", code="json_truncated")
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("模型服务返回了无法识别的响应。") from exc
         if not isinstance(content, str) or not content.strip():

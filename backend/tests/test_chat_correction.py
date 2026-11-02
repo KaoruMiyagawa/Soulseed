@@ -1,5 +1,5 @@
 import pytest
-from fastapi.testclient import TestClient
+from .conftest import PairedTestClient as TestClient
 
 from app.chat_service import ChatService
 from app.db import Database
@@ -118,11 +118,16 @@ def test_chat_http_response_keeps_message_fields_and_adds_correction(monkeypatch
             }
 
     monkeypatch.setattr(main_module, "database", Database(str(tmp_path / "api.db")))
+    from app.life import LifeRepository
+    monkeypatch.setattr(main_module, "life_repository", LifeRepository(main_module.database))
+    from app.repositories import ConversationRepository
+    monkeypatch.setattr(main_module, "conversations", ConversationRepository(main_module.database))
     monkeypatch.setattr(main_module, "chat", StubChat())
 
     with TestClient(main_module.app) as client:
+        conversation = main_module.conversations.create()
         response = client.post(
-            "/api/conversations/conversation-1/messages",
+            f"/api/conversations/{conversation['id']}/messages",
             json={"content": "你好"},
         )
 

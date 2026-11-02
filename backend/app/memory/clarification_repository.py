@@ -95,21 +95,21 @@ class ClarificationRepository:
         with self.database.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
-                "SELECT * FROM memory_correction_clarifications WHERE idempotency_key = ?",
+                'SELECT * FROM memory_correction_clarifications WHERE memory_correction_clarifications.character_id = current_character() AND idempotency_key = ?',
                 (fingerprint,),
             ).fetchone()
             if existing is not None:
                 return self._record(existing)
             if source_proposal_id is not None:
                 existing_source = db.execute(
-                    "SELECT * FROM memory_correction_clarifications WHERE source_proposal_id = ?",
+                    'SELECT * FROM memory_correction_clarifications WHERE memory_correction_clarifications.character_id = current_character() AND source_proposal_id = ?',
                     (source_proposal_id,),
                 ).fetchone()
                 if existing_source is not None:
                     raise ClarificationStateError("该来源 Proposal 已关联其他澄清记录")
 
             trigger = db.execute(
-                "SELECT role, conversation_id, content FROM messages WHERE id = ?",
+                'SELECT role, conversation_id, content FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                 (trigger_message_id,),
             ).fetchone()
             if trigger is None or trigger["role"] != "user" or trigger["conversation_id"] != conversation_id:
@@ -120,8 +120,7 @@ class ClarificationRepository:
 
             if source_proposal_id is not None:
                 proposal = db.execute(
-                    "SELECT proposal_type, evidence_message_id, target_memory_id, target_memory_updated_at, status "
-                    "FROM memory_change_proposals WHERE id = ?",
+                    'SELECT proposal_type, evidence_message_id, target_memory_id, target_memory_updated_at, status FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?',
                     (source_proposal_id,),
                 ).fetchone()
                 if proposal is None:
@@ -142,9 +141,7 @@ class ClarificationRepository:
             self._validate_context_snapshots(db, context)
             clarification_id = str(uuid4())
             db.execute(
-                "INSERT INTO memory_correction_clarifications "
-                "(id, idempotency_key, conversation_id, trigger_message_id, source_proposal_id, conflict_context, "
-                "status, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                'INSERT INTO memory_correction_clarifications (character_id, id, idempotency_key, conversation_id, trigger_message_id, source_proposal_id, conflict_context, status, version, created_at, updated_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
                 (
                     clarification_id,
                     fingerprint,
@@ -169,7 +166,7 @@ class ClarificationRepository:
             current = self._record(self._row(db, clarification_id))
             if current.status is ClarificationStatus.AWAITING_USER and current.assistant_message_id:
                 row = db.execute(
-                    "SELECT id, conversation_id, role, content, created_at FROM messages WHERE id = ?",
+                    'SELECT id, conversation_id, role, content, created_at FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                     (current.assistant_message_id,),
                 ).fetchone()
                 if row is not None and row["content"] == text:
@@ -190,8 +187,7 @@ class ClarificationRepository:
                 (message["id"], message["conversation_id"], message["role"], message["content"], message["created_at"]),
             )
             db.execute(
-                "UPDATE memory_correction_clarifications SET assistant_message_id = ?, status = ?, "
-                "version = version + 1, updated_at = ? WHERE id = ? AND status = ?",
+                'UPDATE memory_correction_clarifications SET assistant_message_id = ?, status = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = ?',
                 (
                     message["id"],
                     ClarificationStatus.AWAITING_USER.value,
@@ -217,8 +213,7 @@ class ClarificationRepository:
                 raise ClarificationStateError("只有 preparing 状态可以保存初次回应")
             message = self._insert_assistant_message(db, current.conversation_id, text)
             db.execute(
-                "UPDATE memory_correction_clarifications SET assistant_message_id = ?, status = ?, "
-                "version = version + 1, updated_at = ? WHERE id = ? AND status = ?",
+                'UPDATE memory_correction_clarifications SET assistant_message_id = ?, status = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = ?',
                 (message["id"], target.value, now_iso(), clarification_id, ClarificationStatus.PREPARING.value),
             )
             return message, self._record(self._row(db, clarification_id))
@@ -233,8 +228,7 @@ class ClarificationRepository:
             if current.status is not ClarificationStatus.PREPARING:
                 raise ClarificationStateError("只有 preparing 状态可以标记准备失败")
             db.execute(
-                "UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? "
-                "WHERE id = ? AND status = ?",
+                'UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = ?',
                 (ClarificationStatus.DEFERRED.value, error_code, now_iso(), clarification_id, ClarificationStatus.PREPARING.value),
             )
             return self._record(self._row(db, clarification_id))
@@ -275,9 +269,7 @@ class ClarificationRepository:
             context = self._with_resolution(current.conflict_context, resolution, evidence_excerpt)
             message = self._insert_assistant_message(db, current.conversation_id, text)
             db.execute(
-                "UPDATE memory_correction_clarifications SET assistant_message_id = ?, conflict_context = ?, status = ?, "
-                "processing_token = NULL, lease_expires_at = NULL, error_code = ?, version = version + 1, "
-                "updated_at = ? WHERE id = ? AND processing_token = ?",
+                'UPDATE memory_correction_clarifications SET assistant_message_id = ?, conflict_context = ?, status = ?, processing_token = NULL, lease_expires_at = NULL, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND processing_token = ?',
                 (
                     message["id"], json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     target.value, error_code, now_iso(), clarification_id, processing_token,
@@ -307,7 +299,7 @@ class ClarificationRepository:
             if current.application_proposal_id not in (None, proposal_id):
                 raise ClarificationStateError("该澄清已关联其他应用 Proposal")
             user_message = db.execute(
-                "SELECT role, conversation_id, content FROM messages WHERE id = ?",
+                'SELECT role, conversation_id, content FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                 (current.response_message_id,),
             ).fetchone()
             if (
@@ -322,7 +314,7 @@ class ClarificationRepository:
                 raise ClarificationStateError("多条可能目标不能自动应用")
             snapshot = snapshots[0]
             target = db.execute(
-                "SELECT content, updated_at, status FROM memory_items WHERE id = ?", (snapshot["id"],)
+                'SELECT content, updated_at, status FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (snapshot["id"],)
             ).fetchone()
             if (
                 target is None
@@ -332,8 +324,7 @@ class ClarificationRepository:
             ):
                 raise ClarificationStateError("澄清目标已删除或版本发生变化")
             proposal = db.execute(
-                "SELECT proposal_type, target_memory_id, target_memory_updated_at, evidence_message_id, relation, status "
-                "FROM memory_change_proposals WHERE id = ?",
+                'SELECT proposal_type, target_memory_id, target_memory_updated_at, evidence_message_id, relation, status FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?',
                 (proposal_id,),
             ).fetchone()
             if (
@@ -348,8 +339,7 @@ class ClarificationRepository:
                 raise ClarificationStateError("Proposal 与本次澄清答复或目标快照不匹配")
             context = self._with_resolution(current.conflict_context, resolution, evidence_excerpt)
             db.execute(
-                "UPDATE memory_correction_clarifications SET application_proposal_id = ?, conflict_context = ?, "
-                "version = version + 1, updated_at = ? WHERE id = ? AND status = ? AND processing_token = ?",
+                'UPDATE memory_correction_clarifications SET application_proposal_id = ?, conflict_context = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = ? AND processing_token = ?',
                 (
                     proposal_id,
                     json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -382,7 +372,7 @@ class ClarificationRepository:
             db.execute("BEGIN IMMEDIATE")
             current = self._record(self._row(db, clarification_id))
             message = db.execute(
-                "SELECT role, conversation_id FROM messages WHERE id = ?",
+                'SELECT role, conversation_id FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                 (response_message_id,),
             ).fetchone()
             if message is None or message["role"] != "user" or message["conversation_id"] != current.conversation_id:
@@ -410,9 +400,7 @@ class ClarificationRepository:
 
             token = str(uuid4())
             db.execute(
-                "UPDATE memory_correction_clarifications SET response_message_id = ?, status = ?, "
-                "version = version + 1, processing_token = ?, lease_expires_at = ?, error_code = NULL, updated_at = ? "
-                "WHERE id = ?",
+                'UPDATE memory_correction_clarifications SET response_message_id = ?, status = ?, version = version + 1, processing_token = ?, lease_expires_at = ?, error_code = NULL, updated_at = ? WHERE character_id = current_character() AND id = ?',
                 (
                     response_message_id,
                     ClarificationStatus.PROCESSING.value,
@@ -442,14 +430,13 @@ class ClarificationRepository:
             if current.lease_expires_at is None or current.lease_expires_at > now_text:
                 raise ClarificationStateError("仍在有效租约内的澄清不能由恢复流程接管")
             message = db.execute(
-                "SELECT role, conversation_id FROM messages WHERE id = ?", (current.response_message_id,)
+                'SELECT role, conversation_id FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?', (current.response_message_id,)
             ).fetchone()
             if message is None or message["role"] != "user" or message["conversation_id"] != current.conversation_id:
                 raise ClarificationStateError("恢复答复不再是有效的同会话 user 消息")
             token = str(uuid4())
             db.execute(
-                "UPDATE memory_correction_clarifications SET processing_token = ?, lease_expires_at = ?, "
-                "version = version + 1, updated_at = ? WHERE id = ? AND status = ?",
+                'UPDATE memory_correction_clarifications SET processing_token = ?, lease_expires_at = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = ?',
                 (token, lease_until, now_text, clarification_id, ClarificationStatus.PROCESSING.value),
             )
             return ClarificationClaim(self._record(self._row(db, clarification_id)), acquired=True)
@@ -478,7 +465,7 @@ class ClarificationRepository:
 
             if target is ClarificationStatus.EXPLAINED and application_proposal_id is not None:
                 proposal = db.execute(
-                    "SELECT evidence_message_id, status FROM memory_change_proposals WHERE id = ?",
+                    'SELECT evidence_message_id, status FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?',
                     (application_proposal_id,),
                 ).fetchone()
                 if proposal is None or proposal["evidence_message_id"] != current.response_message_id:
@@ -500,7 +487,7 @@ class ClarificationRepository:
                 if not isinstance(evidence_excerpt, str) or not evidence_excerpt.strip():
                     raise ClarificationStateError("澄清判断必须带有用户答复证据")
                 user_message = db.execute(
-                    "SELECT role, conversation_id, content FROM messages WHERE id = ?",
+                    'SELECT role, conversation_id, content FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                     (current.response_message_id,),
                 ).fetchone()
                 if (
@@ -513,9 +500,7 @@ class ClarificationRepository:
             context = self._with_resolution(current.conflict_context, resolution, evidence_excerpt)
 
             db.execute(
-                "UPDATE memory_correction_clarifications SET status = ?, conflict_context = ?, application_proposal_id = COALESCE(?, application_proposal_id), "
-                "processing_token = NULL, lease_expires_at = NULL, error_code = ?, version = version + 1, updated_at = ? "
-                "WHERE id = ?",
+                'UPDATE memory_correction_clarifications SET status = ?, conflict_context = ?, application_proposal_id = COALESCE(?, application_proposal_id), processing_token = NULL, lease_expires_at = NULL, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                 (
                     target.value,
                     json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -535,8 +520,7 @@ class ClarificationRepository:
         """Find a persisted question that can receive a reply without guessing."""
         with self.database.connection() as db:
             rows = db.execute(
-                "SELECT * FROM memory_correction_clarifications WHERE conversation_id = ? "
-                "AND status IN (?, ?, ?, ?) ORDER BY updated_at DESC, id DESC LIMIT 2",
+                'SELECT * FROM memory_correction_clarifications WHERE memory_correction_clarifications.character_id = current_character() AND conversation_id = ? AND status IN (?, ?, ?, ?) ORDER BY updated_at DESC, id DESC LIMIT 2',
                 (
                     conversation_id,
                     ClarificationStatus.AWAITING_USER.value,
@@ -553,8 +537,7 @@ class ClarificationRepository:
         """Find any clarification occupying this conversation, including preparation."""
         with self.database.connection() as db:
             rows = db.execute(
-                "SELECT * FROM memory_correction_clarifications WHERE conversation_id = ? "
-                "AND status IN (?, ?, ?, ?, ?) ORDER BY updated_at DESC, id DESC LIMIT 2",
+                'SELECT * FROM memory_correction_clarifications WHERE memory_correction_clarifications.character_id = current_character() AND conversation_id = ? AND status IN (?, ?, ?, ?, ?) ORDER BY updated_at DESC, id DESC LIMIT 2',
                 (
                     conversation_id,
                     ClarificationStatus.PREPARING.value,
@@ -586,7 +569,7 @@ class ClarificationRepository:
             params.append(conversation_id)
         with self.database.connection() as db:
             rows = db.execute(
-                f"SELECT * FROM memory_correction_clarifications WHERE {where} ORDER BY updated_at, id",
+                f"SELECT * FROM memory_correction_clarifications WHERE character_id = current_character() AND {where} ORDER BY updated_at, id",
                 params,
             ).fetchall()
         return [self._record(row) for row in rows]
@@ -596,8 +579,7 @@ class ClarificationRepository:
         with self.database.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                "SELECT * FROM memory_correction_clarifications "
-                "WHERE application_proposal_id IS NOT NULL OR status = ?",
+                'SELECT * FROM memory_correction_clarifications WHERE character_id = current_character() AND (application_proposal_id IS NOT NULL OR status = ?)',
                 (ClarificationStatus.APPLIED.value,),
             ).fetchall()
             reconciled: list[ClarificationRecord] = []
@@ -610,14 +592,12 @@ class ClarificationRepository:
                 )
                 if actual and current.status is not ClarificationStatus.APPLIED:
                     db.execute(
-                        "UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, "
-                        "lease_expires_at = NULL, error_code = NULL, version = version + 1, updated_at = ? WHERE id = ?",
+                        'UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, lease_expires_at = NULL, error_code = NULL, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                         (ClarificationStatus.APPLIED.value, now_iso(), current.id),
                     )
                 elif not actual and current.status is ClarificationStatus.APPLIED:
                     db.execute(
-                        "UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, "
-                        "lease_expires_at = NULL, error_code = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                        'UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, lease_expires_at = NULL, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                         (ClarificationStatus.FAILED.value, "application_record_missing", now_iso(), current.id),
                     )
                 reconciled.append(self._record(self._row(db, current.id)))
@@ -631,7 +611,7 @@ class ClarificationRepository:
             if current.application_proposal_id is None:
                 if current.status is ClarificationStatus.APPLIED:
                     db.execute(
-                        "UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                        'UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                         (ClarificationStatus.FAILED.value, "application_record_missing", now_iso(), clarification_id),
                     )
                     return self._record(self._row(db, clarification_id))
@@ -641,13 +621,12 @@ class ClarificationRepository:
             )
             if actual and current.status is not ClarificationStatus.APPLIED:
                 db.execute(
-                    "UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, "
-                    "lease_expires_at = NULL, error_code = NULL, version = version + 1, updated_at = ? WHERE id = ?",
+                    'UPDATE memory_correction_clarifications SET status = ?, processing_token = NULL, lease_expires_at = NULL, error_code = NULL, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                     (ClarificationStatus.APPLIED.value, now_iso(), clarification_id),
                 )
             elif not actual and current.status is ClarificationStatus.APPLIED:
                 db.execute(
-                    "UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                    'UPDATE memory_correction_clarifications SET status = ?, error_code = ?, version = version + 1, updated_at = ? WHERE character_id = current_character() AND id = ?',
                     (ClarificationStatus.FAILED.value, "application_record_missing", now_iso(), clarification_id),
                 )
             return self._record(self._row(db, clarification_id))
@@ -655,9 +634,7 @@ class ClarificationRepository:
     @staticmethod
     def _proposal_is_applied(db: sqlite3.Connection, proposal_id: str) -> bool:
         row = db.execute(
-            "SELECT p.status, p.application_status, l.proposal_id AS logged_proposal_id "
-            "FROM memory_change_proposals p LEFT JOIN memory_proposal_application_log l ON l.proposal_id = p.id "
-            "WHERE p.id = ?",
+            'SELECT p.status, p.application_status, l.proposal_id AS logged_proposal_id FROM memory_change_proposals p LEFT JOIN memory_proposal_application_log l ON l.proposal_id = p.id WHERE p.character_id = current_character() AND l.character_id = current_character() AND p.id = ?',
             (proposal_id,),
         ).fetchone()
         return bool(
@@ -672,7 +649,7 @@ class ClarificationRepository:
         if message_id is None:
             return False
         row = db.execute(
-            "SELECT evidence_message_id FROM memory_change_proposals WHERE id = ?",
+            'SELECT evidence_message_id FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?',
             (proposal_id,),
         ).fetchone()
         return row is not None and row["evidence_message_id"] == message_id
@@ -716,7 +693,7 @@ class ClarificationRepository:
     def _validate_context_snapshots(db: sqlite3.Connection, context: dict[str, Any]) -> None:
         for match in context["matched_memories"]:
             row = db.execute(
-                "SELECT content, updated_at, status FROM memory_items WHERE id = ?",
+                'SELECT content, updated_at, status FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?',
                 (match["id"],),
             ).fetchone()
             if row is None or row["status"] != "active" or row["content"] != match["content"] or row["updated_at"] != match["updated_at"]:
@@ -734,7 +711,7 @@ class ClarificationRepository:
 
     @staticmethod
     def _row(db: sqlite3.Connection, clarification_id: str) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM memory_correction_clarifications WHERE id = ?", (clarification_id,)).fetchone()
+        row = db.execute('SELECT * FROM memory_correction_clarifications WHERE memory_correction_clarifications.character_id = current_character() AND id = ?', (clarification_id,)).fetchone()
         if row is None:
             raise ClarificationNotFoundError(clarification_id)
         return row

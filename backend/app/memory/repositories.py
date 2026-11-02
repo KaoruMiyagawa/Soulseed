@@ -90,9 +90,9 @@ class MemoryRepository:
                 return self._item_from_row(self._memory_row(db, existing.memory_id, include_deleted=True))
             self._ensure_no_active_duplicate(db, canonical_key)
             try:
-                db.execute("INSERT INTO memory_items (id, memory_type, content, canonical_key, importance, confidence, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (memory_id, memory_type.value, content, canonical_key, importance, confidence, MemoryStatus.ACTIVE.value, memory.expires_at, timestamp, timestamp))
+                db.execute('INSERT INTO memory_items (character_id, id, memory_type, content, canonical_key, importance, confidence, status, expires_at, created_at, updated_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (memory_id, memory_type.value, content, canonical_key, importance, confidence, MemoryStatus.ACTIVE.value, memory.expires_at, timestamp, timestamp))
             except sqlite3.IntegrityError as exc:
-                if "idx_memory_active_canonical_key" in str(exc) or "UNIQUE constraint failed: memory_items.canonical_key" in str(exc):
+                if "idx_memory_active_canonical_key" in str(exc) or "memory_items.canonical_key" in str(exc):
                     raise DuplicateMemoryError(f"已存在 active canonical_key：{canonical_key}") from exc
                 raise
             self._insert_change_log(db, memory_id=memory_id, action=MemoryChangeAction.CREATED, old_snapshot=_ChangeSnapshot(None, None, None, None, None), new_snapshot=_ChangeSnapshot(content, canonical_key, MemoryStatus.ACTIVE.value, importance, confidence), reason=reason, source_message_id=source_message_id, actor_type=actor_type, idempotency_key=idempotency_key, request_fingerprint=fingerprint, created_at=timestamp)
@@ -104,14 +104,14 @@ class MemoryRepository:
             if not include_inactive and row["status"] != MemoryStatus.ACTIVE.value:
                 raise MemoryNotFoundError(memory_id)
             if row["status"] == MemoryStatus.ACTIVE.value:
-                db.execute("UPDATE memory_items SET last_accessed_at = ? WHERE id = ?", (now_iso(), memory_id))
+                db.execute('UPDATE memory_items SET last_accessed_at = ? WHERE character_id = current_character() AND id = ?', (now_iso(), memory_id))
                 row = self._memory_row(db, memory_id, include_deleted=True)
         return self._item_from_row(row)
 
     def find_active_by_canonical_key(self, canonical_key: str) -> MemoryItem | None:
         normalized = normalize_canonical_key(canonical_key)
         with self.database.connection() as db:
-            row = db.execute("SELECT * FROM memory_items WHERE canonical_key = ? AND status = ?", (normalized, MemoryStatus.ACTIVE.value)).fetchone()
+            row = db.execute('SELECT * FROM memory_items WHERE memory_items.character_id = current_character() AND canonical_key = ? AND status = ?', (normalized, MemoryStatus.ACTIVE.value)).fetchone()
         return self._item_from_row(row) if row is not None else None
 
     def list(self, *, limit: int = 50, offset: int = 0, memory_type: MemoryType | str | None = None, include_inactive: bool = False, include_deleted: bool = False) -> list[MemoryItem]:
@@ -119,7 +119,7 @@ class MemoryRepository:
             raise ValueError("limit 必须在 1 到 1000 之间")
         if offset < 0:
             raise ValueError("offset 不能小于 0")
-        clauses, params = [], []
+        clauses, params = ["character_id = current_character()"], []
         if not include_deleted:
             clauses.append("status != ?")
             params.append(MemoryStatus.DELETED.value)
@@ -155,7 +155,7 @@ class MemoryRepository:
                 return current
             self._ensure_no_active_duplicate(db, canonical_key, exclude_id=memory_id, active_status=status)
             timestamp = now_iso()
-            db.execute("UPDATE memory_items SET content = ?, canonical_key = ?, importance = ?, confidence = ?, status = ?, expires_at = ?, updated_at = ? WHERE id = ?", (content, canonical_key, importance, confidence, status, expires_at, timestamp, memory_id))
+            db.execute('UPDATE memory_items SET content = ?, canonical_key = ?, importance = ?, confidence = ?, status = ?, expires_at = ?, updated_at = ? WHERE character_id = current_character() AND id = ?', (content, canonical_key, importance, confidence, status, expires_at, timestamp, memory_id))
             self._insert_change_log(db, memory_id=memory_id, action=MemoryChangeAction.UPDATED, old_snapshot=self._snapshot(current), new_snapshot=_ChangeSnapshot(content, canonical_key, status, importance, confidence), reason=reason, source_message_id=source_message_id, actor_type=actor_type, idempotency_key=idempotency_key, request_fingerprint=fingerprint, created_at=timestamp)
         return self.get(memory_id, include_inactive=True, include_deleted=True)
 
@@ -178,7 +178,7 @@ class MemoryRepository:
                 if replacement.status == MemoryStatus.DELETED:
                     raise InvalidMemoryStateError("不能指向已软删除的替代记忆")
             timestamp = now_iso()
-            db.execute("UPDATE memory_items SET status = ?, superseded_by_id = ?, updated_at = ? WHERE id = ?", (target.value, superseded_by_id, timestamp, memory_id))
+            db.execute('UPDATE memory_items SET status = ?, superseded_by_id = ?, updated_at = ? WHERE character_id = current_character() AND id = ?', (target.value, superseded_by_id, timestamp, memory_id))
             action = {MemoryStatus.INVALID: MemoryChangeAction.INVALIDATED, MemoryStatus.EXPIRED: MemoryChangeAction.EXPIRED, MemoryStatus.SUPERSEDED: MemoryChangeAction.SUPERSEDED, MemoryStatus.DELETED: MemoryChangeAction.SOFT_DELETED}.get(target, MemoryChangeAction.UPDATED)
             fingerprint = self._fingerprint("status", {"memory_id": memory_id, "status": target.value, "superseded_by_id": superseded_by_id})
             self._insert_change_log(db, memory_id=memory_id, action=action, old_snapshot=self._snapshot(current), new_snapshot=_ChangeSnapshot(current.content, current.canonical_key, target.value, current.importance, current.confidence), reason=reason, source_message_id=source_message_id, actor_type=actor_type, idempotency_key=idempotency_key, request_fingerprint=fingerprint, created_at=timestamp)
@@ -194,13 +194,13 @@ class MemoryRepository:
             if existing is not None:
                 self._validate_idempotent_replay(existing, MemoryChangeAction.PERMANENTLY_DELETED, memory_id, fingerprint)
                 return
-            row = db.execute("SELECT id FROM memory_items WHERE id = ?", (memory_id,)).fetchone()
+            row = db.execute('SELECT id FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (memory_id,)).fetchone()
             if row is None:
                 raise MemoryNotFoundError(memory_id)
             # Do not copy any memory content into the deletion event. ON DELETE SET NULL
             # removes the memory reference after the row is deleted in this transaction.
             self._insert_change_log(db, memory_id=memory_id, action=MemoryChangeAction.PERMANENTLY_DELETED, old_snapshot=_ChangeSnapshot(None, None, None, None, None), new_snapshot=_ChangeSnapshot(None, None, None, None, None), reason=None, source_message_id=None, actor_type=actor_type, idempotency_key=idempotency_key, request_fingerprint=fingerprint, created_at=now_iso())
-            db.execute("DELETE FROM memory_items WHERE id = ?", (memory_id,))
+            db.execute('DELETE FROM memory_items WHERE character_id = current_character() AND id = ?', (memory_id,))
 
     def list_change_log(self, memory_id: str | None = None, *, limit: int = 100, offset: int = 0) -> list[MemoryChangeLog]:
         if not 1 <= limit <= 1000:
@@ -209,9 +209,9 @@ class MemoryRepository:
             raise ValueError("offset 不能小于 0")
         with self.database.connection() as db:
             if memory_id is None:
-                rows = db.execute("SELECT * FROM memory_change_log ORDER BY created_at, id LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+                rows = db.execute('SELECT * FROM memory_change_log WHERE memory_change_log.character_id = current_character() ORDER BY created_at, id LIMIT ? OFFSET ?', (limit, offset)).fetchall()
             else:
-                rows = db.execute("SELECT * FROM memory_change_log WHERE memory_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?", (memory_id, limit, offset)).fetchall()
+                rows = db.execute('SELECT * FROM memory_change_log WHERE memory_change_log.character_id = current_character() AND memory_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?', (memory_id, limit, offset)).fetchall()
         return [self._change_from_row(row) for row in rows]
 
     def add_source(self, memory_id: str, message_id: str, source_role: SourceRole | str, evidence_type: EvidenceType | str, excerpt: str | None = None) -> MemorySource:
@@ -221,33 +221,33 @@ class MemoryRepository:
         role = SourceRole(source_role)
         evidence = EvidenceType(evidence_type)
         with self.database.connection() as db:
-            message = db.execute("SELECT role FROM messages WHERE id = ?", (message_id,)).fetchone()
+            message = db.execute('SELECT role FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?', (message_id,)).fetchone()
             if message is None:
                 raise MessageNotFoundError(message_id)
             if message["role"] != role.value:
                 raise ValueError("source_role 与原始消息角色不一致")
             source_id, timestamp = str(uuid4()), now_iso()
             try:
-                db.execute("INSERT INTO memory_sources (id, memory_id, message_id, source_role, evidence_type, excerpt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (source_id, memory_id, message_id, role.value, evidence.value, excerpt.strip() if excerpt else None, timestamp))
+                db.execute('INSERT INTO memory_sources (character_id, id, memory_id, message_id, source_role, evidence_type, excerpt, created_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?)', (source_id, memory_id, message_id, role.value, evidence.value, excerpt.strip() if excerpt else None, timestamp))
             except sqlite3.IntegrityError as exc:
                 raise DuplicateMemoryError("相同记忆、消息和证据类型的来源已存在") from exc
         return self.get_source(source_id)
 
     def get_source(self, source_id: str) -> MemorySource:
         with self.database.connection() as db:
-            row = db.execute("SELECT * FROM memory_sources WHERE id = ?", (source_id,)).fetchone()
+            row = db.execute('SELECT * FROM memory_sources WHERE memory_sources.character_id = current_character() AND id = ?', (source_id,)).fetchone()
         if row is None:
             raise MemorySourceNotFoundError(source_id)
         return self._source_from_row(row)
 
     def list_sources(self, memory_id: str) -> list[MemorySource]:
         with self.database.connection() as db:
-            rows = db.execute("SELECT * FROM memory_sources WHERE memory_id = ? ORDER BY created_at, id", (memory_id,)).fetchall()
+            rows = db.execute('SELECT * FROM memory_sources WHERE memory_sources.character_id = current_character() AND memory_id = ? ORDER BY created_at, id', (memory_id,)).fetchall()
         return [self._source_from_row(row) for row in rows]
 
     @staticmethod
     def _memory_row(db: sqlite3.Connection, memory_id: str, *, include_deleted: bool = False) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM memory_items WHERE id = ?", (memory_id,)).fetchone()
+        row = db.execute('SELECT * FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (memory_id,)).fetchone()
         if row is None or (not include_deleted and row["status"] == MemoryStatus.DELETED.value):
             raise MemoryNotFoundError(memory_id)
         return row
@@ -274,12 +274,12 @@ class MemoryRepository:
     def _change_by_idempotency(db: sqlite3.Connection, idempotency_key: str | None) -> MemoryChangeLog | None:
         if not idempotency_key:
             return None
-        row = db.execute("SELECT * FROM memory_change_log WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+        row = db.execute('SELECT * FROM memory_change_log WHERE memory_change_log.character_id = current_character() AND idempotency_key = ?', (idempotency_key,)).fetchone()
         return MemoryRepository._change_from_row(row) if row is not None else None
 
     @staticmethod
     def _insert_change_log(db: sqlite3.Connection, *, memory_id: str | None, action: MemoryChangeAction, old_snapshot: _ChangeSnapshot, new_snapshot: _ChangeSnapshot, reason: str | None, source_message_id: str | None, actor_type: MemoryActorType | str, idempotency_key: str | None, request_fingerprint: str | None, created_at: str) -> None:
-        db.execute("INSERT INTO memory_change_log (id, memory_id, action, old_content, new_content, old_canonical_key, new_canonical_key, old_status, new_status, old_importance, new_importance, old_confidence, new_confidence, reason, source_message_id, actor_type, idempotency_key, request_fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), memory_id, action.value, old_snapshot.content, new_snapshot.content, old_snapshot.canonical_key, new_snapshot.canonical_key, old_snapshot.status, new_snapshot.status, old_snapshot.importance, new_snapshot.importance, old_snapshot.confidence, new_snapshot.confidence, reason, source_message_id, MemoryActorType(actor_type).value, idempotency_key, request_fingerprint, created_at))
+        db.execute('INSERT INTO memory_change_log (character_id, id, memory_id, action, old_content, new_content, old_canonical_key, new_canonical_key, old_status, new_status, old_importance, new_importance, old_confidence, new_confidence, reason, source_message_id, actor_type, idempotency_key, request_fingerprint, created_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (str(uuid4()), memory_id, action.value, old_snapshot.content, new_snapshot.content, old_snapshot.canonical_key, new_snapshot.canonical_key, old_snapshot.status, new_snapshot.status, old_snapshot.importance, new_snapshot.importance, old_snapshot.confidence, new_snapshot.confidence, reason, source_message_id, MemoryActorType(actor_type).value, idempotency_key, request_fingerprint, created_at))
 
     @staticmethod
     def _change_from_row(row: sqlite3.Row) -> MemoryChangeLog:
@@ -289,7 +289,7 @@ class MemoryRepository:
     def _ensure_no_active_duplicate(db: sqlite3.Connection, canonical_key: str, *, exclude_id: str | None = None, active_status: str = "active") -> None:
         if active_status != MemoryStatus.ACTIVE.value:
             return
-        query = "SELECT id FROM memory_items WHERE canonical_key = ? AND status = 'active'"
+        query = "SELECT id FROM memory_items WHERE memory_items.character_id = current_character() AND canonical_key = ? AND status = 'active'"
         params: list[str] = [canonical_key]
         if exclude_id:
             query += " AND id != ?"

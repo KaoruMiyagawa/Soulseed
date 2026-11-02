@@ -28,7 +28,7 @@ from app.memory import (
     MemoryUpdate,
 )
 from app.repositories import ConversationRepository, MessageRepository
-from app.model_adapter import ClarificationAction, ClarificationResolution, StructuredChatReply
+from app.model_adapter import ClarificationAction, ClarificationResolution, StructuredChatReply, StructuredOutputError
 
 
 class ContextFlow:
@@ -218,10 +218,112 @@ async def test_detected_conflict_can_be_naturally_asked_and_waiting_is_persisted
     assert len(ctx[2].list_for_conversation(ctx[5]["id"])) == 2
     assert "Proposal" not in result["content"] and "confidence" not in result["content"]
     assert "历史记忆只是曾记录的内容，可能已经过时" in model.structured_messages[0][-2]["content"]
+    initial_instruction = model.structured_messages[0][-1]["content"]
+    assert "不是对本次澄清问题的回答" in initial_instruction
+    assert '"action":"ask","resolution":"none"' in initial_instruction
+    assert '"action":"defer","resolution":"none"' in initial_instruction
+    assert '"action":"normal","resolution":"none"' in initial_instruction
     assert ctx[3].list_memories(limit=10)[0].content == "我主要使用 Windows 作为开发环境。"
     with ctx[0].connection() as db:
         proposal = db.execute("SELECT status, application_status FROM memory_change_proposals").fetchone()
         assert tuple(proposal) == ("pending", "not_applied")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "content"),
+    [
+        (ClarificationAction.DEFER, "哦，你最近开始折腾 Linux 啦。"),
+        (ClarificationAction.NORMAL, "Linux 的终端确实挺有意思。"),
+    ],
+)
+async def test_initial_defer_and_normal_do_not_start_waiting(ctx, action, content):
+    model = StructuredFake({"content": content, "action": action})
+    chat, _, _, _ = make_integrated_chat(ctx, model)
+
+    result = await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+
+    assert result["content"] == content
+    assert record.status is ClarificationStatus.DEFERRED
+    assert record.assistant_message_id == result["id"]
+    assert ctx[3].get_memory(ctx[6].id).content == "我主要使用 Windows 作为开发环境。"
+
+
+@pytest.mark.asyncio
+async def test_initial_explicit_change_resolution_is_rejected_with_specific_diagnostic(ctx):
+    model = StructuredFake(
+        {
+            "content": "你已经换成 Linux 了吗？",
+            "action": ClarificationAction.NORMAL,
+            "resolution": ClarificationResolution.EXPLICIT_CHANGE,
+            "evidence_excerpt": "我已经永久改用 Linux 作为主要开发环境",
+        },
+        ordinary="我听见你刚才提到 Linux 了。",
+    )
+    chat, _, _, _ = make_integrated_chat(ctx, model)
+
+    result = await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+
+    assert result["content"] == "我听见你刚才提到 Linux 了。"
+    assert record.status is ClarificationStatus.DEFERRED
+    assert record.error_code == "initial_resolution_must_be_none"
+    assert record.assistant_message_id is None
+    assert ctx[3].get_memory(ctx[6].id).content == "我主要使用 Windows 作为开发环境。"
+    with ctx[0].connection() as db:
+        proposal = db.execute("SELECT status, application_status FROM memory_change_proposals").fetchone()
+        assert tuple(proposal) == ("pending", "not_applied")
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_wrong_initial_clarification_id_is_rejected_without_waiting(ctx):
+    class WrongClarificationBinding:
+        async def reply(self, _messages):
+            return "我先按普通聊天回应。"
+
+        async def reply_structured(self, _messages):
+            return StructuredChatReply(
+                "你已经换环境了吗？",
+                "some-other-clarification",
+                ClarificationAction.ASK,
+                ClarificationResolution.NONE,
+                None,
+            )
+
+    chat, _, _, _ = make_integrated_chat(ctx, WrongClarificationBinding())
+    await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+
+    assert record.status is ClarificationStatus.DEFERRED
+    assert record.error_code == "clarification_id_mismatch"
+    assert record.assistant_message_id is None
+    assert ctx[3].get_memory(ctx[6].id).content == "我主要使用 Windows 作为开发环境。"
+    with ctx[0].connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_response_none_resolution_is_rejected_and_deferred(ctx):
+    model = StructuredFake(
+        {"content": "你已经决定换环境了吗？", "action": ClarificationAction.ASK},
+        {"content": "我听到了。", "action": ClarificationAction.NORMAL},
+        ordinary="好，我先不替你做判断。",
+    )
+    chat, _, _, _ = make_integrated_chat(ctx, model)
+    await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+
+    result = await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+
+    assert result["content"] == "好，我先不替你做判断。"
+    assert record.status is ClarificationStatus.DEFERRED
+    assert record.error_code == "response_resolution_required"
+    assert record.response_message_id is not None
+    assert ctx[3].get_memory(ctx[6].id).content == "我主要使用 Windows 作为开发环境。"
+    with ctx[0].connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
@@ -527,6 +629,28 @@ async def test_unsupported_structured_model_saves_normal_reply_as_deferred(ctx):
     assert record.status is ClarificationStatus.DEFERRED
     assert result["content"] == "先聊眼前这件事。"
     assert record.assistant_message_id == result["id"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_structured_output_falls_back_without_applying_memory(ctx):
+    class InvalidStructuredModel:
+        async def reply(self, _messages):
+            return "咦，这听起来像个大变化。"
+
+        async def reply_structured(self, _messages):
+            raise StructuredOutputError("结构化输出不可用", code="missing_clarification_fields")
+
+    chat, _, _, _ = make_integrated_chat(ctx, InvalidStructuredModel())
+    result = await chat.send(ctx[5]["id"], "我已经永久改用 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+
+    assert result["content"] == "咦，这听起来像个大变化。"
+    assert record.status is ClarificationStatus.DEFERRED
+    assert ctx[3].get_memory(ctx[6].id).content == "我主要使用 Windows 作为开发环境。"
+    with ctx[0].connection() as db:
+        proposal = db.execute("SELECT status, application_status FROM memory_change_proposals").fetchone()
+        assert tuple(proposal) == ("pending", "not_applied")
+        assert db.execute("SELECT COUNT(*) FROM memory_proposal_application_log").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

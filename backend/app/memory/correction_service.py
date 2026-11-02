@@ -92,11 +92,11 @@ class MemoryCorrectionService:
                     applied_row = None
 
             db.execute(
-                "UPDATE memory_change_proposals SET application_status = ?, applied_at = ?, applied_memory_id = ?, replacement_memory_id = ? WHERE id = ?",
+                'UPDATE memory_change_proposals SET application_status = ?, applied_at = ?, applied_memory_id = ?, replacement_memory_id = ? WHERE character_id = current_character() AND id = ?',
                 (ProposalApplicationStatus.APPLIED.value, timestamp, applied_id, replacement_id, proposal_id),
             )
             db.execute(
-                "INSERT INTO memory_proposal_application_log (id, proposal_id, application_status, applied_memory_id, replacement_memory_id, actor_type, reason, idempotency_key, request_fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                'INSERT INTO memory_proposal_application_log (character_id, id, proposal_id, application_status, applied_memory_id, replacement_memory_id, actor_type, reason, idempotency_key, request_fingerprint, created_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (str(uuid4()), proposal_id, ProposalApplicationStatus.APPLIED.value, applied_id, replacement_id, MemoryActorType(actor_type).value, reason, idempotency_key, fingerprint, timestamp),
             )
             return self._result(db, proposal_id)
@@ -105,36 +105,36 @@ class MemoryCorrectionService:
         memory_id = str(uuid4())
         canonical_key = normalize_canonical_key(proposal["proposed_canonical_key"])
         content = validate_content(proposal["proposed_content"])
-        if db.execute("SELECT id FROM memory_items WHERE canonical_key = ? AND status = 'active'", (canonical_key,)).fetchone() is not None:
+        if db.execute("SELECT id FROM memory_items WHERE memory_items.character_id = current_character() AND canonical_key = ? AND status = 'active'", (canonical_key,)).fetchone() is not None:
             raise DuplicateMemoryError(f"已存在 active canonical_key：{canonical_key}")
         db.execute(
-            "INSERT INTO memory_items (id, memory_type, content, canonical_key, importance, confidence, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)",
+            "INSERT INTO memory_items (character_id, id, memory_type, content, canonical_key, importance, confidence, status, expires_at, created_at, updated_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)",
             (memory_id, proposal["proposed_memory_type"], content, canonical_key, 0.5, proposal["confidence"], timestamp, timestamp),
         )
         self._insert_change_log(db, memory_id, "created", None, content, None, canonical_key, None, "active", proposal["evidence_message_id"], proposal["id"], timestamp, None, actor_type)
         return memory_id
 
     def _update_superseded(self, db: sqlite3.Connection, target: sqlite3.Row, replacement_id: str, proposal_id: str, source_message_id: str, reason: str | None, actor_type: MemoryActorType | str, timestamp: str) -> None:
-        db.execute("UPDATE memory_items SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ? AND status = 'active'", (replacement_id, timestamp, target["id"]))
+        db.execute("UPDATE memory_items SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = 'active'", (replacement_id, timestamp, target["id"]))
         self._insert_change_log(db, target["id"], "superseded", target["content"], target["content"], target["canonical_key"], target["canonical_key"], "active", "superseded", source_message_id, proposal_id, timestamp, reason, actor_type)
 
     def _update_status(self, db: sqlite3.Connection, target: sqlite3.Row, status: MemoryStatus, proposal_id: str, source_message_id: str, reason: str | None, actor_type: MemoryActorType | str, timestamp: str) -> None:
-        db.execute("UPDATE memory_items SET status = ?, updated_at = ? WHERE id = ? AND status = 'active'", (status.value, timestamp, target["id"]))
+        db.execute("UPDATE memory_items SET status = ?, updated_at = ? WHERE character_id = current_character() AND id = ? AND status = 'active'", (status.value, timestamp, target["id"]))
         action = "invalidated" if status is MemoryStatus.INVALID else "expired"
         self._insert_change_log(db, target["id"], action, target["content"], target["content"], target["canonical_key"], target["canonical_key"], "active", status.value, source_message_id, proposal_id, timestamp, reason, actor_type)
 
     @staticmethod
     def _insert_source(db: sqlite3.Connection, memory_id: str, message_id: str, excerpt: str, timestamp: str) -> None:
-        db.execute("INSERT INTO memory_sources (id, memory_id, message_id, source_role, evidence_type, excerpt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), memory_id, message_id, SourceRole.USER.value, EvidenceType.CORRECTION.value, excerpt, timestamp))
+        db.execute('INSERT INTO memory_sources (character_id, id, memory_id, message_id, source_role, evidence_type, excerpt, created_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?)', (str(uuid4()), memory_id, message_id, SourceRole.USER.value, EvidenceType.CORRECTION.value, excerpt, timestamp))
 
     @staticmethod
     def _insert_change_log(db: sqlite3.Connection, memory_id: str, action: str, old_content: str | None, new_content: str | None, old_key: str | None, new_key: str | None, old_status: str | None, new_status: str | None, source_message_id: str | None, proposal_id: str, timestamp: str, reason: str | None, actor_type: MemoryActorType | str) -> None:
-        db.execute("INSERT INTO memory_change_log (id, memory_id, action, old_content, new_content, old_canonical_key, new_canonical_key, old_status, new_status, reason, source_message_id, actor_type, idempotency_key, request_fingerprint, created_at, proposal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), memory_id, action, old_content, new_content, old_key, new_key, old_status, new_status, reason, source_message_id, MemoryActorType(actor_type).value, None, None, timestamp, proposal_id))
+        db.execute('INSERT INTO memory_change_log (character_id, id, memory_id, action, old_content, new_content, old_canonical_key, new_canonical_key, old_status, new_status, reason, source_message_id, actor_type, idempotency_key, request_fingerprint, created_at, proposal_id) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (str(uuid4()), memory_id, action, old_content, new_content, old_key, new_key, old_status, new_status, reason, source_message_id, MemoryActorType(actor_type).value, None, None, timestamp, proposal_id))
 
     def _validate_target(self, db: sqlite3.Connection, proposal: sqlite3.Row) -> sqlite3.Row | None:
         if proposal["target_memory_id"] is None:
             return None
-        target = db.execute("SELECT * FROM memory_items WHERE id = ?", (proposal["target_memory_id"],)).fetchone()
+        target = db.execute('SELECT * FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (proposal["target_memory_id"],)).fetchone()
         if target is None:
             raise MemoryNotFoundError(proposal["target_memory_id"])
         if target["status"] != MemoryStatus.ACTIVE.value:
@@ -154,7 +154,7 @@ class MemoryCorrectionService:
     def _validate_evidence(db: sqlite3.Connection, message_id: str | None) -> str:
         if not message_id:
             raise MessageNotFoundError("Proposal 缺少来源消息")
-        message = db.execute("SELECT role, content FROM messages WHERE id = ?", (message_id,)).fetchone()
+        message = db.execute('SELECT role, content FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?', (message_id,)).fetchone()
         if message is None:
             raise MessageNotFoundError(message_id)
         if message["role"] != SourceRole.USER.value:
@@ -163,13 +163,13 @@ class MemoryCorrectionService:
 
     @staticmethod
     def _proposal_row(db: sqlite3.Connection, proposal_id: str) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM memory_change_proposals WHERE id = ?", (proposal_id,)).fetchone()
+        row = db.execute('SELECT * FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?', (proposal_id,)).fetchone()
         if row is None:
             raise ProposalNotFoundError(proposal_id)
         return row
 
     def _validate_replay(self, db: sqlite3.Connection, proposal_id: str, fingerprint: str, idempotency_key: str | None) -> None:
-        row = db.execute("SELECT request_fingerprint, idempotency_key FROM memory_proposal_application_log WHERE proposal_id = ?", (proposal_id,)).fetchone()
+        row = db.execute('SELECT request_fingerprint, idempotency_key FROM memory_proposal_application_log WHERE memory_proposal_application_log.character_id = current_character() AND proposal_id = ?', (proposal_id,)).fetchone()
         stored_key = self._normalize_idempotency_key(row["idempotency_key"]) if row is not None else None
         requested_key = self._normalize_idempotency_key(idempotency_key)
         if row is None or row["request_fingerprint"] != fingerprint or stored_key != requested_key:
@@ -190,7 +190,7 @@ class MemoryCorrectionService:
 
     @staticmethod
     def _memory_row(db: sqlite3.Connection, memory_id: str) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM memory_items WHERE id = ?", (memory_id,)).fetchone()
+        row = db.execute('SELECT * FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (memory_id,)).fetchone()
         if row is None:
             raise MemoryNotFoundError(memory_id)
         return row

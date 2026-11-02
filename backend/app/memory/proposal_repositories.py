@@ -92,7 +92,7 @@ class MemoryProposalRepository:
                     expected_target_memory_updated_at=proposal.expected_target_memory_updated_at,
                 )
                 db.execute(
-                    "INSERT INTO memory_change_proposals (id, proposal_type, target_memory_id, proposed_memory_type, proposed_content, proposed_canonical_key, evidence_message_id, correction_intent, relation, confidence, evidence, status, idempotency_key, request_fingerprint, created_at, resolved_at, resolution_reason, target_memory_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    'INSERT INTO memory_change_proposals (character_id, id, proposal_type, target_memory_id, proposed_memory_type, proposed_content, proposed_canonical_key, evidence_message_id, correction_intent, relation, confidence, evidence, status, idempotency_key, request_fingerprint, created_at, resolved_at, resolution_reason, target_memory_updated_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (proposal_id, proposal_type.value, proposal.target_memory_id, memory_type.value, content, canonical_key, proposal.evidence_message_id, intent.value, proposal.relation, confidence, evidence, ProposalStatus.PENDING.value, proposal.idempotency_key, fingerprint, timestamp, None, None, target_memory_updated_at),
                 )
                 self._insert_log(db, proposal_id, ProposalChangeAction.CREATED, None, ProposalStatus.PENDING, None, actor_type, proposal.idempotency_key, fingerprint, timestamp)
@@ -137,7 +137,7 @@ class MemoryProposalRepository:
             target = None
             if proposal["target_memory_id"] is not None:
                 row = db.execute(
-                    "SELECT id, content, status, updated_at FROM memory_items WHERE id = ?",
+                    'SELECT id, content, status, updated_at FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?',
                     (proposal["target_memory_id"],),
                 ).fetchone()
                 if row is not None:
@@ -145,7 +145,7 @@ class MemoryProposalRepository:
             source = None
             if proposal["evidence_message_id"] is not None:
                 row = db.execute(
-                    "SELECT id, role, content FROM messages WHERE id = ?",
+                    'SELECT id, role, content FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                     (proposal["evidence_message_id"],),
                 ).fetchone()
                 if row is not None:
@@ -157,7 +157,7 @@ class MemoryProposalRepository:
         memory_type = MemoryType(proposed_memory_type).value
         with self.database.connection() as db:
             rows = db.execute(
-                "SELECT * FROM memory_change_proposals WHERE proposal_type = ? AND evidence_message_id = ? AND proposed_memory_type = ? AND proposed_content = ? AND proposed_canonical_key = ? ORDER BY created_at, id",
+                'SELECT * FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND proposal_type = ? AND evidence_message_id = ? AND proposed_memory_type = ? AND proposed_content = ? AND proposed_canonical_key = ? ORDER BY created_at, id',
                 (ProposalType.CORRECTION.value, evidence_message_id, memory_type, proposed_content, proposed_canonical_key),
             ).fetchall()
         return [self._proposal_from_row(row) for row in rows]
@@ -168,9 +168,9 @@ class MemoryProposalRepository:
         if offset < 0:
             raise ValueError("offset 不能小于 0")
         params: list[str | int] = []
-        where = ""
+        where = " WHERE character_id = current_character()"
         if status is not None:
-            where = " WHERE status = ?"
+            where += " AND status = ?"
             params.append(ProposalStatus(status).value)
         params.extend([limit, offset])
         with self.database.connection() as db:
@@ -202,7 +202,7 @@ class MemoryProposalRepository:
                     return current
                 raise ProposalStateError(f"不能从 {current.status.value} 转换到 {target_status.value}")
             timestamp = now_iso()
-            db.execute("UPDATE memory_change_proposals SET status = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?", (target_status.value, timestamp, reason, proposal_id))
+            db.execute('UPDATE memory_change_proposals SET status = ?, resolved_at = ?, resolution_reason = ? WHERE character_id = current_character() AND id = ?', (target_status.value, timestamp, reason, proposal_id))
             self._insert_log(db, proposal_id, action, current.status, target_status, reason, actor_type, idempotency_key, fingerprint, timestamp)
         return self.get(proposal_id)
 
@@ -212,7 +212,7 @@ class MemoryProposalRepository:
         if offset < 0:
             raise ValueError("offset 不能小于 0")
         with self.database.connection() as db:
-            rows = db.execute("SELECT * FROM memory_proposal_change_log WHERE proposal_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?", (proposal_id, limit, offset)).fetchall()
+            rows = db.execute('SELECT * FROM memory_proposal_change_log WHERE memory_proposal_change_log.character_id = current_character() AND proposal_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?', (proposal_id, limit, offset)).fetchall()
         return [self._log_from_row(row) for row in rows]
 
     @staticmethod
@@ -222,7 +222,7 @@ class MemoryProposalRepository:
 
     @staticmethod
     def _proposal_row(db: sqlite3.Connection, proposal_id: str) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM memory_change_proposals WHERE id = ?", (proposal_id,)).fetchone()
+        row = db.execute('SELECT * FROM memory_change_proposals WHERE memory_change_proposals.character_id = current_character() AND id = ?', (proposal_id,)).fetchone()
         if row is None:
             raise ProposalNotFoundError(proposal_id)
         return row
@@ -231,7 +231,7 @@ class MemoryProposalRepository:
     def _log_by_idempotency(db: sqlite3.Connection, idempotency_key: str | None) -> ProposalChangeLog | None:
         if not idempotency_key:
             return None
-        row = db.execute("SELECT * FROM memory_proposal_change_log WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+        row = db.execute('SELECT * FROM memory_proposal_change_log WHERE memory_proposal_change_log.character_id = current_character() AND idempotency_key = ?', (idempotency_key,)).fetchone()
         return MemoryProposalRepository._log_from_row(row) if row is not None else None
 
     @staticmethod
@@ -253,7 +253,7 @@ class MemoryProposalRepository:
     ) -> str | None:
         target_updated_at = None
         if target_memory_id is not None:
-            target = db.execute("SELECT id, status, updated_at FROM memory_items WHERE id = ?", (target_memory_id,)).fetchone()
+            target = db.execute('SELECT id, status, updated_at FROM memory_items WHERE memory_items.character_id = current_character() AND id = ?', (target_memory_id,)).fetchone()
             if target is None:
                 raise MemoryNotFoundError(target_memory_id)
             if expected_target_memory_updated_at is not None:
@@ -264,7 +264,7 @@ class MemoryProposalRepository:
                 target_updated_at = expected_target_memory_updated_at
             else:
                 target_updated_at = target["updated_at"]
-        message = db.execute("SELECT role FROM messages WHERE id = ?", (evidence_message_id,)).fetchone()
+        message = db.execute('SELECT role FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?', (evidence_message_id,)).fetchone()
         if message is None:
             raise MessageNotFoundError(evidence_message_id)
         if message["role"] != "user":
@@ -273,7 +273,7 @@ class MemoryProposalRepository:
 
     @staticmethod
     def _insert_log(db: sqlite3.Connection, proposal_id: str, action: ProposalChangeAction, old_status: ProposalStatus | None, new_status: ProposalStatus, reason: str | None, actor_type: MemoryActorType | str, idempotency_key: str | None, request_fingerprint: str | None, created_at: str) -> None:
-        db.execute("INSERT INTO memory_proposal_change_log (id, proposal_id, action, old_status, new_status, reason, actor_type, idempotency_key, request_fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), proposal_id, action.value, old_status.value if old_status else None, new_status.value, reason, MemoryActorType(actor_type).value, idempotency_key, request_fingerprint, created_at))
+        db.execute('INSERT INTO memory_proposal_change_log (character_id, id, proposal_id, action, old_status, new_status, reason, actor_type, idempotency_key, request_fingerprint, created_at) VALUES (current_character(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (str(uuid4()), proposal_id, action.value, old_status.value if old_status else None, new_status.value, reason, MemoryActorType(actor_type).value, idempotency_key, request_fingerprint, created_at))
 
     @staticmethod
     def _proposal_from_row(row: sqlite3.Row) -> MemoryChangeProposal:

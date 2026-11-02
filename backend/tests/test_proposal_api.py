@@ -5,7 +5,7 @@ from threading import Barrier, Event
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from .conftest import PairedTestClient as TestClient
 
 from app import main as api_main
 from app.db import Database
@@ -116,7 +116,8 @@ def test_empty_proposal_list_is_success(client):
 
 
 def test_main_app_registers_read_routes_and_uses_replaceable_service(proposal_api_context, monkeypatch):
-    _, _, _, proposal_service, _ = proposal_api_context
+    database, _, _, proposal_service, _ = proposal_api_context
+    monkeypatch.setattr(api_main, "database", database)
     monkeypatch.setattr(api_main, "proposal_service", proposal_service)
     client = TestClient(api_main.app)
     try:

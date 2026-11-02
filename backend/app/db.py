@@ -1,4 +1,7 @@
+import hashlib
+import os
 import sqlite3
+from contextvars import ContextVar
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -188,14 +191,357 @@ CREATE INDEX IF NOT EXISTS idx_memory_clarifications_conversation_status
     ON memory_correction_clarifications(conversation_id, status, updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_memory_clarifications_recovery
     ON memory_correction_clarifications(status, lease_expires_at, updated_at);
+""",
+8: """
+CREATE TABLE IF NOT EXISTS life_states (
+    character_id TEXT PRIMARY KEY,
+    current_activity_event_id TEXT,
+    mood TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS life_events (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'planned', 'imagined', 'wish')),
+    occurred_at TEXT,
+    planned_end_at TEXT,
+    content TEXT NOT NULL,
+    location TEXT,
+    feeling TEXT,
+    source TEXT NOT NULL,
+    generation_method TEXT NOT NULL,
+    state_id TEXT REFERENCES life_states(character_id) ON DELETE SET NULL,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    CHECK ((status = 'completed' AND occurred_at IS NOT NULL) OR status <> 'completed')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_life_event_idempotency
+    ON life_events(character_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_life_events_character_time
+    ON life_events(character_id, status, occurred_at, planned_end_at);
+""",
+9: """
+ALTER TABLE life_events ADD COLUMN activity_status TEXT CHECK (activity_status IN ('planned', 'active', 'completed', 'cancelled'));
+ALTER TABLE life_events ADD COLUMN planned_start_at TEXT;
+ALTER TABLE life_events ADD COLUMN started_at TEXT;
+ALTER TABLE life_events ADD COLUMN ended_at TEXT;
+ALTER TABLE life_events ADD COLUMN selection_reason TEXT;
+UPDATE life_events SET activity_status = CASE status WHEN 'planned' THEN 'planned' WHEN 'completed' THEN 'completed' ELSE NULL END;
+UPDATE life_events SET started_at = occurred_at, ended_at = occurred_at WHERE status = 'completed';
+UPDATE life_states SET current_activity_event_id = NULL;
+CREATE TABLE life_activity_transitions (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    event_id TEXT NOT NULL REFERENCES life_events(id) ON DELETE CASCADE,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_at TEXT NOT NULL
+);
+CREATE INDEX idx_life_transitions_event ON life_activity_transitions(event_id, changed_at, id);
+CREATE TABLE life_preferences (
+    character_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    weight REAL NOT NULL CHECK (weight >= 0.25 AND weight <= 2.0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(character_id, event_type)
+);
+CREATE TABLE life_preference_changes (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    old_weight REAL NOT NULL,
+    new_weight REAL NOT NULL,
+    reason TEXT NOT NULL,
+    event_id TEXT REFERENCES life_events(id) ON DELETE SET NULL,
+    changed_at TEXT NOT NULL
+);
+CREATE INDEX idx_life_preference_changes_character ON life_preference_changes(character_id, changed_at, id);
+CREATE UNIQUE INDEX idx_life_preference_once_per_event ON life_preference_changes(event_id, reason) WHERE event_id IS NOT NULL;
+""",
+10: """
+ALTER TABLE life_states ADD COLUMN timezone_id TEXT NOT NULL DEFAULT 'Asia/Shanghai';
+CREATE TABLE life_advance_leases (
+    character_id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE TABLE life_scheduler_ticks (
+    character_id TEXT PRIMARY KEY,
+    last_tick_at TEXT NOT NULL
+);
+CREATE TABLE life_share_intents (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE REFERENCES life_events(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'dismissed')),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    offered_at TEXT,
+    delivered_at TEXT,
+    dismissed_at TEXT
+);
+CREATE INDEX idx_life_share_pending ON life_share_intents(character_id, status, created_at);
+CREATE TABLE life_share_decisions (
+    event_id TEXT PRIMARY KEY REFERENCES life_events(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('created', 'skipped')),
+    reason TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
+""",
+11: """
+CREATE TABLE contact_preferences (
+    character_id TEXT PRIMARY KEY,
+    allowed INTEGER NOT NULL DEFAULT 1 CHECK (allowed IN (0, 1)),
+    busy_until TEXT,
+    quiet_start_minute INTEGER NOT NULL DEFAULT 1320 CHECK (quiet_start_minute BETWEEN 0 AND 1439),
+    quiet_end_minute INTEGER NOT NULL DEFAULT 480 CHECK (quiet_end_minute BETWEEN 0 AND 1439),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE contact_intents (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('life_share', 'smalltalk', 'conversation_followup', 'reminder')),
+    source_id TEXT NOT NULL,
+    share_intent_id TEXT REFERENCES life_share_intents(id) ON DELETE SET NULL,
+    event_id TEXT REFERENCES life_events(id) ON DELETE SET NULL,
+    importance TEXT NOT NULL CHECK (importance IN ('normal', 'important')),
+    reason TEXT NOT NULL,
+    topic TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'generating', 'deferred', 'ready', 'delivered', 'dismissed')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    retry_after TEXT,
+    generation_token TEXT,
+    lease_expires_at TEXT,
+    UNIQUE(character_id, source, source_id)
+);
+CREATE INDEX idx_contact_intents_queue ON contact_intents(character_id, status, importance, created_at);
+CREATE TABLE proactive_messages (
+    id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL REFERENCES contact_intents(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no IN (0, 1)),
+    content TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready', 'delivered', 'read')),
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    read_at TEXT,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    chat_message_id TEXT UNIQUE REFERENCES messages(id) ON DELETE SET NULL,
+    UNIQUE(intent_id, attempt_no)
+);
+CREATE INDEX idx_proactive_inbox ON proactive_messages(status, created_at, id);
 """}
 
 
+from .ownership_migration import SQL as OWNERSHIP_MIGRATION
+
+MIGRATIONS[12] = OWNERSHIP_MIGRATION
+
+MIGRATIONS[13] = """
+ALTER TABLE life_events ADD COLUMN runtime_owner_token TEXT;
+ALTER TABLE life_events ADD COLUMN execution_status TEXT
+    CHECK (execution_status IN ('running', 'interrupted'));
+ALTER TABLE life_events ADD COLUMN interrupted_at TEXT;
+UPDATE life_events SET execution_status = 'running' WHERE activity_status = 'active';
+CREATE INDEX idx_life_running_owner ON life_events(runtime_owner_token, character_id, activity_status, execution_status);
+CREATE TABLE life_activity_interruptions (
+    event_id TEXT PRIMARY KEY REFERENCES life_events(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    instance_token TEXT,
+    reason TEXT NOT NULL CHECK (reason IN ('service_stopped', 'owner_lost')),
+    interrupted_at TEXT NOT NULL
+);
+CREATE TRIGGER life_activity_interruptions_owner_insert BEFORE INSERT ON life_activity_interruptions
+WHEN NEW.character_id IS NOT (SELECT character_id FROM life_events WHERE id=NEW.event_id)
+BEGIN SELECT RAISE(ABORT, 'cross-character interruption'); END;
+CREATE TRIGGER life_activity_interruptions_owner_update BEFORE UPDATE ON life_activity_interruptions
+WHEN NEW.character_id IS NOT OLD.character_id OR NEW.event_id IS NOT OLD.event_id
+BEGIN SELECT RAISE(ABORT, 'interruption ownership is immutable'); END;
+CREATE TABLE life_service_instances (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token TEXT NOT NULL UNIQUE,
+    process_id INTEGER NOT NULL,
+    host_name TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+"""
+
+MIGRATIONS[14] = """
+ALTER TABLE contact_preferences ADD COLUMN pause_until TEXT;
+ALTER TABLE life_share_intents ADD COLUMN delivery_channel TEXT
+    CHECK (delivery_channel IN ('chat', 'contact'));
+ALTER TABLE life_share_intents ADD COLUMN selection_token TEXT;
+ALTER TABLE life_share_intents ADD COLUMN selection_expires_at TEXT;
+ALTER TABLE life_share_intents ADD COLUMN chat_retry_after TEXT;
+UPDATE life_share_intents SET delivery_channel = 'contact'
+WHERE status = 'pending' AND EXISTS (
+    SELECT 1 FROM contact_intents c WHERE c.share_intent_id = life_share_intents.id
+      AND c.status IN ('pending', 'generating', 'deferred', 'ready')
+);
+UPDATE life_share_intents SET delivery_channel = 'chat', offered_at = NULL
+WHERE status = 'pending' AND offered_at IS NOT NULL AND delivery_channel IS NULL;
+CREATE INDEX idx_life_share_channel ON life_share_intents(character_id, status, delivery_channel, created_at);
+"""
+
+
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, environment: str | None = None,
+                 test_data_root: str | None = None, migration_backup_path: str | None = None,
+                 migration_confirmation: str | None = None,
+                 allow_protected_database_access: bool = False,
+                 protected_database_confirmation: str | None = None):
+        self.environment = environment or os.environ.get("SOULSEED_ENVIRONMENT", "development")
+        if self.environment == "testing":
+            if test_data_root is None:
+                from .config import get_settings
+                test_data_root = get_settings().test_data_root
+            from .config import validate_test_database_path
+            path = str(validate_test_database_path(path, test_data_root))
         self.path = path
+        self.test_data_root = test_data_root
+        self.migration_backup_path = migration_backup_path
+        self.migration_confirmation = migration_confirmation
+        self.allow_protected_database_access = allow_protected_database_access
+        self.protected_database_confirmation = protected_database_confirmation
+        self._active_transaction: ContextVar[sqlite3.Connection | None] = ContextVar(
+            f"soulseed_transaction_{id(self)}", default=None
+        )
+
+    def _validate_path_before_access(self) -> None:
+        if self.environment == "testing":
+            from .config import validate_test_database_path
+            self.path = str(validate_test_database_path(self.path, self.test_data_root))
+
+    def _protected_database_target(self) -> Path | None:
+        from .config import DEVELOPMENT_DATABASE_PATH, FORMAL_DATABASE_PATHS
+
+        # The testing path has already passed the strict temporary-root fence.
+        # Do not even stat the user's protected database while running tests.
+        if self.environment == "testing":
+            return None
+
+        target = Path(self.path).expanduser().resolve(strict=False)
+        for protected_path in FORMAL_DATABASE_PATHS:
+            protected = Path(protected_path).expanduser().resolve(strict=False)
+            if target == protected:
+                return protected
+            # File identity catches hard links and aliases that retain a
+            # different path. This check reads metadata, not database content.
+            try:
+                if target.is_file() and protected.is_file() and os.path.samefile(target, protected):
+                    return protected
+            except OSError:
+                return target
+
+        if self.environment == "development":
+            development_path = DEVELOPMENT_DATABASE_PATH.resolve(strict=False)
+            if target != development_path:
+                # A custom development path may contain user data or a
+                # relocated copy, so it requires the same explicit approval.
+                return target
+        return None
+
+    def _require_protected_database_access(self, protected: Path) -> None:
+        confirmation = self.protected_database_confirmation
+        confirmed_path = None
+        if confirmation:
+            try:
+                confirmed_path = Path(confirmation).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                confirmed_path = None
+        if (not self.allow_protected_database_access or confirmed_path is None
+                or os.path.normcase(str(confirmed_path)) != os.path.normcase(str(protected))):
+            raise RuntimeError(
+                "该路径属于受保护数据；需显式启用受保护数据库访问并确认其规范化绝对路径"
+            )
+
+    @staticmethod
+    def _readonly_schema_version(path: Path) -> int:
+        uri = path.resolve(strict=True).as_uri() + "?mode=ro"
+        try:
+            with sqlite3.connect(uri, uri=True, timeout=5) as db:
+                integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError("数据库或备份完整性检查失败")
+                exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+                ).fetchone()
+                if not exists:
+                    return 0
+                return int(db.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
+        except sqlite3.Error as exc:
+            raise RuntimeError("无法只读核验数据库迁移版本") from exc
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _require_migration_approval(self) -> None:
+        database = Path(self.path).resolve(strict=False)
+        if not database.is_file():
+            raise RuntimeError("受保护数据库不存在；自动建库和迁移已拒绝")
+        current = self._readonly_schema_version(database)
+        latest = max(MIGRATIONS)
+        if current > latest:
+            raise RuntimeError("数据库迁移版本高于当前程序支持版本")
+        if current == latest:
+            return
+
+        confirmation = f"{current}->{latest}"
+        if self.migration_confirmation != confirmation or not self.migration_backup_path:
+            raise RuntimeError(
+                f"数据库有待执行迁移 {confirmation}；需提供字节一致的独立备份并显式确认"
+            )
+
+        backup = Path(self.migration_backup_path).expanduser().resolve(strict=True)
+        if not backup.is_file() or os.path.samefile(database, backup):
+            raise RuntimeError("迁移备份必须是另一个现存普通文件")
+        project_root = Path(__file__).resolve().parents[2]
+        try:
+            backup.relative_to(project_root)
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("production 迁移备份必须位于项目仓库之外")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if Path(str(database) + suffix).exists() or Path(str(backup) + suffix).exists():
+                raise RuntimeError("存在 SQLite sidecar 文件；须先完成一致性备份")
+        if self._readonly_schema_version(backup) != current:
+            raise RuntimeError("迁移备份的 schema 版本与正式库不一致")
+        if self._sha256(database) != self._sha256(backup):
+            raise RuntimeError("迁移备份哈希与待升级数据库不一致")
+
+    @contextmanager
+    def atomic(self) -> Iterator[sqlite3.Connection]:
+        """One SQLite write transaction shared by nested repository calls."""
+        active = self._active_transaction.get()
+        if active is not None:
+            yield active
+            return
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            token = self._active_transaction.set(connection)
+            try:
+                yield connection
+            finally:
+                self._active_transaction.reset(token)
 
     def initialize(self) -> None:
+        self._validate_path_before_access()
+        protected = self._protected_database_target()
+        if protected is not None:
+            self._require_protected_database_access(protected)
+        if self.environment == "production" or protected is not None:
+            self._require_migration_approval()
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
@@ -216,7 +562,18 @@ class Database:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        active = self._active_transaction.get()
+        if active is not None:
+            yield active
+            return
+        self._validate_path_before_access()
+        protected = self._protected_database_target()
+        if protected is not None:
+            self._require_protected_database_access(protected)
+        connection = sqlite3.connect(self.path, timeout=10)
+        from .ownership import current_character
+        scope = current_character.get()
+        connection.create_function("current_character", 0, lambda: scope)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
