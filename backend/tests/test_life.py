@@ -43,7 +43,9 @@ def test_due_plan_advances_once_and_wish_is_not_a_fact(life):
 
 def test_chat_gets_life_context_only_when_relevant(life):
     _, repo = life
-    now = datetime(2026, 11, 2, 5, tzinfo=UTC)
+    # ChatService queries the current local day, so the fixture event must be
+    # on that day rather than an old hard-coded calendar date.
+    now = datetime.now(UTC)
     repo.record("读了一会儿童话", now=now)
     db = life[0]
     conversations, messages = ConversationRepository(db), MessageRepository(db)

@@ -2,7 +2,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 import json
+import os
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 import httpx
 
@@ -139,14 +143,19 @@ class OpenAICompatibleAdapter:
         )
 
     async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False) -> str:
+        if not self.settings.model_enabled:
+            raise ModelConfigurationError("真实模型调用已在当前环境关闭。")
         if not self.settings.model_api_key:
             raise ModelConfigurationError("模型 API 密钥未配置。请在 .env 中设置 SOULSEED_MODEL_API_KEY。")
         if not self.settings.model_name:
             raise ModelConfigurationError("模型名称未配置。请在 .env 中设置 SOULSEED_MODEL_NAME。")
         url = self.settings.model_base_url.rstrip("/") + "/chat/completions"
+        request_id = self._reserve_request()
         try:
             async with self.client_factory(timeout=self.settings.model_timeout_seconds) as client:
                 body = {"model": self.settings.model_name, "messages": messages}
+                if self.settings.model_max_output_tokens is not None:
+                    body["max_tokens"] = self.settings.model_max_output_tokens
                 if structured:
                     body["response_format"] = {"type": "json_object"}
                 response = await client.post(
@@ -155,9 +164,12 @@ class OpenAICompatibleAdapter:
                     json=body,
                 )
         except httpx.TimeoutException as exc:
+            self._record_result(request_id, "timeout")
             raise ModelTimeoutError() from exc
         except httpx.RequestError as exc:
+            self._record_result(request_id, "network_error")
             raise ModelRequestError("无法连接硅基流动模型服务，请检查网络或稍后重试。") from exc
+        self._record_result(request_id, f"http_{response.status_code}", response)
         if response.is_error:
             status = response.status_code
             if status in (401, 403):
@@ -180,4 +192,61 @@ class OpenAICompatibleAdapter:
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("模型服务返回了空回复。")
         return content.strip()
+
+    def _append_log(self, record: dict) -> None:
+        path = self.settings.model_request_log_path
+        if not path:
+            return
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # The local instance lock allows one backend process for this database.
+        # A started reservation is never refunded, including after a crash.
+        with target.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+
+    def _reserve_request(self) -> str | None:
+        path = self.settings.model_request_log_path
+        limit = self.settings.model_daily_request_limit
+        if limit is not None and not path:
+            raise ModelConfigurationError("模型请求限额需要持久化调用记录路径。")
+        if not path:
+            return None
+        now = datetime.now(UTC)
+        day = now.date().isoformat()
+        target = Path(path).expanduser()
+        if limit is not None and target.exists():
+            try:
+                with target.open("r", encoding="utf-8") as log:
+                    used = sum(1 for line in log if line.startswith('{"event":"started","day":"' + day + '"'))
+            except OSError as exc:
+                raise ModelConfigurationError("无法读取模型调用记录；已拒绝本次请求。") from exc
+            if used >= limit:
+                raise ModelConfigurationError("今日模型请求次数已达到开发环境上限。")
+        request_id = str(uuid4())
+        try:
+            self._append_log({"event": "started", "day": day, "at": now.isoformat(),
+                              "id": request_id, "model": self.settings.model_name})
+        except OSError as exc:
+            raise ModelConfigurationError("无法持久记录模型请求；已拒绝本次请求。") from exc
+        return request_id
+
+    def _record_result(self, request_id: str | None, status: str, response: httpx.Response | None = None) -> None:
+        if request_id is None:
+            return
+        usage = None
+        if response is not None:
+            try:
+                raw = response.json().get("usage", {})
+                usage = {key: raw.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                         if isinstance(raw.get(key), int)}
+            except (ValueError, AttributeError):
+                pass
+        try:
+            self._append_log({"event": "finished", "at": datetime.now(UTC).isoformat(),
+                              "id": request_id, "status": status, "usage": usage})
+        except OSError:
+            # Reservation remains counted. A log write failure never causes a retry.
+            pass
 

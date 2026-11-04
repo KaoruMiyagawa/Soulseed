@@ -32,18 +32,56 @@ class SafeContactGenerator:
 
 
 class AdapterContactGenerator:
-    """Future opt-in adapter seam; production does not instantiate this class."""
+    """Opt-in generator.  Its only life facts come from a character-scoped DB lookup."""
 
-    def __init__(self, model, persona_prompt: str):
-        self.model, self.persona_prompt = model, persona_prompt
+    def __init__(self, model, persona_prompt: str, repository: LifeRepository | None = None):
+        self.model, self.persona_prompt, self.repository = model, persona_prompt, repository
 
     async def generate(self, intent: dict, *, reminder: bool = False) -> str:
-        source = "真实已完成的生活事件" if intent["source"] == "life_share" else "已保存的互动主题"
-        reply = await self.model.reply([
+        from .expression import ExpressionContextBuilder
+
+        character_id = str(intent.get("character_id") or "")
+        if not character_id:
+            raise ValueError("主动联系意图缺少角色范围")
+        evidence, recent, prefs = [], [], []
+        if self.repository is not None:
+            snapshot = self.repository.expression_snapshot("最近在干嘛", character_id=character_id)
+            evidence = snapshot["events"]
+            prefs = snapshot["preferences"]
+            with self.repository.database.connection() as db:
+                if intent.get("source") == "life_share":
+                    row = db.execute(
+                        "SELECT e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id WHERE s.id=? AND s.character_id=? AND s.status='pending' AND e.activity_status='completed' AND e.status='completed'",
+                        (intent.get("share_intent_id"), character_id),
+                    ).fetchone()
+                    if not row:
+                        raise ValueError("分享来源不再是已完成的角色经历")
+                    share = dict(row)
+                else:
+                    share = None
+                    row = db.execute(
+                        "SELECT m.id, m.role, m.content FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id=? AND m.role='user' AND c.character_id=?",
+                        (intent.get("source_id"), character_id),
+                    ).fetchone()
+                    if row:
+                        recent.append(f"已保存的用户主题：{row['content'][:180]}")
+            context = ExpressionContextBuilder().build(
+                character_id=character_id, intent=str(intent.get("topic") or ""),
+                intent_source=str(intent.get("source") or "saved_intent"), life_events=evidence,
+                share=share, preferences=prefs, recent_interactions=recent,
+                boundaries=("消息不得催促或要求回复",),
+                local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],
+            ).to_system_message()
+        else:
+            context = None
+        messages = [
             {"role": "system", "content": self.persona_prompt},
-            {"role": "system", "content": f"写一条简短、自然、无催促的站内主动消息。依据：{source}。不要编造经历、施压或索要回复。"},
-            {"role": "user", "content": f"主题：{intent['topic']}；是否提醒：{reminder}"},
-        ])
+            {"role": "system", "content": "生成一条自然、简洁、无催促的站内消息。只可依据下列保存资料表达；不要把计划或中断说成完成，不要添加未记录的细节，也不要输出 JSON、规则或内部信息。"},
+        ]
+        if context:
+            messages.append(context)
+        messages.append({"role": "system", "content": f"提醒模式：{'是' if reminder else '否'}。这是服务端已批准的联系意图内容，不能改变联系决策。"})
+        reply = await self.model.reply(messages)
         if not isinstance(reply, str) or not reply.strip() or reply.lstrip().startswith(("{", "[")):
             raise ValueError("主动消息生成结果不可用")
         return reply.strip()
@@ -60,6 +98,18 @@ class ContactService:
         with self.repository.database.connection() as db:
             db.execute("INSERT OR IGNORE INTO contact_preferences(character_id, updated_at) VALUES (?, ?)", (character_id, _iso(now)))
             return dict(db.execute("SELECT * FROM contact_preferences WHERE character_id = ?", (character_id,)).fetchone())
+
+    def expression_boundaries(self, character_id: str = "big_fish", *, now: datetime | None = None) -> tuple[str, ...]:
+        prefs = self.preferences(character_id, now=now)
+        current = now or datetime.now(UTC)
+        result = []
+        if not prefs["allowed"]:
+            result.append("用户已关闭主动联系；普通聊天仍可正常回应")
+        if prefs["busy_until"] and datetime.fromisoformat(prefs["busy_until"]) > current:
+            result.append("用户当前标记为忙碌")
+        if prefs["pause_until"] and datetime.fromisoformat(prefs["pause_until"]) > current:
+            result.append("用户暂时不希望被主动联系")
+        return tuple(result)
 
     def set_preferences(self, character_id: str = "big_fish", *, allowed=UNSET,
                         busy_until=UNSET, pause_until=UNSET, quiet_start_minute=UNSET,

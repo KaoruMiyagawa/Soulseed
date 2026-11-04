@@ -71,10 +71,16 @@ class Settings(BaseSettings):
     database_path: str = str(DEVELOPMENT_DATABASE_PATH)
     test_data_root: str | None = Field(default=None, repr=False)
     test_frontend_origin: str | None = Field(default=None, repr=False)
+    development_frontend_origin: str | None = None
     model_base_url: str = "https://api.siliconflow.cn/v1"
     model_api_key: str | None = Field(default=None, repr=False)
     model_name: str = "deepseek-ai/DeepSeek-V4.1-Flash"
     model_timeout_seconds: float = 60
+    model_enabled: bool = True
+    model_max_output_tokens: int | None = Field(default=None, ge=64, le=4096)
+    model_daily_request_limit: int | None = Field(default=None, ge=1, le=1000)
+    model_conversation_turn_limit: int | None = Field(default=None, ge=1, le=1000)
+    model_request_log_path: str | None = None
     system_prompt: str | None = None
     memory_context_max_chars: int = 4000
     memory_context_max_items: int = 5
@@ -83,6 +89,7 @@ class Settings(BaseSettings):
     life_background_enabled: bool = True
     life_background_interval_minutes: int = Field(default=30, ge=5)
     contact_enabled: bool = True
+    contact_model_generation_enabled: bool = False
     contact_background_enabled: bool = True
     contact_check_interval_minutes: int = Field(default=60, ge=30)
     local_pairing_secret: str | None = Field(default=None, repr=False, min_length=32)
@@ -103,6 +110,14 @@ class Settings(BaseSettings):
             development_database = DEVELOPMENT_DATABASE_PATH.resolve(strict=False)
             if selected_database == development_database:
                 raise ValueError("production 环境不能使用 development 数据库路径")
+
+        if self.development_frontend_origin:
+            frontend = urlsplit(self.development_frontend_origin)
+            if (self.environment != "development" or frontend.scheme != "http"
+                    or frontend.hostname not in {"127.0.0.1", "localhost"}
+                    or frontend.port is None or frontend.path not in {"", "/"}
+                    or frontend.username or frontend.password or frontend.query or frontend.fragment):
+                raise ValueError("development 前端来源必须是明确的本机 HTTP 地址和端口")
 
         if self.environment == "testing":
             required = ("database_path", "test_data_root", "local_pairing_secret")

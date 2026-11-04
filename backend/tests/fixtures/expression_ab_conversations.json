@@ -1,0 +1,34 @@
+{
+  "baseline_commit": "ed171fb6fd15139356ac91eb4595b0eff12a5e41",
+  "pilot_pairs": [
+    "food_today",
+    "miss_you",
+    "music_completed",
+    "activity_interrupted",
+    "exploration_share",
+    "technical_help",
+    "contact_proactive"
+  ],
+  "continuous": [
+    {
+      "id": "daily_chat",
+      "turns": ["鱼儿，在干嘛？", "今天有什么好玩的？", "哈哈哈，你真是个笨蛋。", "好啦不逗你了。"]
+    },
+    {
+      "id": "affection_and_fatigue",
+      "turns": ["大肥鱼，我想你了。", "你就一点也不想我吗？", "今天好累啊。", "那你陪我说说话。"]
+    },
+    {
+      "id": "experience_truth",
+      "turns": ["今天吃了什么？", "你刚才听了哪首歌？", "探索的时候发现了什么？", "你今天开心吗？"]
+    },
+    {
+      "id": "proactive_contact",
+      "turns": ["站内主动联系：已完成的探索分享意图"]
+    },
+    {
+      "id": "technical_chat",
+      "turns": ["我最近换 Linux 了。", "你知道 Linux 的权限系统吗？", "chmod 755 是什么意思？"]
+    }
+  ]
+}

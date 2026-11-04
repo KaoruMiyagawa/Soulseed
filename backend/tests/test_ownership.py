@@ -90,6 +90,30 @@ def test_all_data_endpoints_require_identity(owned):
         assert c.execute("SELECT COUNT(*) FROM life_events").fetchone()[0] == 0
 
 
+def test_development_conversation_turn_limit_rejects_before_model(owned, monkeypatch):
+    _, records, _ = owned
+    conversation_id = records["big_fish"][0]["id"]
+    monkeypatch.setattr(main.settings, "model_conversation_turn_limit", 1)
+    client = paired()
+    response = client.post(f"/api/conversations/{conversation_id}/messages", json={"content": "another turn"})
+    assert response.status_code == 429
+    with character_scope("big_fish"):
+        assert [item["content"] for item in main.messages.list_for_conversation(conversation_id)] == [
+            records["big_fish"][1]["content"]
+        ]
+
+
+def test_development_loopback_uses_only_big_fish_without_pairing(owned, monkeypatch):
+    _, records, _ = owned
+    monkeypatch.setattr(main.settings, "environment", "development")
+    client = raw_client()
+    assert client.get("/api/auth/session").status_code == 200
+    assert client.get("/api/auth/session").json()["character_id"] == "big_fish"
+    assert client.get(f"/api/conversations/{records['big_fish'][0]['id']}").status_code == 200
+    assert client.get(f"/api/conversations/{records['fish_b'][0]['id']}").status_code == 404
+    assert client.post("/api/auth/session", json={"secret": "unused", "character_id": "big_fish"}).status_code == 404
+
+
 def test_forged_role_conversation_and_owner_cannot_authorize(owned):
     db, records, _ = owned
     client = paired()

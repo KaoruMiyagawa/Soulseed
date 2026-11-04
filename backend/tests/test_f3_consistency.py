@@ -175,7 +175,7 @@ def test_chat_share_generation_failure_releases_selection_and_success_does_not_f
     model = Model(False)
     chat = ChatService(conversations, messages, model, "persona", life_repository=repo)
     asyncio.run(chat.send(conversation["id"], "鱼儿你在干嘛？"))
-    assert any("life_share_intent" in item["content"] for item in model.prompts[-1] if item["role"] == "system")
+    assert any('"source":"pending_life_share"' in item["content"] for item in model.prompts[-1] if item["role"] == "system")
     with db.connection() as sql:
         selected = dict(sql.execute("SELECT status, offered_at, delivery_channel, selection_token FROM life_share_intents WHERE id=?", (share["id"],)).fetchone())
     assert selected == {"status": "pending", "offered_at": None, "delivery_channel": "chat", "selection_token": None}

@@ -81,13 +81,15 @@ class LifeShareService:
         with self.repository.database.connection() as db:
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT i.id, e.content, e.occurred_at FROM life_share_intents i JOIN life_events e ON e.id = i.event_id AND e.character_id=i.character_id WHERE i.character_id = ? AND i.status = 'pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after <= ?) AND (i.selection_token IS NULL OR i.selection_expires_at <= ?) AND e.status='completed' AND e.activity_status='completed' ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
+            row = db.execute("SELECT i.id, e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method FROM life_share_intents i JOIN life_events e ON e.id = i.event_id AND e.character_id=i.character_id WHERE i.character_id = ? AND i.status = 'pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after <= ?) AND (i.selection_token IS NULL OR i.selection_expires_at <= ?) AND e.status='completed' AND e.activity_status='completed' ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
             if not row:
                 return None
             changed = db.execute("UPDATE life_share_intents SET selection_token=?, selection_expires_at=? WHERE id=? AND status='pending' AND (selection_token IS NULL OR selection_expires_at <= ?)", (token, _iso(current + timedelta(minutes=10)), row["id"], at)).rowcount
             if changed != 1:
                 return None
-            return {"token": token, "intent_id": row["id"], "context": self._chat_context(dict(row))}
+            event = {key: row[key] for key in ("event_id", "event_type", "content", "occurred_at", "status", "source", "generation_method")}
+            return {"token": token, "intent_id": row["id"], "event": event,
+                    "context": self._chat_context(dict(row))}
 
     def release_chat_reservation(self, token: str) -> bool:
         with self.repository.database.connection() as db:

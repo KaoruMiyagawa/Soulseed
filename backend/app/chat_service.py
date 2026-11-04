@@ -4,6 +4,7 @@ import json
 import logging
 import re
 
+from .expression import ExpressionContextBuilder
 from .memory.context_builder import MemoryContextBuilder
 from .memory.correction_flow_service import CorrectionFlowResult, CorrectionFlowService, CorrectionFlowStatus
 from .memory.clarification_repository import (
@@ -70,6 +71,7 @@ class ChatService:
         self.memory_correction_service = memory_correction_service
         self.life_repository = life_repository
         self.contact_service = contact_service
+        self.expression_context_builder = ExpressionContextBuilder()
 
     async def send(self, conversation_id: str, content: str) -> dict:
         self.conversations.get(conversation_id)
@@ -109,11 +111,13 @@ class ChatService:
             return {**assistant_message, "correction": self._correction_summary(())}
 
         memory_context = ""
+        memory_matches = []
         share_service = None
         share_reservation = None
         if self.memory_retriever and self.memory_context_builder:
             try:
-                memory_context = self.memory_context_builder.build(self.memory_retriever.retrieve(content))
+                memory_matches = self.memory_retriever.retrieve(content)
+                memory_context = self.memory_context_builder.build(memory_matches)
             except Exception:
                 logger.exception("记忆检索或上下文组装失败，继续执行聊天请求 message_id=%s", user_message["id"])
 
@@ -160,18 +164,37 @@ class ChatService:
             try:
                 from .life_engine import LifeEngine
                 LifeEngine(self.life_repository).advance(current_character.get())
-                life_context = self.life_repository.context(content, character_id=current_character.get())
-                if life_context:
-                    memory_context = f"{memory_context}\n{life_context}" if memory_context else life_context
+                snapshot = self.life_repository.expression_snapshot(content, character_id=current_character.get())
                 if not correction_results and not clarification_busy:
                     from .life_share import LifeShareService
                     share_service = LifeShareService(self.life_repository)
                     share_reservation = share_service.reserve_for_chat(content, character_id=current_character.get())
-                    if share_reservation:
-                        candidate = share_reservation["context"]
-                        memory_context = f"{memory_context}\n{candidate}" if memory_context else candidate
+                history = self.messages.list_for_conversation(conversation_id)
+                continues_topic = any(word in content for word in ("刚才", "上次", "之前说", "接着", "继续聊", "还记得"))
+                recent = ([f"{item['role']}: {item['content']}" for item in history[-4:-1]
+                           if item.get("role") in {"user", "assistant"}] if continues_topic else [])
+                expression = self.expression_context_builder.build(
+                    character_id=current_character.get(), intent=content,
+                    memory_matches=memory_matches, life_events=snapshot["events"],
+                    current_activity=snapshot["current_activity"],
+                    share=(share_reservation or {}).get("event"),
+                    preferences=snapshot["preferences"], recent_interactions=recent,
+                    boundaries=(self.contact_service.expression_boundaries(current_character.get())
+                                if self.contact_service is not None else ()),
+                    local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],
+                )
+                expression_message = expression.to_system_message()
+                memory_context = ""
+                if expression_message:
+                    memory_context = expression_message["content"]
             except Exception:
                 logger.exception("生活状态读取或推进失败，继续执行聊天请求 message_id=%s", user_message["id"])
+                memory_context = self.memory_context_builder.build(memory_matches) if self.memory_context_builder else ""
+        elif memory_matches:
+            expression_message = self.expression_context_builder.build(
+                character_id=current_character.get(), intent=content, memory_matches=memory_matches,
+            ).to_system_message()
+            memory_context = expression_message["content"] if expression_message else ""
         model_messages = self._model_messages(conversation_id, memory_context)
         clarification = self._single_clarification_context(correction_results)
         if clarification is not None and self.clarifications is not None:

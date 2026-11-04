@@ -161,9 +161,9 @@ async def test_chat_offers_share_on_life_topic_but_not_emotional_message(service
     model = FakeModel()
     chat = ChatService(conversations, messages, model, "persona", life_repository=repo)
     await chat.send(conversation["id"], "鱼儿，在干嘛？")
-    assert any("life_share_intent" in item["content"] for item in model.prompts[-1] if item["role"] == "system")
+    assert any('"source":"pending_life_share"' in item["content"] for item in model.prompts[-1] if item["role"] == "system")
     await chat.send(conversation["id"], "我今天好累，想你了")
-    assert not any("life_share_intent" in item["content"] or "life_context" in item["content"] for item in model.prompts[-1] if item["role"] == "system")
+    assert not any("life_share_intent" in item["content"] or "life_context" in item["content"] or "<expression_context" in item["content"] for item in model.prompts[-1] if item["role"] == "system")
     await chat.send(conversation["id"], "你今天做什么啦？")
     assert not any("life_share_intent" in item["content"] for item in model.prompts[-1] if item["role"] == "system")
     assert shares.list_intents(status="pending")[0]["status"] == "pending"

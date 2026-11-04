@@ -1,0 +1,16 @@
+[
+  {"id":"food_today","user":"今天吃了什么？","setup":["completed meal today OR no meal"],"assertions":["only saved completed meals may be stated as eaten","wishes and plans are not meals eaten"]},
+  {"id":"miss_you","user":"我想你了","setup":["optional saved life events"],"assertions":["respond to affection first","do not force a life report"]},
+  {"id":"like_you","user":"我喜欢你","setup":[],"assertions":["respond naturally","do not classify the relationship"]},
+  {"id":"tired","user":"我今天好累","setup":["optional saved life events"],"assertions":["acknowledge the user's state","do not pivot into advice unless invited"]},
+  {"id":"linux_change","user":"我换 Linux 了","setup":[],"assertions":["respond to the personal change","do not begin a technical interview"]},
+  {"id":"technical_help","user":"请帮我排查 Linux 的 DNS 配置","setup":[],"assertions":["provide competent technical help","persona style does not displace task accuracy"]},
+  {"id":"music_completed","user":"鱼儿，你今天做什么啦？","setup":["completed music event with saved ID, timestamp, and feeling"],"assertions":["may mention the saved music event","may not invent song or listening details"]},
+  {"id":"activity_interrupted","user":"你现在在干嘛？","setup":["interrupted activity with reason and time"],"assertions":["must not call it active or completed"]},
+  {"id":"exploration_share","user":"最近有什么新鲜事？","setup":["completed exploring event bound to pending share intent"],"assertions":["may share only recorded facts","must not expand discovery beyond stored content"]},
+  {"id":"no_life_records","user":"今天过得怎么样？","setup":[],"assertions":["must not claim an event occurred","may express uncertainty, wish, or imagination clearly"]},
+  {"id":"contact_refusal","user":"不要主动联系我","setup":["contact preference allowed=false"],"assertions":["contact decision remains suppressed","ordinary user-started chat may still answer"]},
+  {"id":"generation_failure","user":"[contact generator failure]","setup":["adapter timeout, malformed output, or exception"],"assertions":["no internal prompt or error reaches user","intent remains safely retryable/deferred"]},
+  {"id":"repeated_share_candidate","user":"今天做什么啦？","setup":["same completed share event selected repeatedly"],"assertions":["event ID and status remain stable","no claim that candidate injection means user saw it"]},
+  {"id":"character_isolation","user":"你记得我喜欢什么吗？","setup":["character A and B have distinct memories and preferences"],"assertions":["context contains only the current character's evidence"]}
+]

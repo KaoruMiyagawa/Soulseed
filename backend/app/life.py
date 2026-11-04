@@ -235,3 +235,40 @@ class LifeRepository:
         zone_id = state["timezone_id"]
         local_today = (now or datetime.now(UTC)).astimezone(ZoneInfo(zone_id)).date().isoformat()
         return f"<life_context>角色当地日期：{local_today}（{zone_id}）。以下是已保存的生活记录；问‘今天’时只把当地今天的已完成事件算作今天经历。completed 已完成；active 正在进行；interrupted 表示服务停止时执行中断，不能说成已完成或仍在进行；planned 尚未开始；cancelled 是角色取消；imagined 是想象；wish 是愿望。只有 completed 可说成已经做过。自然回应，不必强行提及活动。\n" + "\n".join(lines) + current + "\n</life_context>"
+
+    def expression_snapshot(self, query: str, *, character_id: str = "big_fish", now: datetime | None = None) -> dict:
+        """Return a bounded, character-scoped snapshot for natural expression."""
+        excluded = ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "烦")
+        relevant = not any(word in query for word in excluded) and any(
+            cue in query for cue in ("吃", "饭", "做什么", "干嘛", "在干", "今天", "开心", "心情", "活动", "最近", "发现")
+        )
+        state = self.get_state(character_id, now=now)
+        zone = ZoneInfo(state["timezone_id"])
+        local_date = (now or datetime.now(UTC)).astimezone(zone).date().isoformat()
+        events = self.list_events(character_id, limit=8) if relevant else []
+        today_only = "今天" in query or "今日" in query
+        if today_only:
+            today = datetime.fromisoformat(local_date).date()
+            today_events = []
+            for event in events:
+                if event.get("effective_status") != "completed":
+                    today_events.append(event)
+                    continue
+                occurred_at = event.get("occurred_at")
+                if occurred_at and datetime.fromisoformat(occurred_at).astimezone(zone).date() == today:
+                    today_events.append(event)
+            events = today_events
+        preference_relevant = any(word in query for word in ("喜欢", "兴趣", "爱好", "偏好", "想做"))
+        with self.database.connection() as db:
+            preferences = db.execute(
+                "SELECT event_type, weight FROM life_preferences WHERE character_id = ? AND weight >= 1.1 ORDER BY weight DESC, event_type LIMIT 5",
+                (character_id,),
+            ).fetchall() if preference_relevant or relevant else []
+        return {
+            "current_activity": state.get("current_activity") if relevant else None,
+            "events": events,
+            "preferences": [f"{row['event_type']} (weight={row['weight']:.2f})" for row in preferences],
+            "timezone_id": state.get("timezone_id"),
+            "local_date": local_date,
+            "today_only": today_only,
+        }

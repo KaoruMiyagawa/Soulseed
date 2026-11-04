@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,14 +40,18 @@ def isolated_environment(test_root: Path, port: int) -> dict[str, str]:
 
 
 def run_child(command: list[str], *, env: dict[str, str], cwd: Path, duration: float | None = None) -> int:
-    child = subprocess.Popen(command, cwd=cwd, env=env)
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" and duration is not None else 0
+    child = subprocess.Popen(command, cwd=cwd, env=env, creationflags=flags)
     try:
         if duration is not None:
             try:
                 child.wait(timeout=duration)
                 return child.returncode
             except subprocess.TimeoutExpired:
-                child.terminate()
+                if os.name == "nt":
+                    child.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    child.terminate()
                 try:
                     child.wait(timeout=5)
                 except subprocess.TimeoutExpired:

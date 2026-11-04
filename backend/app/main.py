@@ -25,7 +25,7 @@ from .life_engine import LifeEngine
 from .life_scheduler import LifeScheduler
 from .life_instance import LifeInstance
 from .life_share import LifeShareService
-from .contact import ContactService
+from .contact import AdapterContactGenerator, ContactService
 from .contact_scheduler import ContactScheduler
 from .local_auth import LocalAuth, COOKIE, ALLOWED_ORIGINS
 from .ownership import character_scope
@@ -96,6 +96,8 @@ settings = get_settings()
 allowed_origins = set(ALLOWED_ORIGINS)
 if settings.environment == "testing" and settings.test_frontend_origin:
     allowed_origins.add(settings.test_frontend_origin.rstrip("/"))
+if settings.environment == "development" and settings.development_frontend_origin:
+    allowed_origins = {settings.development_frontend_origin.rstrip("/")}
 database_path_label = (
     "<test-root>/" + Path(settings.database_path).relative_to(Path(settings.test_data_root).resolve()).as_posix()
     if settings.environment == "testing"
@@ -117,7 +119,12 @@ conversations = ConversationRepository(database)
 messages = MessageRepository(database)
 memory_service = MemoryService(MemoryRepository(database))
 life_repository = LifeRepository(database, default_timezone=settings.life_timezone)
-contact_service = ContactService(life_repository, enabled=settings.contact_enabled)
+model_adapter = OpenAICompatibleAdapter(settings)
+contact_generator = (
+    AdapterContactGenerator(model_adapter, resolve_system_prompt(settings.system_prompt), life_repository)
+    if settings.contact_model_generation_enabled else None
+)
+contact_service = ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled)
 proposal_service = MemoryProposalService(MemoryProposalRepository(database))
 memory_correction_service = MemoryCorrectionService(database)
 correction_flow = CorrectionFlowService(memory_service, proposal_service)
@@ -129,7 +136,7 @@ memory_retriever = MemoryRetriever(memory_service)
 chat = ChatService(
     conversations,
     messages,
-    OpenAICompatibleAdapter(settings),
+    model_adapter,
     resolve_system_prompt(settings.system_prompt),
     memory_service,
     DeterministicMemoryExtractor(),
@@ -208,7 +215,12 @@ async def authorize_local_request(request: Request, call_next):
     if request.method == "OPTIONS" or not path.startswith("/api/") or path in {"/api/health", "/api/auth/session", "/api/auth/logout"}:
         return await call_next(request)
     try:
-        principal = LocalAuth(database, settings.local_pairing_secret).authenticate(request.cookies.get(COOKIE))
+        if settings.environment == "development":
+            # Development is loopback-only and binds every request to one
+            # fixed local character; no client-supplied identity is accepted.
+            principal = {"user_id": "local", "character_id": "big_fish", "expires_at": None}
+        else:
+            principal = LocalAuth(database, settings.local_pairing_secret).authenticate(request.cookies.get(COOKIE))
         parts = path.split("/")
         if len(parts) > 3 and parts[2] == "characters" and parts[3] != principal["character_id"]:
             raise HTTPException(403, "当前会话无权访问该角色")
@@ -232,6 +244,8 @@ app.add_middleware(
 
 @app.post("/api/auth/session")
 def pair_local(request: PairRequest, response: Response) -> dict:
+    if settings.environment == "development":
+        raise HTTPException(404, "development 模式不使用配对登录")
     token, principal = LocalAuth(database, settings.local_pairing_secret).pair(request.secret, request.character_id)
     response.set_cookie(COOKIE, token, max_age=8 * 60 * 60, httponly=True, samesite="strict", path="/api")
     response.headers["Cache-Control"] = "no-store"
@@ -241,11 +255,15 @@ def pair_local(request: PairRequest, response: Response) -> dict:
 @app.get("/api/auth/session")
 def get_local_session(request: Request, response: Response) -> dict:
     response.headers["Cache-Control"] = "no-store"
+    if settings.environment == "development":
+        return {"user_id": "local", "character_id": "big_fish", "expires_at": None}
     return LocalAuth(database, settings.local_pairing_secret).authenticate(request.cookies.get(COOKIE))
 
 
 @app.post("/api/auth/logout")
 def logout_local(request: Request, response: Response) -> dict:
+    if settings.environment == "development":
+        return {"status": "disabled_in_development"}
     LocalAuth(database, settings.local_pairing_secret).logout(request.cookies.get(COOKIE))
     response.delete_cookie(COOKIE, path="/api")
     return {"status": "logged_out"}
@@ -419,6 +437,10 @@ def get_conversation(conversation_id: str) -> dict:
 async def send_message(conversation_id: str, request: SendMessageRequest) -> dict:
     try:
         conversations.get(conversation_id)
+        if (settings.model_conversation_turn_limit is not None
+                and sum(item["role"] == "user" for item in messages.list_for_conversation(conversation_id))
+                >= settings.model_conversation_turn_limit):
+            raise HTTPException(status_code=429, detail="当前会话已达到开发环境聊天轮次上限；请新建会话。")
         return await chat.send(conversation_id, request.content.strip())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc

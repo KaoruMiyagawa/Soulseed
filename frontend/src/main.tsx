@@ -141,7 +141,6 @@ function App({ characterId }: { characterId: string }) {
   return <main className="shell">
     <aside>
       <div className="brand">SOULSEED <span>V1.0-A</span></div>
-      <button onClick={() => request("/auth/logout", { method: "POST" }).then(() => window.dispatchEvent(new Event("soulseed-session-expired"))).catch((e: Error) => setError(e.message))}>退出本地会话</button>
       <button onClick={() => newConversation().catch((e: Error) => setError(e.message))}>＋ 新会话</button>
       <nav>{conversations.map((item) => <button className={item.id === active?.id ? "selected" : ""} key={item.id} onClick={() => request<Conversation>(`/conversations/${item.id}`).then(setActive).catch((e: Error) => setError(e.message))}>{item.title}</button>)}</nav>
     </aside>
@@ -203,4 +202,7 @@ function LocalSession() {
   </main>;
 }
 
-createRoot(document.getElementById("root")!).render(<StrictMode><LocalSession /></StrictMode>);
+const development = import.meta.env.VITE_SOULSEED_DEVELOPMENT_MODE === "true";
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>{development ? <App characterId="big_fish" /> : <LocalSession />}</StrictMode>,
+);
