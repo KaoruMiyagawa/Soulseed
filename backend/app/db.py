@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS memory_correction_clarifications (
     processing_token TEXT,
     lease_expires_at TEXT,
     error_code TEXT,
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (
@@ -388,6 +389,80 @@ WHERE status = 'pending' AND offered_at IS NOT NULL AND delivery_channel IS NULL
 CREATE INDEX idx_life_share_channel ON life_share_intents(character_id, status, delivery_channel, created_at);
 """
 
+MIGRATIONS[15] = """
+CREATE TABLE exploration_runs (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL,
+    requested_topic TEXT,
+    selected_topic TEXT,
+    topic_origin TEXT NOT NULL CHECK (topic_origin IN ('user', 'character')),
+    status TEXT NOT NULL CHECK (status IN ('planned', 'active', 'completed', 'interrupted', 'failed', 'cancelled')),
+    step_count INTEGER NOT NULL DEFAULT 0 CHECK (step_count >= 0),
+    tool_call_count INTEGER NOT NULL DEFAULT 0 CHECK (tool_call_count >= 0),
+    model_call_count INTEGER NOT NULL DEFAULT 0 CHECK (model_call_count >= 0),
+    input_char_count INTEGER NOT NULL DEFAULT 0 CHECK (input_char_count >= 0),
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    summary TEXT,
+    claims_json TEXT,
+    unanswered_json TEXT,
+    error_code TEXT,
+    life_event_id TEXT REFERENCES life_events(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(character_id, idempotency_key),
+    UNIQUE(id, character_id)
+);
+CREATE INDEX idx_exploration_runs_character_created
+    ON exploration_runs(character_id, created_at DESC, id);
+CREATE INDEX idx_exploration_runs_recovery
+    ON exploration_runs(status, started_at);
+CREATE TABLE exploration_evidence (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    character_id TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL CHECK (sequence_no > 0),
+    tool_name TEXT NOT NULL CHECK (tool_name IN ('search_web', 'read_webpage')),
+    query_text TEXT,
+    source_url TEXT,
+    title TEXT,
+    retrieved_at TEXT,
+    excerpt TEXT,
+    content_sha256 TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'empty', 'failed')),
+    error_code TEXT,
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id, character_id) REFERENCES exploration_runs(id, character_id) ON DELETE CASCADE,
+    UNIQUE(run_id, sequence_no),
+    UNIQUE(id, character_id)
+);
+CREATE INDEX idx_exploration_evidence_run ON exploration_evidence(run_id, sequence_no);
+CREATE TRIGGER exploration_runs_owner_insert BEFORE INSERT ON exploration_runs
+WHEN current_character() IS NULL OR NEW.character_id IS NOT current_character()
+BEGIN SELECT RAISE(ABORT, 'cross-character exploration run'); END;
+CREATE TRIGGER exploration_runs_owner_update BEFORE UPDATE ON exploration_runs
+WHEN NEW.character_id IS NOT OLD.character_id OR NEW.id IS NOT OLD.id
+  OR current_character() IS NULL OR NEW.character_id IS NOT current_character()
+BEGIN SELECT RAISE(ABORT, 'exploration ownership is immutable'); END;
+CREATE TRIGGER exploration_evidence_owner_insert BEFORE INSERT ON exploration_evidence
+WHEN current_character() IS NULL OR NEW.character_id IS NOT current_character()
+  OR NEW.character_id IS NOT (SELECT character_id FROM exploration_runs WHERE id=NEW.run_id)
+BEGIN SELECT RAISE(ABORT, 'cross-character exploration evidence'); END;
+CREATE TRIGGER exploration_evidence_owner_update BEFORE UPDATE ON exploration_evidence
+WHEN NEW.character_id IS NOT OLD.character_id OR NEW.run_id IS NOT OLD.run_id
+  OR current_character() IS NULL OR NEW.character_id IS NOT current_character()
+BEGIN SELECT RAISE(ABORT, 'exploration evidence ownership is immutable'); END;
+"""
+
+MIGRATIONS[16] = """
+ALTER TABLE exploration_evidence ADD COLUMN provider TEXT
+    CHECK (provider IS NULL OR provider IN ('duckduckgo', 'wikimedia_zh', 'wikimedia_en', 'controlled', 'unknown'));
+ALTER TABLE exploration_evidence ADD COLUMN relevance TEXT
+    CHECK (relevance IS NULL OR relevance IN ('relevant', 'irrelevant'));
+"""
 
 
 class Database:

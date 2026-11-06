@@ -45,7 +45,17 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 16
+
+
+def test_health_exposes_non_secret_runtime_build_and_startup_ids():
+    from app.main import health
+
+    response = health()
+    assert response["status"] == "ok"
+    assert response["environment"] == "testing"
+    assert response["build_id"].startswith("dev-") and len(response["build_id"]) == 20
+    assert len(response["startup_id"]) == 16
 
 
 @pytest.mark.asyncio

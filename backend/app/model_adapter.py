@@ -1,7 +1,7 @@
 from collections.abc import Callable
 import asyncio
 from time import perf_counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import json
 import os
@@ -76,6 +76,18 @@ class ModelAdapter(Protocol):
     async def reply(self, messages: list[dict[str, str]]) -> str: ...
 
 
+@dataclass(frozen=True)
+class ActionModelReply:
+    """Per-request final output and safe metadata; never exposes reasoning text."""
+
+    content: str | None
+    request_id: str | None = None
+    finish_reason: str | None = None
+    http_status: int | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    has_tool_calls: bool = False
+
+
 class OpenAICompatibleAdapter:
     def __init__(self, settings: Settings, client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient):
         self.settings = settings
@@ -84,6 +96,28 @@ class OpenAICompatibleAdapter:
     async def reply(self, messages: list[dict[str, str]]) -> str:
         content = await self._request_content(messages)
         return content
+
+    async def reply_action(self, messages: list[dict[str, str]], *, run_id: str, step: int) -> ActionModelReply:
+        """JSON content protocol, separate from chat clarification and native tools."""
+        return await self._request_completion(
+            messages, structured=True,
+            request_context={"exploration_run_id": run_id, "exploration_step": step},
+        )
+
+    def record_action_validation(self, reply: ActionModelReply, *, run_id: str,
+                                 step: int, reason: str | None, shape: dict) -> None:
+        # The caller supplies only a schema summary: no user/model text or unknown keys.
+        try:
+            self._append_log({
+                "event": "action_validation", "at": datetime.now(UTC).isoformat(),
+                "id": reply.request_id, "exploration_run_id": run_id,
+                "exploration_step": step, "reason": reason, "shape": shape,
+                "http_status": reply.http_status, "finish_reason": reply.finish_reason,
+                "usage": reply.usage, "tool_calls_present": reply.has_tool_calls,
+            })
+        except OSError:
+            # Validation errors are also persisted as bounded task error codes.
+            pass
 
     async def reply_structured(self, messages: list[dict[str, str]]) -> StructuredChatReply:
         content = await self._request_content(messages, structured=True)
@@ -152,6 +186,15 @@ class OpenAICompatibleAdapter:
         )
 
     async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False) -> str:
+        reply = await self._request_completion(messages, structured=structured)
+        if structured and reply.finish_reason in {"length", "max_tokens"}:
+            raise StructuredOutputError("模型结构化输出达到生成长度上限", code="json_truncated")
+        if not isinstance(reply.content, str) or not reply.content.strip():
+            raise RuntimeError("模型服务返回了空回复。")
+        return reply.content.strip()
+
+    async def _request_completion(self, messages: list[dict[str, str]], *, structured: bool = False,
+                                  request_context: dict | None = None) -> ActionModelReply:
         if not self.settings.model_enabled:
             raise ModelConfigurationError("真实模型调用已在当前环境关闭。")
         if not self.settings.model_api_key:
@@ -166,6 +209,7 @@ class OpenAICompatibleAdapter:
                    "max_output_tokens": self.settings.model_max_output_tokens,
                    "timeout_seconds": self.settings.model_timeout_seconds,
                    "trust_env": self.settings.model_trust_env}
+        metrics.update(request_context or {})
         request_id = self._reserve_request(metrics)
         started = perf_counter()
         async def headers_received(_response):
@@ -221,15 +265,31 @@ class OpenAICompatibleAdapter:
             raise ModelRequestError(f"硅基流动模型请求失败（HTTP {status}）。", status_code=502)
         try:
             # SiliconFlow may also return reasoning_content; only final content is user-visible.
-            choice = response.json()["choices"][0]
-            if structured and choice.get("finish_reason") in {"length", "max_tokens"}:
-                raise StructuredOutputError("模型结构化输出达到生成长度上限", code="json_truncated")
-            content = choice["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
+            payload = response.json()
+            choice = payload["choices"][0]
+            message = choice["message"]
+            content = message.get("content")
+            usage = self._safe_usage(payload.get("usage"))
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise RuntimeError("模型服务返回了无法识别的响应。") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("模型服务返回了空回复。")
-        return content.strip()
+        finish = choice.get("finish_reason")
+        return ActionModelReply(
+            content=content if isinstance(content, str) else None,
+            request_id=request_id, http_status=response.status_code, usage=usage,
+            finish_reason=finish if finish is None or isinstance(finish, str) and finish in {"stop", "length", "max_tokens", "tool_calls", "content_filter"} else "unknown",
+            has_tool_calls=bool(message.get("tool_calls") or message.get("function_call")),
+        )
+
+    @staticmethod
+    def _safe_usage(raw) -> dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        usage = {key: raw[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                 if type(raw.get(key)) is int and raw[key] >= 0}
+        details = raw.get("completion_tokens_details")
+        if isinstance(details, dict) and type(details.get("reasoning_tokens")) is int and details["reasoning_tokens"] >= 0:
+            usage["reasoning_tokens"] = details["reasoning_tokens"]
+        return usage
 
     @staticmethod
     def _is_context_limit_response(response: httpx.Response) -> bool:
@@ -302,14 +362,10 @@ class OpenAICompatibleAdapter:
         if response is not None:
             try:
                 payload = response.json()
-                raw = payload.get("usage", {})
-                usage = {key: raw.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                         if isinstance(raw.get(key), int)}
-                details = raw.get("completion_tokens_details") or {}
-                if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
-                    usage["reasoning_tokens"] = details["reasoning_tokens"]
+                usage = self._safe_usage(payload.get("usage"))
                 choice = payload.get("choices", [{}])[0]
                 message = choice.get("message", {})
+                output_sizes["tool_calls_present"] = bool(message.get("tool_calls") or message.get("function_call"))
                 for field in ("content", "reasoning_content"):
                     if isinstance(message.get(field), str):
                         output_sizes[field + "_chars"] = len(message[field])

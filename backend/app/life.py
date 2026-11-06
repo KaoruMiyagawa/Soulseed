@@ -258,6 +258,33 @@ class LifeRepository:
         zone = ZoneInfo(state["timezone_id"])
         local_date = (now or datetime.now(UTC)).astimezone(zone).date().isoformat()
         recent = self.list_events(character_id, limit=40) if relevant else []
+        if relevant:
+            with self.database.connection() as db:
+                for event in recent:
+                    if event.get("event_type") != "research" or event.get("effective_status") != "completed":
+                        continue
+                    run = db.execute(
+                        "SELECT summary,claims_json,unanswered_json FROM exploration_runs WHERE life_event_id=? AND character_id=? AND status='completed'",
+                        (event["id"], character_id),
+                    ).fetchone()
+                    if not run:
+                        continue
+                    import json
+                    sources = db.execute(
+                        "SELECT id,source_url,title,retrieved_at,excerpt FROM exploration_evidence "
+                        "WHERE run_id=(SELECT id FROM exploration_runs WHERE life_event_id=? AND character_id=?) "
+                        "AND tool_name='read_webpage' AND outcome='success' ORDER BY sequence_no LIMIT 4",
+                        (event["id"], character_id),
+                    ).fetchall()
+                    event["research_result"] = {
+                        "summary": run["summary"],
+                        "claims": json.loads(run["claims_json"] or "[]"),
+                        "unanswered": json.loads(run["unanswered_json"] or "[]"),
+                        "sources": [{"evidence_id": source["id"], "url": source["source_url"],
+                                     "title": source["title"], "retrieved_at": source["retrieved_at"],
+                                     "excerpt": source["excerpt"][:500] if source["excerpt"] else None}
+                                    for source in sources],
+                    }
         today_only = "今天" in query or "今日" in query
         if today_only:
             today = datetime.fromisoformat(local_date).date()
@@ -289,3 +316,21 @@ class LifeRepository:
             "today_only": today_only,
             "life_scope": life_scope,
         }
+
+    def exploration_candidates(self, character_id: str = "big_fish", limit: int = 8) -> list[str]:
+        """Only interests reinforced by completed character experiences count as candidates."""
+        with self.database.connection() as db:
+            rows = db.execute(
+                "SELECT DISTINCT p.event_type FROM life_preferences p "
+                "JOIN life_preference_changes c ON c.character_id=p.character_id AND c.event_type=p.event_type "
+                "WHERE p.character_id=? AND c.reason IN ('completed_feeling','explicit_preference') "
+                "ORDER BY p.event_type LIMIT ?", (character_id, max(1, min(limit, 12))),
+            ).fetchall()
+            candidates = [str(row["event_type"]) for row in rows]
+            goals = db.execute(
+                "SELECT content FROM life_events WHERE character_id=? AND event_type='goal' "
+                "AND status IN ('completed','planned') ORDER BY created_at DESC LIMIT ?",
+                (character_id, max(1, min(limit, 8))),
+            ).fetchall()
+            candidates.extend("目标：" + " ".join(str(row["content"]).split())[:160] for row in goals)
+            return list(dict.fromkeys(candidates))[:limit]

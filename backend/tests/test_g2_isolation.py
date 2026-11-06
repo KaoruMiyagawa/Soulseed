@@ -176,10 +176,10 @@ def test_production_migration_requires_exact_backup_and_confirmation(tmp_path, m
 
     Database(
         str(database_path), environment="production",
-        migration_backup_path=str(backup_path), migration_confirmation="13->14",
+            migration_backup_path=str(backup_path), migration_confirmation="13->16",
     ).initialize()
     with Database(str(database_path), environment="testing", test_data_root=str(tmp_path)).connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
 
 
 def test_test_launcher_fails_on_port_conflict_then_restarts_isolated(tmp_path):
@@ -229,7 +229,7 @@ def test_development_uses_its_independent_database_normally(tmp_path, monkeypatc
     )
     database.initialize()
     with database.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
 
 
 def test_development_rejects_protected_database_before_sqlite_connect(tmp_path, monkeypatch):
@@ -285,4 +285,4 @@ def test_authorized_protected_database_access_is_available_without_migration(tmp
     )
     approved.initialize()
     with approved.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16

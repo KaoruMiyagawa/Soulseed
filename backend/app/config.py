@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     model_daily_request_limit: int | None = Field(default=None, ge=1, le=1000)
     model_conversation_turn_limit: int | None = Field(default=None, ge=1, le=1000)
     model_request_log_path: str | None = None
+    exploration_enabled: bool = True
+    exploration_max_steps: int = Field(default=4, ge=1, le=4)
+    exploration_max_tool_calls: int = Field(default=4, ge=1, le=8)
+    exploration_timeout_seconds: float = Field(default=90, gt=1, le=180)
+    exploration_max_input_chars: int = Field(default=24_000, ge=2_000, le=64_000)
+    exploration_max_total_input_chars: int = Field(default=48_000, ge=4_000, le=128_000)
+    exploration_daily_model_request_limit: int = Field(default=8, ge=1, le=100)
+    exploration_model_request_log_path: str | None = None
     chat_timing_log_path: str | None = None
     model_context_input_token_budget: int = Field(default=16_000, ge=512, le=200_000)
     model_context_persona_token_budget: int = Field(default=3_500, ge=128, le=50_000)

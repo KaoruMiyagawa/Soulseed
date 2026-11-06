@@ -49,6 +49,7 @@ def _child_environment(*, model_enabled: bool = True) -> dict[str, str]:
         "SOULSEED_MODEL_DAILY_REQUEST_LIMIT": "20",
         "SOULSEED_MODEL_CONVERSATION_TURN_LIMIT": "100",
         "SOULSEED_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "model-requests.jsonl"),
+        "SOULSEED_EXPLORATION_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "exploration-model-requests.jsonl"),
         "SOULSEED_CHAT_TIMING_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "chat-timings.jsonl"),
         "SOULSEED_CONTACT_MODEL_GENERATION_ENABLED": "false",
         "VITE_API_URL": f"http://127.0.0.1:{BACKEND_PORT}/api",
@@ -62,7 +63,7 @@ def _frontend_environment(backend_env: dict[str, str]) -> dict[str, str]:
             if not key.upper().startswith("SOULSEED_")}
 
 
-def _preflight(env: dict[str, str], python: Path) -> None:
+def _preflight(env: dict[str, str], python: Path) -> str:
     if not python.is_file():
         raise RuntimeError("未找到项目 .venv Python；请先使用现有项目环境。")
     if not (FRONTEND / "node_modules" / "vite" / "bin" / "vite.js").is_file():
@@ -76,11 +77,14 @@ def _preflight(env: dict[str, str], python: Path) -> None:
         "assert Path(s.database_path).resolve()==DEVELOPMENT_DATABASE_PATH.resolve(); "
         "assert s.model_api_key and s.model_base_url and s.model_name; "
         "assert s.local_pairing_secret is None; "
-        "assert s.development_frontend_origin=='http://127.0.0.1:5174'"
+        "assert s.development_frontend_origin=='http://127.0.0.1:5174'; "
+        "from app.build_info import BUILD_ID; print(BUILD_ID)"
     )
-    subprocess.run([str(python), "-c", code], cwd=BACKEND, env=env, check=True, capture_output=True)
+    check = subprocess.run([str(python), "-c", code], cwd=BACKEND, env=env,
+                           check=True, capture_output=True, text=True)
     _ensure_free(FRONTEND_PORT)
     _ensure_free(BACKEND_PORT)
+    return check.stdout.strip().splitlines()[-1]
 
 
 def _stop(children: list[subprocess.Popen]) -> None:
@@ -102,15 +106,17 @@ def main() -> int:
     args = parser.parse_args()
     python = ROOT / ".venv" / "Scripts" / "python.exe"
     env = _child_environment(model_enabled=not args.model_off)
-    _preflight(env, python)
+    build_id = _preflight(env, python)
     frontend_env = _frontend_environment(env)
     node = shutil.which("node")
     if not node:
         raise RuntimeError("未找到 Node.js；未启动开发服务。")
     print("Soulseed environment=development database=<backend/data>/soulseed-development.db", flush=True)
     print(f"前端 http://127.0.0.1:{FRONTEND_PORT}  后端 http://127.0.0.1:{BACKEND_PORT}", flush=True)
+    print(f"开发代码标识 build_id={build_id}；启动后可与 /api/health 的 build_id 对照。", flush=True)
     model_state = "已关闭" if args.model_off else "已启用"
     print(f"模型{model_state}；每次最多 1024 输出 Token，每 UTC 日最多 20 次请求；调用记录位于本机 LOCALAPPDATA/Soulseed/development。", flush=True)
+    print("自主探索仅由用户手动触发；每任务最多 4 次决策请求、每 UTC 日最多 8 次探索请求、每次最多 512 输出 Token，调用记录单独保存。", flush=True)
     children: list[subprocess.Popen] = []
     try:
         children.append(subprocess.Popen(

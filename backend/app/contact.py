@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from .life import LifeRepository, _iso
@@ -88,10 +88,15 @@ class AdapterContactGenerator:
 
 
 class ContactService:
-    def __init__(self, repository: LifeRepository, *, generator: ContactGenerator | None = None, enabled: bool = True):
+    def __init__(self, repository: LifeRepository, *, generator: ContactGenerator | None = None,
+                 enabled: bool = True, clock: Callable[[], datetime] | None = None):
         self.repository = repository
         self.generator = generator or SafeContactGenerator()
         self.enabled = enabled
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    def _current(self, now: datetime | None = None) -> datetime:
+        return now if now is not None else self.clock()
 
     def preferences(self, character_id: str = "big_fish", *, now: datetime | None = None) -> dict:
         self.repository.ensure_state(character_id, now=now)
@@ -101,7 +106,7 @@ class ContactService:
 
     def expression_boundaries(self, character_id: str = "big_fish", *, now: datetime | None = None) -> tuple[str, ...]:
         prefs = self.preferences(character_id, now=now)
-        current = now or datetime.now(UTC)
+        current = self._current(now)
         result = []
         if not prefs["allowed"]:
             result.append("用户已关闭主动联系；普通聊天仍可正常回应")
@@ -113,7 +118,7 @@ class ContactService:
 
     def delivery_context(self, character_id: str = "big_fish", *, now: datetime | None = None) -> dict:
         """Server-verified facts for answering capability questions, not a send decision."""
-        current = now or datetime.now(UTC)
+        current = self._current(now)
         allowed_now = bool(self.enabled and self._allowed_now(character_id, current))
         previously_delivered = bool(self.list_messages(character_id, limit=1))
         return {

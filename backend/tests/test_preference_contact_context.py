@@ -14,6 +14,8 @@ from app.ownership import character_scope
 from app.persona import resolve_system_prompt
 from app.repositories import ConversationRepository, MessageRepository
 
+CONTACT_TEST_TIME = datetime(2026, 11, 6, 4, 0, tzinfo=UTC)  # 12:00 in Asia/Shanghai.
+
 
 class CapturingModel:
     def __init__(self):
@@ -38,7 +40,7 @@ def _chat(tmp_path, *, contact_enabled=True, break_life_snapshot=False):
     chat = ChatService(
         conversations, messages, model, resolve_system_prompt(None),
         life_repository=repository,
-        contact_service=ContactService(repository, enabled=contact_enabled),
+        contact_service=ContactService(repository, enabled=contact_enabled, clock=lambda: CONTACT_TEST_TIME),
         runtime_features={"contact_background_enabled": True, "contact_model_generation_enabled": False},
     )
     return repository, conversation["id"], model, chat
@@ -106,6 +108,19 @@ def test_common_proactive_message_wording_gets_enabled_runtime_facts(tmp_path, m
     assert capability["previous_message_delivered"] is False
     assert capability["external_push"] is False
     assert "enabled 或 policy_allows_now 不代表消息已经送达" in rendered
+
+
+@pytest.mark.parametrize(("instant", "expected"), [
+    (datetime(2026, 11, 6, 3, 59, tzinfo=UTC), True),   # 11:59 Asia/Shanghai
+    (datetime(2026, 11, 6, 14, 0, tzinfo=UTC), False),  # 22:00, quiet period begins
+    (datetime(2026, 11, 6, 23, 59, tzinfo=UTC), False), # 07:59, quiet period continues
+    (datetime(2026, 11, 7, 0, 0, tzinfo=UTC), True),    # 08:00, quiet period ends
+])
+def test_contact_context_uses_injected_clock_around_quiet_period(tmp_path, instant, expected):
+    repository, _, _, _ = _chat(tmp_path)
+    service = ContactService(repository, clock=lambda: instant)
+    context = service.delivery_context()
+    assert context["policy_allows_now"] is expected
 
 
 @pytest.mark.parametrize("question", ["你会主动联系我吗", "你会主动给我发信息吗"])

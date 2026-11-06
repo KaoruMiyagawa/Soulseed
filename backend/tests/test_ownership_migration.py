@@ -56,7 +56,7 @@ def test_upgrade_v11_preserves_graph_and_quarantines_ambiguous_rows(tmp_path,mon
         before={t:c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0] for t in ('conversations','messages','memory_items','memory_sources','memory_change_proposals','memory_correction_clarifications','life_events','contact_intents','proactive_messages')}
     db.initialize();db.initialize()
     with db.connection() as c:
-        assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==14
+        assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==16
         assert all(c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0]==count for t,count in before.items())
         assert dict(c.execute('SELECT id,character_id FROM conversations').fetchall())=={'known':'big_fish','unknown':None,'mixed':None}
         assert dict(c.execute('SELECT id,character_id FROM memory_items').fetchall())=={'known-memory':'big_fish','unknown-memory':None,'mixed-memory':None,'orphan-memory':None}
@@ -82,7 +82,7 @@ def test_migration12_failure_rolls_back_entire_schema_and_marker(tmp_path,monkey
         assert 'character_id' not in {r[1] for r in c.execute('PRAGMA table_info(conversations)')}
         assert c.execute("SELECT source_proposal_id FROM memory_correction_clarifications WHERE id='clarification'").fetchone()[0]=='proposal'
     db.initialize()
-    with db.connection() as c: assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==14
+    with db.connection() as c: assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==16
 
 
 def test_old_proactive_delivery_alone_does_not_prove_ownership(tmp_path,monkeypatch):

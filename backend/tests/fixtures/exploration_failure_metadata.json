@@ -1,0 +1,14 @@
+{
+  "provenance": "Observed Development failure metadata only. Original response content and exact validation branch were not retained; test response bodies are synthetic.",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "http_status": 200,
+  "finish_reason": "stop",
+  "usage": {"prompt_tokens": 360, "completion_tokens": 101, "total_tokens": 461, "completion_tokens_details": {"reasoning_tokens": 64}},
+  "content_chars": 110,
+  "reasoning_content_chars": 302,
+  "max_output_tokens": 512,
+  "structured": false,
+  "step_count": 1,
+  "model_call_count": 1,
+  "tool_call_count": 0
+}

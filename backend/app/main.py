@@ -25,9 +25,12 @@ from .life import LifeRepository
 from .life_engine import LifeEngine
 from .life_scheduler import LifeScheduler
 from .life_instance import LifeInstance
+from .exploration_agent import ExplorationAgent
+from .exploration_repository import ExplorationRepository
 from .life_share import LifeShareService
 from .contact import AdapterContactGenerator, ContactService
 from .contact_scheduler import ContactScheduler
+from .build_info import BUILD_ID, STARTUP_ID
 from .local_auth import LocalAuth, COOKIE, ALLOWED_ORIGINS
 from .ownership import character_scope
 
@@ -93,6 +96,11 @@ class PairRequest(BaseModel):
     character_id: str = Field(default="big_fish", min_length=1, max_length=120)
 
 
+class StartExplorationRequest(BaseModel):
+    topic: str | None = Field(default=None, min_length=3, max_length=240)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
 settings = get_settings()
 allowed_origins = set(ALLOWED_ORIGINS)
 if settings.environment == "testing" and settings.test_frontend_origin:
@@ -107,6 +115,7 @@ database_path_label = (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("soulseed.startup")
 logger.info("Soulseed environment=%s database=%s", settings.environment, database_path_label)
+logger.info("Soulseed runtime build_id=%s startup_id=%s", BUILD_ID, STARTUP_ID)
 database = Database(
     settings.database_path,
     environment=settings.environment,
@@ -120,6 +129,10 @@ conversations = ConversationRepository(database)
 messages = MessageRepository(database)
 memory_service = MemoryService(MemoryRepository(database))
 life_repository = LifeRepository(database, default_timezone=settings.life_timezone)
+exploration_repository = ExplorationRepository(database, life_repository)
+exploration_agent = ExplorationAgent(exploration_repository, life_repository, settings)
+active_exploration_tasks: dict[str, asyncio.Task] = {}
+active_exploration_characters: dict[str, str] = {}
 model_adapter = OpenAICompatibleAdapter(settings)
 contact_generator = (
     AdapterContactGenerator(model_adapter, resolve_system_prompt(settings.system_prompt), life_repository)
@@ -172,8 +185,16 @@ chat = ChatService(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global exploration_repository, exploration_agent
+    exploration_repository = ExplorationRepository(database, life_repository)
+    exploration_agent = ExplorationAgent(exploration_repository, life_repository, settings)
     runtime = LifeInstance(database, life_repository)
     runtime.acquire()
+    with database.connection() as db:
+        exploration_characters = [row[0] for row in db.execute("SELECT id FROM characters WHERE ownership_status='owned'")]
+    for character_id in exploration_characters:
+        with character_scope(character_id):
+            exploration_repository.recover_active(character_id)
     stop = asyncio.Event()
     tasks = []
     try:
@@ -204,6 +225,14 @@ async def lifespan(_: FastAPI):
     finally:
         stop.set()
         try:
+            for run_id, task in list(active_exploration_tasks.items()):
+                character_id = active_exploration_characters.get(run_id, "big_fish")
+                exploration_agent.stop(run_id, status="interrupted")
+                with character_scope(character_id):
+                    exploration_repository.terminate(run_id, character_id, "interrupted", error_code="service_stopped")
+                task.cancel()
+            if active_exploration_tasks:
+                await asyncio.gather(*active_exploration_tasks.values(), return_exceptions=True)
             for task in tasks:
                 await task
         finally:
@@ -319,7 +348,64 @@ app.include_router(create_proposal_router(get_proposal_service, get_memory_corre
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "build_id": BUILD_ID,
+        "startup_id": STARTUP_ID,
+    }
+
+
+def _launch_exploration(run_id: str, character_id: str) -> None:
+    task = active_exploration_tasks.get(run_id)
+    if task and not task.done():
+        return
+    task = asyncio.create_task(exploration_agent.run(run_id, character_id), name=f"exploration-{run_id}")
+    active_exploration_tasks[run_id] = task
+    active_exploration_characters[run_id] = character_id
+    def clear(done, key=run_id):
+        active_exploration_tasks.pop(key, None)
+        active_exploration_characters.pop(key, None)
+    task.add_done_callback(clear)
+
+
+@app.post("/api/characters/{character_id}/explorations", status_code=202)
+async def start_exploration(character_id: str, request: StartExplorationRequest) -> dict:
+    topic = " ".join(request.topic.split()) if request.topic else None
+    run, created = exploration_repository.create(character_id=character_id,
+                                                 idempotency_key=request.idempotency_key,
+                                                 requested_topic=topic)
+    if run["status"] == "planned":
+        _launch_exploration(run["id"], character_id)
+    return {**run, "created": created}
+
+
+@app.get("/api/characters/{character_id}/explorations")
+def list_explorations(character_id: str, limit: int = 20) -> list[dict]:
+    return exploration_repository.list(character_id, limit)
+
+
+@app.get("/api/characters/{character_id}/explorations/{run_id}")
+def get_exploration(character_id: str, run_id: str) -> dict:
+    try:
+        return exploration_repository.get(run_id, character_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="探索记录不存在") from exc
+
+
+@app.post("/api/characters/{character_id}/explorations/{run_id}/cancel")
+async def cancel_exploration(character_id: str, run_id: str) -> dict:
+    try:
+        run = exploration_repository.get(run_id, character_id)
+        if run["status"] in {"planned", "active"}:
+            exploration_repository.terminate(run_id, character_id, "cancelled", error_code="cancelled_by_user")
+            task = active_exploration_tasks.get(run_id)
+            if task and not task.done():
+                exploration_agent.stop(run_id, status="cancelled")
+                task.cancel()
+        return exploration_repository.get(run_id, character_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="探索记录不存在") from exc
 
 
 def current_contact_service() -> ContactService:

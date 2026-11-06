@@ -24,6 +24,7 @@ class ExpressionEvidence:
     recorded_via: str | None = None
     generation_method: str | None = None
     confidence: float | None = None
+    research_result: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class ExpressionContext:
             "planned/interrupted/wish/imagined 不得说成已完成，interrupted 也不是正在进行。"
             "问‘今天’时只计角色当地日期的 completed 事件。life_scope 计数不代表完整历史。"
             "活动名称没有记录书名、曲名、实际播放内容或探索结果时，不得补出这些细节。"
+            "research_result 只适用于带有实际成功读取来源的 completed 探索；回答探索发现时优先引用其中结论和来源，"
             "明确区分 sourced 与 inference，并保留 unanswered 中尚未查明的问题。"
         ) if has_life else ""
         capability_rules = (
@@ -185,6 +187,7 @@ class ExpressionContextBuilder:
             content=self._text(str(event.get("content") or "")), trust="persisted_character_event",
             occurred_at=event.get("occurred_at") or event.get("started_at"),
             recorded_via=event.get("source"), generation_method=event.get("generation_method"),
+            research_result=event.get("research_result"),
         )
 
     def _text(self, value: str, limit: int | None = None) -> str:
