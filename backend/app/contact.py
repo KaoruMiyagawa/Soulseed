@@ -111,6 +111,22 @@ class ContactService:
             result.append("用户暂时不希望被主动联系")
         return tuple(result)
 
+    def delivery_context(self, character_id: str = "big_fish", *, now: datetime | None = None) -> dict:
+        """Server-verified facts for answering capability questions, not a send decision."""
+        current = now or datetime.now(UTC)
+        allowed_now = bool(self.enabled and self._allowed_now(character_id, current))
+        previously_delivered = bool(self.list_messages(character_id, limit=1))
+        return {
+            "supported": True,
+            "enabled": self.enabled,
+            "policy_allows_now": allowed_now,
+            "ready_in_app_messages": len(self.inbox(character_id, now=current)) if allowed_now else 0,
+            "previous_message_delivered": previously_delivered,
+            "channel": "in_app_only",
+            "browser_display_and_confirmation_required": True,
+            "external_push": False,
+        }
+
     def set_preferences(self, character_id: str = "big_fish", *, allowed=UNSET,
                         busy_until=UNSET, pause_until=UNSET, quiet_start_minute=UNSET,
                         quiet_end_minute=UNSET, now: datetime | None = None) -> dict:

@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from app.chat_service import ChatService
+from app.context_window import ContextWindowLimits, ModelContextWindow
 from app.db import Database
 from app.memory import (
     ClarificationApplicationService,
@@ -675,6 +676,72 @@ async def test_service_restart_recovers_waiting_clarification(ctx):
     )
     await restarted.send(ctx[5]["id"], "我已经换成 Linux 了。")
     # This lightweight service has no safe Proposal application dependencies, so it defers.
+    assert persisted_clarification(ctx).status is ClarificationStatus.DEFERRED
+
+
+@pytest.mark.asyncio
+async def test_pending_clarification_survives_long_history_trimming(ctx):
+    database, conversations, messages, memories, repository, conversation, old_memory = ctx
+    model = StructuredFake(
+        {"content": "你要不要讲讲这个变化？", "action": ClarificationAction.ASK},
+        {
+            "content": "好，我听明白了。",
+            "action": ClarificationAction.NORMAL,
+            "resolution": ClarificationResolution.EXPLICIT_CHANGE,
+            "evidence_excerpt": "我已经永久改用 Linux 作为主要开发环境",
+        },
+    )
+    context_window = ModelContextWindow(ContextWindowLimits(
+        max_input_tokens=10_000,
+        max_persona_tokens=500,
+        max_expression_tokens=500,
+        max_clarification_tokens=5_000,
+        max_system_control_tokens=5_000,
+        max_current_message_tokens=500,
+        max_history_tokens=30,
+    ))
+    chat = ChatService(
+        conversations,
+        messages,
+        model,
+        "人格提示词",
+        memories,
+        DeterministicMemoryExtractor(),
+        correction_flow=ContextFlow(make_context(old_memory)),
+        clarification_repository=repository,
+        context_window=context_window,
+    )
+    await chat.send(conversation["id"], "我已经换成 Linux 作为主要开发环境。")
+    record = persisted_clarification(ctx)
+    assert record.status is ClarificationStatus.AWAITING_USER
+
+    for index in range(40):
+        messages.add(conversation["id"], "user", f"old-user-{index:02d}")
+        messages.add(conversation["id"], "assistant", f"old-assistant-{index:02d}")
+    before = len(messages.list_for_conversation(conversation["id"]))
+    chat.context_window = ModelContextWindow(ContextWindowLimits(
+        max_input_tokens=10_000,
+        max_persona_tokens=500,
+        max_expression_tokens=500,
+        max_clarification_tokens=5_000,
+        max_system_control_tokens=5_000,
+        max_current_message_tokens=64,
+        max_history_tokens=30,
+    ))
+    with pytest.raises(ValueError, match="当前消息"):
+        await chat.send(conversation["id"], "超长" * 100)
+    assert persisted_clarification(ctx).status is ClarificationStatus.AWAITING_USER
+    chat.context_window = context_window
+    await chat.send(conversation["id"], "我已经永久改用 Linux 作为主要开发环境")
+
+    sent = model.structured_messages[-1]
+    encoded = "\n".join(item["content"] for item in sent)
+    assert "<memory_clarification_context>" in encoded
+    assert "旧记忆" not in encoded  # Only the stored content, not invented labels, is provided.
+    assert "我已经永久改用 Linux 作为主要开发环境" in encoded
+    assert "old-user-00" not in encoded
+    assert "old-user-39" in encoded  # The rejected oversized input was never inserted as a history turn.
+    assert len(messages.list_for_conversation(conversation["id"])) == before + 2
     assert persisted_clarification(ctx).status is ClarificationStatus.DEFERRED
 
 

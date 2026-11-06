@@ -2,6 +2,7 @@ import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import { confirmDeliveryAndSync } from "./proactiveDelivery";
+import { ApiError, createApiRequest } from "./apiRequest";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; content: string };
 type Conversation = { id: string; title: string; messages?: Message[] };
@@ -9,12 +10,7 @@ type ProactiveMessage = { id: string; content: string; status: "ready" | "delive
 type DeliveryRetry = { message: ProactiveMessage; conversationId: string };
 const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8001/api";
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { credentials: "include", headers: { "Content-Type": "application/json" }, ...options });
-  if (response.status === 401) window.dispatchEvent(new Event("soulseed-session-expired"));
-  if (!response.ok) throw new Error((await response.json()).detail ?? `请求失败（${response.status}）`);
-  return response.json();
-}
+const request = createApiRequest(API, () => window.dispatchEvent(new Event("soulseed-session-expired")));
 
 function ProactivePreview({ message, hasConversation, onVisible }: {
   message: ProactiveMessage; hasConversation: boolean; onVisible: (id: string) => void;
@@ -46,6 +42,7 @@ function App({ characterId }: { characterId: string }) {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [syncAfterFailure, setSyncAfterFailure] = useState<string | null>(null);
   const onVisible = useCallback((id: string) => setVisibleInbox((ids) => new Set(ids).add(id)), []);
 
   const deliverAndSync = useCallback(async (message: ProactiveMessage, conversationId: string) => {
@@ -109,12 +106,13 @@ function App({ characterId }: { characterId: string }) {
 
   const send = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!input.trim() || !active || busy) return;
+    if (!input.trim() || !active || busy || syncAfterFailure) return;
     setBusy(true);
     setError("");
+    const content = input;
+    const conversationId = active.id;
+    const started = performance.now();
     try {
-      const content = input;
-      const conversationId = active.id;
       const message = await request<Message>(`/conversations/${conversationId}/messages`, {
         method: "POST", body: JSON.stringify({ content }),
       });
@@ -122,8 +120,29 @@ function App({ characterId }: { characterId: string }) {
         ? { ...conversation, messages: [...(conversation.messages ?? []), { id: crypto.randomUUID(), role: "user", content }, message] }
         : conversation);
       setInput("");
+      requestAnimationFrame(() => console.info("soulseed_chat_display", { nextFrameMs: performance.now() - started }));
     } catch (e) {
-      setError((e as Error).message);
+      const failure = e as Error;
+      if (failure instanceof ApiError && failure.messageSaved) {
+        setInput("");
+        try {
+          const refreshed = await request<Conversation>(`/conversations/${conversationId}`);
+          setActive((current) => current?.id === conversationId ? refreshed : current);
+          setInput("");
+          setError(`模型未完成本次回复：${failure.message} 已同步会话记录；请直接继续发送，避免重复提交。`);
+        } catch {
+          setSyncAfterFailure(conversationId);
+          setError(`${failure.message} 请先刷新当前会话确认记录，再继续发送。`);
+        }
+      } else if (!(failure instanceof ApiError)) {
+        // A lost response is not evidence that the POST was not committed.
+        // Clear the submitted draft and only offer a read-only resync, never a resend.
+        setInput("");
+        setSyncAfterFailure(conversationId);
+        setError("连接或响应异常，本次发送状态未知，模型可能仍在处理。请同步会话，不要原样重发。");
+      } else {
+        setError(failure.message);
+      }
     } finally {
       setBusy(false);
     }
@@ -160,9 +179,19 @@ function App({ characterId }: { characterId: string }) {
         {!active && inbox.length === 0 && <div className="empty">创建一个会话，开始与 Soulseed 交流。</div>}
       </div>
       {error && <div className="error">{error}</div>}
+      {syncAfterFailure && <button type="button" disabled={busy} onClick={async () => {
+        setBusy(true);
+        try {
+          const refreshed = await request<Conversation>(`/conversations/${syncAfterFailure}`);
+          setActive(refreshed);
+          setSyncAfterFailure(null);
+          setError("已同步当前记录。若尚无回复，模型可能仍在处理；请勿原样重复发送。");
+        } catch { setError("会话同步失败，请检查网络后再次同步；不会重新发送消息。"); }
+        finally { setBusy(false); }
+      }}>同步会话记录</button>}
       <form onSubmit={send}>
         <textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="写下你想说的话…" disabled={busy || !active} />
-        <button disabled={busy || !active}>{busy ? "思考中…" : "发送"}</button>
+        <button disabled={busy || !active || !!syncAfterFailure}>{busy ? "思考中…" : "发送"}</button>
       </form>
     </section>
   </main>;

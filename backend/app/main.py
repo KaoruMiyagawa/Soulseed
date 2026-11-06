@@ -13,6 +13,7 @@ from typing import Literal
 from zoneinfo import ZoneInfoNotFoundError
 
 from .chat_service import ChatService
+from .context_window import ContextBudgetExceeded, ContextWindowLimits, ModelContextWindow
 from .config import get_settings
 from .db import Database
 from .model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
@@ -153,6 +154,19 @@ chat = ChatService(
     memory_correction_service=memory_correction_service,
     life_repository=life_repository,
     contact_service=contact_service,
+    context_window=ModelContextWindow(ContextWindowLimits(
+        max_input_tokens=settings.model_context_input_token_budget,
+        max_persona_tokens=settings.model_context_persona_token_budget,
+        max_expression_tokens=settings.model_context_expression_token_budget,
+        max_clarification_tokens=settings.model_context_clarification_token_budget,
+        max_system_control_tokens=settings.model_context_system_control_token_budget,
+        max_current_message_tokens=settings.model_context_current_message_token_budget,
+        max_history_tokens=settings.model_context_history_token_budget,
+    )),
+    runtime_features={
+        "contact_background_enabled": settings.contact_background_enabled,
+        "contact_model_generation_enabled": settings.contact_model_generation_enabled,
+    },
 )
 
 
@@ -233,12 +247,35 @@ async def authorize_local_request(request: Request, call_next):
         return response
 
 
+@app.middleware("http")
+async def time_chat_request(request: Request, call_next):
+    if request.method != "POST" or not request.url.path.startswith("/api/conversations/") or not request.url.path.endswith("/messages"):
+        return await call_next(request)
+    from .chat_diagnostics import ChatTrace, current_trace
+    trace = ChatTrace()
+    token = current_trace.set(trace)
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        trace.checkpoint(None)
+        response.headers["X-Request-ID"] = trace.id
+        response.headers["Server-Timing"] = ", ".join(
+            f"{key};dur={value:.3f}" for key, value in trace.durations.items()
+        )
+        return response
+    finally:
+        trace.finish(status, settings.chat_timing_log_path)
+        current_trace.reset(token)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(allowed_origins),
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     allow_credentials=True,
+    expose_headers=["X-Request-ID", "Server-Timing"],
 )
 
 
@@ -445,9 +482,23 @@ async def send_message(conversation_id: str, request: SendMessageRequest) -> dic
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
     except ModelConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc), "message_saved": True},
+        )
     except ModelRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "message_saved": exc.message_saved},
+        )
+    except ContextBudgetExceeded as exc:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": str(exc), "message_saved": exc.message_saved},
+        )
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=502,
+            content={"detail": str(exc), "message_saved": True},
+        )
 

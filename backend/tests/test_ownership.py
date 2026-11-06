@@ -13,6 +13,7 @@ from fastapi import HTTPException
 import app.db as db_module
 import app.main as main
 from app.chat_service import ChatService
+from app.context_window import ContextWindowLimits, ModelContextWindow
 from app.config import Settings
 from app.contact import ContactService
 from app.db import Database
@@ -101,6 +102,87 @@ def test_development_conversation_turn_limit_rejects_before_model(owned, monkeyp
         assert [item["content"] for item in main.messages.list_for_conversation(conversation_id)] == [
             records["big_fish"][1]["content"]
         ]
+
+
+def test_oversized_current_message_returns_413_without_persisting_retryable_input(owned, monkeypatch):
+    _, records, _ = owned
+    _, conversations, messages = main.database, main.conversations, main.messages
+    calls = []
+
+    class Model:
+        async def reply(self, _messages):
+            calls.append("reply")
+            return "should not run"
+
+    chat = ChatService(
+        conversations,
+        messages,
+        Model(),
+        "人格",
+        context_window=ModelContextWindow(ContextWindowLimits(
+            max_input_tokens=3000,
+            max_persona_tokens=500,
+            max_expression_tokens=500,
+            max_clarification_tokens=500,
+            max_system_control_tokens=500,
+            max_current_message_tokens=128,
+            max_history_tokens=500,
+        )),
+    )
+    monkeypatch.setattr(main, "chat", chat)
+    monkeypatch.setattr(main.settings, "model_conversation_turn_limit", None)
+    conversation_id = records["big_fish"][0]["id"]
+    client = paired()
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"content": "超长消息" * 100},
+    )
+    assert response.status_code == 413
+    assert response.json()["message_saved"] is False
+    assert calls == []
+    with character_scope("big_fish"):
+        assert [item["content"] for item in messages.list_for_conversation(conversation_id)] == [
+            records["big_fish"][1]["content"]
+        ]
+
+
+def test_required_context_413_is_explicitly_marked_as_persisted(owned, monkeypatch):
+    _, records, _ = owned
+    _, conversations, messages = main.database, main.conversations, main.messages
+    calls = []
+
+    class Model:
+        async def reply(self, _messages):
+            calls.append("reply")
+            return "unexpected"
+
+    chat = ChatService(
+        conversations,
+        messages,
+        Model(),
+        "人格" * 200,
+        context_window=ModelContextWindow(ContextWindowLimits(
+            max_input_tokens=100,
+            max_persona_tokens=500,
+            max_expression_tokens=500,
+            max_clarification_tokens=500,
+            max_system_control_tokens=500,
+            max_current_message_tokens=128,
+            max_history_tokens=500,
+        )),
+    )
+    monkeypatch.setattr(main, "chat", chat)
+    monkeypatch.setattr(main.settings, "model_conversation_turn_limit", None)
+    conversation_id = records["big_fish"][0]["id"]
+    response = paired().post(
+        f"/api/conversations/{conversation_id}/messages", json={"content": "短消息"}
+    )
+    assert response.status_code == 413
+    assert response.json()["message_saved"] is True
+    assert "不要原样重发" in response.json()["detail"]
+    assert calls == []
+    with character_scope("big_fish"):
+        assert messages.list_for_conversation(conversation_id)[-1]["content"] == "短消息"
 
 
 def test_development_loopback_uses_only_big_fish_without_pairing(owned, monkeypatch):

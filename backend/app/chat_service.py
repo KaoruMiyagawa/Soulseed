@@ -5,6 +5,8 @@ import logging
 import re
 
 from .expression import ExpressionContextBuilder
+from .context_window import ContextBudgetExceeded, ModelContextWindow
+from .chat_diagnostics import checkpoint, count, measure
 from .memory.context_builder import MemoryContextBuilder
 from .memory.correction_flow_service import CorrectionFlowResult, CorrectionFlowService, CorrectionFlowStatus
 from .memory.clarification_repository import (
@@ -21,6 +23,7 @@ from .model_adapter import (
     ClarificationAction,
     ClarificationResolution,
     ModelAdapter,
+    ModelConfigurationError,
     ModelRequestError,
     StructuredChatReply,
     StructuredOutputError,
@@ -60,6 +63,8 @@ class ChatService:
         memory_correction_service: MemoryCorrectionService | None = None,
         life_repository=None,
         contact_service=None,
+        context_window: ModelContextWindow | None = None,
+        runtime_features: dict[str, bool] | None = None,
     ):
         self.conversations, self.messages, self.model, self.system_prompt = conversations, messages, model, system_prompt
         self.memory_service, self.memory_extractor = memory_service, memory_extractor
@@ -72,16 +77,25 @@ class ChatService:
         self.life_repository = life_repository
         self.contact_service = contact_service
         self.expression_context_builder = ExpressionContextBuilder()
+        self.context_window = context_window or ModelContextWindow()
+        self.runtime_features = runtime_features or {}
+        self.last_context_report = None
 
     async def send(self, conversation_id: str, content: str) -> dict:
+        checkpoint("user_persistence")
         self.conversations.get(conversation_id)
+        # Reject an intrinsically oversized input before writing it. This makes
+        # a visible 413 safe to correct and retry without creating duplicate turns.
+        self.context_window.validate_current_message(content)
         user_message = self.messages.add(conversation_id, "user", content)
+        checkpoint("contact_boundary")
         if self.contact_service is not None:
             try:
                 self.contact_service.observe_user_message(content, character_id=current_character.get())
             except Exception:
                 logger.exception("主动联系偏好更新失败 message_id=%s", user_message["id"])
 
+        checkpoint("clarification_lookup")
         pending: ClarificationRecord | None = None
         claim = None
         clarification_busy = False
@@ -110,6 +124,7 @@ class ChatService:
             self.conversations.touch(conversation_id)
             return {**assistant_message, "correction": self._correction_summary(())}
 
+        checkpoint("memory_retrieval")
         memory_context = ""
         memory_matches = []
         share_service = None
@@ -121,6 +136,7 @@ class ChatService:
             except Exception:
                 logger.exception("记忆检索或上下文组装失败，继续执行聊天请求 message_id=%s", user_message["id"])
 
+        checkpoint("memory_extraction")
         correction_results: tuple[CorrectionFlowResult, ...] = ()
         if not clarification_busy and self.memory_service and self.memory_extractor:
             candidates = []
@@ -160,6 +176,10 @@ class ChatService:
                                 for _ in correction_candidates
                             )
 
+        checkpoint("life_expression")
+        # Capability facts are independent of the life-history snapshot. Keep
+        # them available even if life advancement or expression lookup fails.
+        runtime_capabilities = self._runtime_capabilities(content, current_character.get())
         if self.life_repository is not None:
             try:
                 from .life_engine import LifeEngine
@@ -169,8 +189,8 @@ class ChatService:
                     from .life_share import LifeShareService
                     share_service = LifeShareService(self.life_repository)
                     share_reservation = share_service.reserve_for_chat(content, character_id=current_character.get())
-                history = self.messages.list_for_conversation(conversation_id)
                 continues_topic = any(word in content for word in ("刚才", "上次", "之前说", "接着", "继续聊", "还记得"))
+                history = self.messages.list_for_conversation(conversation_id) if continues_topic else []
                 recent = ([f"{item['role']}: {item['content']}" for item in history[-4:-1]
                            if item.get("role") in {"user", "assistant"}] if continues_topic else [])
                 expression = self.expression_context_builder.build(
@@ -180,8 +200,10 @@ class ChatService:
                     share=(share_reservation or {}).get("event"),
                     preferences=snapshot["preferences"], recent_interactions=recent,
                     boundaries=(self.contact_service.expression_boundaries(current_character.get())
-                                if self.contact_service is not None else ()),
+                                if self.contact_service is not None and "proactive_contact" in runtime_capabilities else ()),
                     local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],
+                    life_scope=snapshot["life_scope"],
+                    runtime_capabilities=runtime_capabilities,
                 )
                 expression_message = expression.to_system_message()
                 memory_context = ""
@@ -189,12 +211,27 @@ class ChatService:
                     memory_context = expression_message["content"]
             except Exception:
                 logger.exception("生活状态读取或推进失败，继续执行聊天请求 message_id=%s", user_message["id"])
-                memory_context = self.memory_context_builder.build(memory_matches) if self.memory_context_builder else ""
+                expression_message = self.expression_context_builder.build(
+                    character_id=current_character.get(), intent=content,
+                    memory_matches=memory_matches,
+                    runtime_capabilities=runtime_capabilities,
+                ).to_system_message()
+                memory_context = expression_message["content"] if expression_message else (
+                    self.memory_context_builder.build(memory_matches) if self.memory_context_builder else ""
+                )
         elif memory_matches:
             expression_message = self.expression_context_builder.build(
                 character_id=current_character.get(), intent=content, memory_matches=memory_matches,
             ).to_system_message()
             memory_context = expression_message["content"] if expression_message else ""
+        else:
+            if runtime_capabilities:
+                expression_message = self.expression_context_builder.build(
+                    character_id=current_character.get(), intent=content,
+                    runtime_capabilities=runtime_capabilities,
+                ).to_system_message()
+                memory_context = expression_message["content"] if expression_message else ""
+        checkpoint("history_context")
         model_messages = self._model_messages(conversation_id, memory_context)
         clarification = self._single_clarification_context(correction_results)
         if clarification is not None and self.clarifications is not None:
@@ -215,7 +252,7 @@ class ChatService:
                 )
                 if answer is None:
                     # Unsupported or invalid structured output: ordinary natural chat, explicitly deferred.
-                    reply = await self.model.reply(model_messages)
+                    reply = await self._reply(model_messages)
                     assistant_message, _ = self.clarifications.persist_preparing_reply(
                         record.id, reply, awaiting_user=False
                     )
@@ -225,6 +262,10 @@ class ChatService:
                     assistant_message, _ = self.clarifications.persist_preparing_reply(
                         record.id, answer.content, awaiting_user=awaiting
                     )
+            except (ModelRequestError, ModelConfigurationError, ContextBudgetExceeded):
+                if record is not None:
+                    self.clarifications.defer_preparing(record.id, "model_request_failed")
+                raise
             except StructuredOutputError as exc:
                 logger.warning(
                     "首次澄清决策不符合阶段契约 message_id=%s diagnostic=%s",
@@ -248,7 +289,7 @@ class ChatService:
                 return {**assistant_message, "correction": self._correction_summary(correction_results)}
 
         try:
-            reply = await self.model.reply(model_messages)
+            reply = await self._reply(model_messages)
             with self.messages.database.atomic():
                 assistant_message = self.messages.add(conversation_id, "assistant", reply)
                 if share_reservation and not share_service.commit_chat_selection(share_reservation["token"]):
@@ -273,7 +314,7 @@ class ChatService:
         try:
             answer = await self._structured_generation(model_messages, clarification, "response", user_message["content"])
             if answer is None:
-                reply = await self.model.reply(model_messages)
+                reply = await self._reply(model_messages)
                 assistant_message, _ = self.clarifications.persist_processing_reply(
                     clarification.id, token or "", reply, ClarificationStatus.DEFERRED, error_code="structured_output_unavailable"
                 )
@@ -336,6 +377,20 @@ class ChatService:
                 evidence_excerpt=evidence_excerpt,
             )
             return assistant_message
+        except ContextBudgetExceeded:
+            logger.info("澄清模型上下文超过预算，保留澄清状态 clarification_id=%s", clarification.id)
+            try:
+                self.clarifications.finish_processing(
+                    clarification.id,
+                    token or "",
+                    ClarificationStatus.FAILED,
+                    error_code="context_budget_exceeded",
+                    resolution=resolution_value,
+                    evidence_excerpt=evidence_excerpt,
+                )
+            except Exception:
+                logger.exception("上下文超限后的澄清状态无法释放 clarification_id=%s", clarification.id)
+            raise
         except Exception:
             logger.exception("澄清答复处理失败 clarification_id=%s", clarification.id)
             reconciled = None
@@ -434,7 +489,7 @@ class ChatService:
                 ),
             }
         )
-        reply = await self.model.reply(final_messages)
+        reply = await self._reply(final_messages)
         assistant_message, _ = self.clarifications.persist_processing_reply(
             clarification.id,
             processing_token,
@@ -473,7 +528,7 @@ class ChatService:
                 ),
             }
         )
-        return await self.model.reply(prompt)
+        return await self._reply(prompt)
 
     async def _structured_generation(
         self, messages: list[dict[str, str]], clarification: ClarificationRecord, phase: str, user_text: str
@@ -482,9 +537,14 @@ class ChatService:
         if not callable(method):
             return None
         prompt = list(messages)
-        prompt.append({"role": "system", "content": self._decision_instruction(clarification, phase, user_text)})
+        prompt.append({
+            "role": "system",
+            "content": "<memory_clarification_instruction>\n"
+            + self._decision_instruction(clarification, phase, user_text)
+            + "\n</memory_clarification_instruction>",
+        })
         try:
-            result = await method(prompt)
+            result = await self._structured_reply(method, prompt)
             if not isinstance(result, StructuredChatReply):
                 raise StructuredOutputError("结构化模型响应类型无效", code="invalid_result_type")
             if result.ignored_extra_fields:
@@ -497,13 +557,8 @@ class ChatService:
                 exc.code,
             )
             return None
-        except ModelRequestError as exc:
-            logger.warning(
-                "结构化模型请求失败，回退普通聊天 clarification_id=%s http_status=%s",
-                clarification.id,
-                exc.status_code,
-            )
-            return None
+        except (ContextBudgetExceeded, ModelRequestError, ModelConfigurationError):
+            raise
         except Exception as exc:
             logger.warning(
                 "结构化澄清处理不可用，回退普通聊天 clarification_id=%s error_type=%s",
@@ -512,6 +567,32 @@ class ChatService:
             )
             return None
 
+    async def _reply(self, messages: list[dict[str, str]]) -> str:
+        with measure("context_budget"):
+            result = self.context_window.fit(messages)
+        self.last_context_report = result
+        count("estimated_input_tokens", result.estimated_after)
+        count("dropped_turns", result.dropped_turns)
+        count("plain_model_calls")
+        checkpoint("model_generation")
+        try:
+            return await self.model.reply(result.messages)
+        finally:
+            checkpoint("reply_persistence")
+
+    async def _structured_reply(self, method, messages: list[dict[str, str]]) -> StructuredChatReply:
+        with measure("context_budget"):
+            result = self.context_window.fit(messages)
+        self.last_context_report = result
+        count("estimated_input_tokens", result.estimated_after)
+        count("dropped_turns", result.dropped_turns)
+        count("structured_model_calls")
+        checkpoint("model_generation")
+        try:
+            return await method(result.messages)
+        finally:
+            checkpoint("reply_persistence")
+
     def _model_messages(self, conversation_id: str, memory_context: str) -> list[dict[str, str]]:
         history = self.messages.list_for_conversation(conversation_id)
         messages = [{"role": "system", "content": self.system_prompt}]
@@ -519,6 +600,32 @@ class ChatService:
             messages.append({"role": "system", "content": memory_context})
         messages.extend({"role": item["role"], "content": item["content"]} for item in history)
         return messages
+
+    def _runtime_capabilities(self, query: str, character_id: str) -> dict:
+        """Include only capabilities relevant to the current question."""
+        result: dict = {}
+        if any(cue in query for cue in (
+            "主动", "发消息", "发信息", "联系我", "来找我", "找我", "通知我",
+            "给我留言", "来敲我",
+        )):
+            if self.contact_service is None:
+                contact = {"supported": False, "enabled": False, "policy_allows_now": False,
+                           "ready_in_app_messages": 0, "channel": "in_app_only",
+                           "browser_display_and_confirmation_required": True, "external_push": False}
+            else:
+                contact = self.contact_service.delivery_context(character_id)
+            contact["background_checks_enabled"] = bool(contact["enabled"] and self.runtime_features.get("contact_background_enabled"))
+            contact["model_generated_contact_enabled"] = bool(contact["enabled"] and self.runtime_features.get("contact_model_generation_enabled"))
+            result["proactive_contact"] = contact
+        if any(cue in query for cue in ("在哪里", "在哪", "住哪里", "住在", "房间", "数字空间", "身体", "看得见", "听得见")):
+            result["digital_space"] = {
+                "web_chat_surface": True,
+                "virtual_life_records": True,
+                "immersive_room": False,
+                "physical_location": False,
+                "physical_senses": False,
+            }
+        return result
 
     @staticmethod
     def _single_clarification_context(results: tuple[CorrectionFlowResult, ...]) -> dict | None:

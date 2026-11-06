@@ -93,6 +93,17 @@ async def test_provider_errors_are_explicit(status):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 413])
+async def test_provider_context_limit_error_is_clear_and_does_not_echo_raw_body(status):
+    response = httpx.Response(status, json={"message": "maximum context length exceeded; private-provider-detail"})
+    with pytest.raises(ModelRequestError) as error:
+        await adapter_with_response(response).reply([])
+    assert error.value.status_code == 413
+    assert "上下文限制" in str(error.value)
+    assert "private-provider-detail" not in str(error.value)
+
+
+@pytest.mark.asyncio
 async def test_model_failure_does_not_persist_fake_assistant_message(repositories):
     _, conversations, messages = repositories
 

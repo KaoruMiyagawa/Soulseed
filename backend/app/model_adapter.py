@@ -1,4 +1,6 @@
 from collections.abc import Callable
+import asyncio
+from time import perf_counter
 from dataclasses import dataclass
 from enum import StrEnum
 import json
@@ -11,6 +13,7 @@ from uuid import uuid4
 import httpx
 
 from .config import Settings
+from .chat_diagnostics import current_trace, measure
 
 
 class ModelConfigurationError(RuntimeError):
@@ -18,14 +21,20 @@ class ModelConfigurationError(RuntimeError):
 
 
 class ModelRequestError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502):
+    def __init__(self, message: str, status_code: int = 502, *, message_saved: bool = True):
         super().__init__(message)
         self.status_code = status_code
+        self.message_saved = message_saved
 
 
 class ModelTimeoutError(ModelRequestError):
-    def __init__(self):
-        super().__init__("硅基流动模型请求超时，请稍后重试。", status_code=504)
+    def __init__(self, kind: str = "read"):
+        labels = {"connect": "连接模型服务超时", "read": "等待模型响应超时",
+                  "write": "发送模型请求超时", "pool": "等待模型连接超时",
+                  "deadline": "模型请求超过后端总等待时限"}
+        self.kind = kind
+        super().__init__(labels.get(kind, "模型请求超时") + "；当前消息已保存，但没有完整回复。"
+                         "系统未自动重试，请勿原样重复提交。上游是否已计费未知。", status_code=504)
 
 
 class StructuredOutputError(RuntimeError):
@@ -150,28 +159,57 @@ class OpenAICompatibleAdapter:
         if not self.settings.model_name:
             raise ModelConfigurationError("模型名称未配置。请在 .env 中设置 SOULSEED_MODEL_NAME。")
         url = self.settings.model_base_url.rstrip("/") + "/chat/completions"
-        request_id = self._reserve_request()
+        trace = current_trace.get()
+        metrics = {"chat_request_id": trace.id if trace else None,
+                   "input_chars": sum(len(item.get("content", "")) for item in messages),
+                   "message_count": len(messages), "structured": structured,
+                   "max_output_tokens": self.settings.model_max_output_tokens,
+                   "timeout_seconds": self.settings.model_timeout_seconds,
+                   "trust_env": self.settings.model_trust_env}
+        request_id = self._reserve_request(metrics)
+        started = perf_counter()
+        async def headers_received(_response):
+            metrics["response_headers_ms"] = round((perf_counter() - started) * 1000, 3)
+        def record(status, response=None):
+            metrics["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
+            self._record_result(request_id, status, response, metrics=metrics)
         try:
-            async with self.client_factory(timeout=self.settings.model_timeout_seconds) as client:
-                body = {"model": self.settings.model_name, "messages": messages}
-                if self.settings.model_max_output_tokens is not None:
-                    body["max_tokens"] = self.settings.model_max_output_tokens
-                if structured:
-                    body["response_format"] = {"type": "json_object"}
-                response = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {self.settings.model_api_key}"},
-                    json=body,
-                )
+            # HTTPX timeouts bound inactivity per phase; also bound total elapsed time.
+            with measure("model_http"):
+                async with asyncio.timeout(self.settings.model_timeout_seconds), self.client_factory(
+                    timeout=self.settings.model_timeout_seconds, trust_env=self.settings.model_trust_env,
+                    event_hooks={"response": [headers_received]},
+                ) as client:
+                    body = {"model": self.settings.model_name, "messages": messages}
+                    if self.settings.model_max_output_tokens is not None:
+                        body["max_tokens"] = self.settings.model_max_output_tokens
+                    if structured:
+                        body["response_format"] = {"type": "json_object"}
+                    response = await client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {self.settings.model_api_key}"},
+                        json=body,
+                    )
         except httpx.TimeoutException as exc:
-            self._record_result(request_id, "timeout")
-            raise ModelTimeoutError() from exc
+            kind = {httpx.ConnectTimeout: "connect", httpx.ReadTimeout: "read",
+                    httpx.WriteTimeout: "write", httpx.PoolTimeout: "pool"}.get(type(exc), "read")
+            record("timeout_" + kind)
+            raise ModelTimeoutError(kind) from exc
+        except TimeoutError as exc:
+            record("timeout_deadline")
+            raise ModelTimeoutError("deadline") from exc
         except httpx.RequestError as exc:
-            self._record_result(request_id, "network_error")
+            record("network_error")
             raise ModelRequestError("无法连接硅基流动模型服务，请检查网络或稍后重试。") from exc
-        self._record_result(request_id, f"http_{response.status_code}", response)
+        record(f"http_{response.status_code}", response)
         if response.is_error:
             status = response.status_code
+            if status in (400, 413) and self._is_context_limit_response(response):
+                raise ModelRequestError(
+                    "模型服务报告输入超过该模型当前上下文限制。当前消息已保存但未生成回复；"
+                    "请缩短对话上下文后继续，不要原样重复提交。",
+                    status_code=413,
+                )
             if status in (401, 403):
                 raise ModelRequestError("硅基流动 API Key 无效、已失效或当前账号无权调用该模型。", status_code=502)
             if status == 404:
@@ -179,7 +217,7 @@ class OpenAICompatibleAdapter:
             if status == 429:
                 raise ModelRequestError("硅基流动请求受到限流或额度限制，请检查账户余额、配额和速率限制。", status_code=429)
             if status in (500, 502, 503, 504):
-                raise ModelRequestError("硅基流动模型服务暂时不可用，请稍后重试。", status_code=502)
+                raise ModelRequestError(f"硅基流动服务返回 HTTP {status}；当前消息已保存但未获得回复，系统未自动重试。", status_code=502)
             raise ModelRequestError(f"硅基流动模型请求失败（HTTP {status}）。", status_code=502)
         try:
             # SiliconFlow may also return reasoning_content; only final content is user-visible.
@@ -192,6 +230,30 @@ class OpenAICompatibleAdapter:
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("模型服务返回了空回复。")
         return content.strip()
+
+    @staticmethod
+    def _is_context_limit_response(response: httpx.Response) -> bool:
+        """Recognize provider context errors without exposing its raw response body."""
+        try:
+            body = response.json()
+        except (ValueError, TypeError):
+            return False
+        candidates: list[str] = []
+        if isinstance(body, dict):
+            for key in ("message", "detail", "code", "type", "error"):
+                value = body.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+                elif isinstance(value, dict):
+                    candidates.extend(
+                        item for item in value.values() if isinstance(item, str)
+                    )
+        diagnostic = " ".join(candidates).casefold()
+        markers = (
+            "context length", "context_length", "maximum context", "max context",
+            "prompt is too long", "too many tokens", "token limit", "上下文长度", "上下文超限",
+        )
+        return any(marker in diagnostic for marker in markers)
 
     def _append_log(self, record: dict) -> None:
         path = self.settings.model_request_log_path
@@ -206,7 +268,7 @@ class OpenAICompatibleAdapter:
             log.flush()
             os.fsync(log.fileno())
 
-    def _reserve_request(self) -> str | None:
+    def _reserve_request(self, metrics: dict | None = None) -> str | None:
         path = self.settings.model_request_log_path
         limit = self.settings.model_daily_request_limit
         if limit is not None and not path:
@@ -227,25 +289,37 @@ class OpenAICompatibleAdapter:
         request_id = str(uuid4())
         try:
             self._append_log({"event": "started", "day": day, "at": now.isoformat(),
-                              "id": request_id, "model": self.settings.model_name})
+                              "id": request_id, "model": self.settings.model_name, **(metrics or {})})
         except OSError as exc:
             raise ModelConfigurationError("无法持久记录模型请求；已拒绝本次请求。") from exc
         return request_id
 
-    def _record_result(self, request_id: str | None, status: str, response: httpx.Response | None = None) -> None:
+    def _record_result(self, request_id: str | None, status: str, response: httpx.Response | None = None, *, metrics: dict | None = None) -> None:
         if request_id is None:
             return
         usage = None
+        output_sizes = {}
         if response is not None:
             try:
-                raw = response.json().get("usage", {})
+                payload = response.json()
+                raw = payload.get("usage", {})
                 usage = {key: raw.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
                          if isinstance(raw.get(key), int)}
-            except (ValueError, AttributeError):
+                details = raw.get("completion_tokens_details") or {}
+                if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+                    usage["reasoning_tokens"] = details["reasoning_tokens"]
+                choice = payload.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                for field in ("content", "reasoning_content"):
+                    if isinstance(message.get(field), str):
+                        output_sizes[field + "_chars"] = len(message[field])
+                if choice.get("finish_reason") in {"stop", "length", "max_tokens", "tool_calls", "content_filter"}:
+                    output_sizes["finish_reason"] = choice["finish_reason"]
+            except (ValueError, AttributeError, TypeError, IndexError):
                 pass
         try:
             self._append_log({"event": "finished", "at": datetime.now(UTC).isoformat(),
-                              "id": request_id, "status": status, "usage": usage})
+                              "id": request_id, "status": status, "usage": usage, **(metrics or {}), **output_sizes})
         except OSError:
             # Reservation remains counted. A log write failure never causes a retry.
             pass

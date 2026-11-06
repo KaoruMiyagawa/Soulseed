@@ -49,6 +49,7 @@ def _child_environment(*, model_enabled: bool = True) -> dict[str, str]:
         "SOULSEED_MODEL_DAILY_REQUEST_LIMIT": "20",
         "SOULSEED_MODEL_CONVERSATION_TURN_LIMIT": "100",
         "SOULSEED_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "model-requests.jsonl"),
+        "SOULSEED_CHAT_TIMING_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "chat-timings.jsonl"),
         "SOULSEED_CONTACT_MODEL_GENERATION_ENABLED": "false",
         "VITE_API_URL": f"http://127.0.0.1:{BACKEND_PORT}/api",
         "VITE_SOULSEED_DEVELOPMENT_MODE": "true",

@@ -239,26 +239,42 @@ class LifeRepository:
     def expression_snapshot(self, query: str, *, character_id: str = "big_fish", now: datetime | None = None) -> dict:
         """Return a bounded, character-scoped snapshot for natural expression."""
         excluded = ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "烦")
-        relevant = not any(word in query for word in excluded) and any(
-            cue in query for cue in ("吃", "饭", "做什么", "干嘛", "在干", "今天", "开心", "心情", "活动", "最近", "发现")
+        topic_cues = (
+            ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现"), ("research", "exploring")),
+            ("reading", ("阅读", "读书", "读的", "书名", "什么书"), ("reading",)),
+            ("music", ("音乐", "歌曲", "首歌", "曲名", "旋律"), ("music",)),
+            ("meal", ("吃", "饭", "食物", "做菜", "菜"), ("meal", "cooking")),
         )
+        topic = next((name for name, cues, _ in topic_cues if any(cue in query for cue in cues)), None)
+        topic_types = next((types for name, _, types in topic_cues if name == topic), ())
+        emotional = any(word in query for word in excluded)
+        relevant = topic is not None or (not emotional and any(
+            cue in query for cue in ("做什么", "干嘛", "在干", "今天", "开心", "心情", "活动", "最近", "发现", "刚才", "做了什么")
+        ))
+        if not relevant:
+            topic = None
+            topic_types = ()
         state = self.get_state(character_id, now=now)
         zone = ZoneInfo(state["timezone_id"])
         local_date = (now or datetime.now(UTC)).astimezone(zone).date().isoformat()
-        events = self.list_events(character_id, limit=8) if relevant else []
+        recent = self.list_events(character_id, limit=40) if relevant else []
         today_only = "今天" in query or "今日" in query
         if today_only:
             today = datetime.fromisoformat(local_date).date()
-            today_events = []
-            for event in events:
-                if event.get("effective_status") != "completed":
-                    today_events.append(event)
-                    continue
-                occurred_at = event.get("occurred_at")
-                if occurred_at and datetime.fromisoformat(occurred_at).astimezone(zone).date() == today:
-                    today_events.append(event)
-            events = today_events
-        preference_relevant = any(word in query for word in ("喜欢", "兴趣", "爱好", "偏好", "想做"))
+            recent = [event for event in recent if event.get("effective_status") != "completed"
+                      or (event.get("occurred_at") and datetime.fromisoformat(event["occurred_at"]).astimezone(zone).date() == today)]
+        if topic_types:
+            matching = [event for event in recent if event.get("event_type") in topic_types]
+            selected_ids = {event["id"] for event in matching[:4]}
+            events = (matching[:4] + [event for event in recent if event["id"] not in selected_ids][:4])[:8]
+        else:
+            events = recent[:8]
+        life_scope = {
+            "topic": topic or "general",
+            "matching_evidence_count": sum(event.get("event_type") in topic_types for event in events)
+            if topic_types else len(events),
+        } if relevant else None
+        preference_relevant = not emotional and any(word in query for word in ("喜欢", "兴趣", "爱好", "偏好", "想做"))
         with self.database.connection() as db:
             preferences = db.execute(
                 "SELECT event_type, weight FROM life_preferences WHERE character_id = ? AND weight >= 1.1 ORDER BY weight DESC, event_type LIMIT 5",
@@ -271,4 +287,5 @@ class LifeRepository:
             "timezone_id": state.get("timezone_id"),
             "local_date": local_date,
             "today_only": today_only,
+            "life_scope": life_scope,
         }

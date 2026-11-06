@@ -75,12 +75,21 @@ class Settings(BaseSettings):
     model_base_url: str = "https://api.siliconflow.cn/v1"
     model_api_key: str | None = Field(default=None, repr=False)
     model_name: str = "deepseek-ai/DeepSeek-V4.1-Flash"
-    model_timeout_seconds: float = 60
+    model_timeout_seconds: float = Field(default=60, gt=0, le=300)
+    model_trust_env: bool = True
     model_enabled: bool = True
     model_max_output_tokens: int | None = Field(default=None, ge=64, le=4096)
     model_daily_request_limit: int | None = Field(default=None, ge=1, le=1000)
     model_conversation_turn_limit: int | None = Field(default=None, ge=1, le=1000)
     model_request_log_path: str | None = None
+    chat_timing_log_path: str | None = None
+    model_context_input_token_budget: int = Field(default=16_000, ge=512, le=200_000)
+    model_context_persona_token_budget: int = Field(default=3_500, ge=128, le=50_000)
+    model_context_expression_token_budget: int = Field(default=3_500, ge=128, le=50_000)
+    model_context_clarification_token_budget: int = Field(default=4_500, ge=128, le=50_000)
+    model_context_system_control_token_budget: int = Field(default=4_500, ge=128, le=50_000)
+    model_context_current_message_token_budget: int = Field(default=2_048, ge=128, le=50_000)
+    model_context_history_token_budget: int = Field(default=6_000, ge=128, le=100_000)
     system_prompt: str | None = None
     memory_context_max_chars: int = 4000
     memory_context_max_items: int = 5

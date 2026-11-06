@@ -389,6 +389,7 @@ CREATE INDEX idx_life_share_channel ON life_share_intents(character_id, status, 
 """
 
 
+
 class Database:
     def __init__(self, path: str, *, environment: str | None = None,
                  test_data_root: str | None = None, migration_backup_path: str | None = None,
@@ -562,6 +563,13 @@ class Database:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
+        from .chat_diagnostics import measure
+        with measure("sqlite"):
+            with self._connection() as connection:
+                yield connection
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
         active = self._active_transaction.get()
         if active is not None:
             yield active
