@@ -164,6 +164,7 @@ class ExpressionContextBuilder:
                 status="completed", content=self._text(str(share.get("content") or "")),
                 trust="saved_event_and_pending_share", occurred_at=share.get("occurred_at"),
                 recorded_via=share.get("source"), generation_method=share.get("generation_method"),
+                research_result=share.get("research_result"),
             ))
         represented_events = {item.evidence_id for item in evidence if item.source != "long_term_memory"}
         for event in list(life_events)[:self.max_evidence]:

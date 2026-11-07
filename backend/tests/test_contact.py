@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.contact import ContactService
+from app.contact import SafeContactGenerator
 from app.db import Database
 from app.life import LifeRepository
 from app.life_share import LifeShareService
@@ -12,6 +13,11 @@ from app.repositories import ConversationRepository, MessageRepository
 
 
 NOW = datetime(2026, 11, 2, 5, tzinfo=UTC)  # 13:00 in Asia/Shanghai
+
+
+class TestContactGenerator:
+    async def generate(self, intent, *, reminder=False):
+        return f"这条发现我记下啦：{intent['topic']}"
 
 
 @pytest.fixture
@@ -34,7 +40,8 @@ def user_message(db, conversation_id, when=NOW - timedelta(hours=3), content="�
 async def test_saved_share_becomes_contact_intent_then_station_message(context):
     db, repo, service, conversation = context
     user_message(db, conversation["id"])
-    event = repo.record("发现一片会发光的虚拟海草", event_type="exploring", now=NOW)
+    service.generator = TestContactGenerator()
+    event = repo.record("今天做了一份开心的晚餐", event_type="cooking", feeling="开心", now=NOW)
     share = LifeShareService(repo).consider(event["id"], now=NOW)
     ready = await service.tick(now=NOW)
     assert ready["status"] == "ready"
@@ -54,6 +61,47 @@ async def test_saved_share_becomes_contact_intent_then_station_message(context):
     assert restarted.inbox(now=NOW) == []
     assert restarted.mark_read(ready["id"], now=NOW)["status"] == "read"
     assert restarted.mark_read(ready["id"], now=NOW)["status"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_rule_engine_exploration_is_not_shared_as_a_real_discovery(context):
+    db, repo, service, conversation = context
+    user_message(db, conversation["id"])
+    event = repo.record("去探索一个没注意过的角落", event_type="exploring",
+                        generation_method="rule_engine", now=NOW)
+    assert LifeShareService(repo).consider(event["id"], now=NOW) is None
+    with db.connection() as connection:
+        decision = connection.execute("SELECT outcome, reason FROM life_share_decisions WHERE event_id=?", (event["id"],)).fetchone()
+        assert tuple(decision) == ("skipped", "simulated_activity_not_research")
+        # Simulate a legacy pending intent already queued before this fix.
+        share_id, contact_id = str(uuid4()), str(uuid4())
+        connection.execute(
+            "INSERT INTO life_share_intents(id,character_id,event_id,status,reason,created_at,delivery_channel) VALUES(?,?,?,'pending','interesting_discovery',?,'contact')",
+            (share_id, "big_fish", event["id"], NOW.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO contact_intents(ownership_verified,id,character_id,source,source_id,share_intent_id,event_id,importance,reason,topic,status,created_at,expires_at) VALUES(1,?,'big_fish','life_share',?,?,?,'normal','saved_life_experience',?,'pending',?,?)",
+            (contact_id, share_id, share_id, event["id"], event["content"], NOW.isoformat(), (NOW + timedelta(days=2)).isoformat()),
+        )
+    ready = await service.tick(now=NOW)
+    assert ready is None
+    assert service.inbox(now=NOW) == []
+    with db.connection() as connection:
+        assert connection.execute("SELECT status FROM contact_intents WHERE id=?", (contact_id,)).fetchone()[0] == "pending"
+        assert connection.execute("SELECT status FROM life_share_intents WHERE id=?", (share_id,)).fetchone()[0] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_safe_fallback_does_not_send_a_fixed_exploration_share(context):
+    db, repo, service, conversation = context
+    user_message(db, conversation["id"])
+    event = repo.record("探索主题：海獭。海獭会用石块敲开贝类。", event_type="research",
+                        source="web_research", generation_method="exploration_agent", now=NOW)
+    share = LifeShareService(repo).consider(event["id"], now=NOW)
+    assert share is None
+    with pytest.raises(ValueError, match="显式启用"):
+        await SafeContactGenerator().generate({"source": "life_share", "topic": "海獭会用石块敲开贝类"})
+    assert await service.tick(now=NOW) is None
 
 
 @pytest.mark.asyncio
@@ -190,9 +238,10 @@ def test_in_app_api_acknowledges_display_then_read(context, monkeypatch):
 
     db, repo, service, conversation = context
     service.set_preferences(quiet_start_minute=0, quiet_end_minute=0)
+    service.generator = TestContactGenerator()
     user_message(db, conversation["id"], when=datetime.now(UTC) - timedelta(hours=3))
     current = datetime.now(UTC)
-    event = repo.record("发现一片会发光的虚拟海草", event_type="exploring", now=current)
+    event = repo.record("今天做了一份开心的晚餐", event_type="cooking", feeling="开心", now=current)
     LifeShareService(repo).consider(event["id"], now=current)
     ready = asyncio.run(service.tick(now=current))
     assert ready is not None

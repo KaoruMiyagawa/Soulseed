@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import json
 import socket
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -43,6 +43,34 @@ class ScriptedModel:
         if last["status"] == "ok" and "untrusted_page_text" in last:
             return json.dumps({"action": "finish", "summary": "页面介绍了海獭的觅食行为。", "claims": [{"text": "海獭会用石头敲开贝类。", "kind": "sourced", "source_ids": [last["evidence_id"]]}], "unanswered": []}, ensure_ascii=False)
         return json.dumps({"action": "finish", "summary": "没有取得足够资料。", "claims": [], "unanswered": ["具体细节尚未查明"]}, ensure_ascii=False)
+
+
+class ShareableExplorationModel:
+    async def reply(self, messages):
+        payload = json.loads(messages[-1]["content"])
+        observations = payload["observations"]
+        if not observations:
+            return json.dumps({"action": "search_web", "query": "海獭如何觅食"}, ensure_ascii=False)
+        last = observations[-1]
+        if "results" in last:
+            return json.dumps({"action": "read_webpage", "evidence_id": last["results"][0]["evidence_id"]})
+        if "untrusted_page_text" in last:
+            return json.dumps({
+                "action": "finish",
+                "summary": "海獭会使用石块敲开贝类外壳，这种工具使用行为帮助它们取得食物，也让它们的觅食方式显得特别有意思。这个例子还展示了海獭如何把身边找到的物品变成实用的小工具，也能看出它们会根据环境选择不同的方法。",
+                "claims": [{"text": "海獭会使用石块敲开贝类外壳。", "kind": "sourced", "source_ids": [last["evidence_id"]]}],
+                "unanswered": [],
+            }, ensure_ascii=False)
+        return json.dumps({"action": "finish", "summary": "资料不足。", "claims": [], "unanswered": ["仍需查证"]}, ensure_ascii=False)
+
+
+class CapturingContactModel:
+    def __init__(self):
+        self.messages = []
+
+    async def reply(self, messages):
+        self.messages = messages
+        return "嘿，我刚查到海獭会拿石块敲贝壳，像给自己带了把小工具！"
 
 
 class FakeSearch:
@@ -107,9 +135,10 @@ def test_v14_database_upgrade_adds_exploration_without_changing_existing_life_re
     monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
     db.initialize(); db.initialize()
     with db.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
         evidence_columns = {row[1] for row in sql.execute("PRAGMA table_info(exploration_evidence)")}
-        assert {"provider", "relevance"} <= evidence_columns
+        assert {"provider", "relevance", "page_relevance"} <= evidence_columns
+        assert sql.execute("SELECT COUNT(*) FROM exploration_autonomy").fetchone()[0] == 0
         assert sql.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert sql.execute("SELECT content FROM life_events WHERE id=?", (old_event["id"],)).fetchone()[0] == "之前的普通经历"
         assert sql.execute("SELECT COUNT(*) FROM exploration_runs").fetchone()[0] == 0
@@ -119,10 +148,15 @@ def test_success_runs_decision_loop_saves_sources_and_is_retrievable_in_real_cha
     db, life, repo, agent, run = setup(tmp_path)
     result = asyncio.run(agent.run(run["id"], "big_fish"))
     assert result["status"] == "completed"
-    assert result["step_count"] == 3 and result["model_call_count"] == 3
+    assert result["step_count"] == 2 and result["model_call_count"] == 2
     assert result["tool_call_count"] == 2
+    assert result["timings"]["model"]["count"] == 2
+    assert result["timings"]["search"]["count"] == 1
+    assert result["timings"]["read"]["count"] == 1
+    assert result["phase"] == "completed" and result["duration_ms"] is not None
     assert result["claims"][0]["kind"] == "sourced"
     assert [item["tool_name"] for item in result["evidence"]] == ["search_web", "read_webpage"]
+    assert result["evidence"][-1]["page_relevance"] == "relevant"
     assert result["life_event_id"]
     event = next(item for item in life.expression_snapshot("你探索发现了什么？")["events"] if item["id"] == result["life_event_id"])
     assert event["effective_status"] == "completed"
@@ -137,7 +171,8 @@ def test_success_runs_decision_loop_saves_sources_and_is_retrievable_in_real_cha
     }
     assert second_payload["search_history"] == ["海獭如何使用工具"]
     assert second_payload["progress"]["remaining_steps_after_this"] == 2
-    assert "read_webpage" in second_payload["available_actions"]
+    assert "read_webpage" not in second_payload["available_actions"]
+    assert second_payload["read_source_evidence_ids"] == [result["evidence"][0]["id"]]
 
     conversations, messages = ConversationRepository(db), MessageRepository(db)
     with character_scope("big_fish"):
@@ -158,6 +193,64 @@ def test_success_runs_decision_loop_saves_sources_and_is_retrievable_in_real_cha
     assert "https://example.org/otters" in context
 
 
+def test_completed_discovery_flows_through_contact_and_remains_citable(tmp_path):
+    db, life, repo, agent, run = setup(tmp_path, model=ShareableExplorationModel())
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "completed"
+    with db.connection() as sql:
+        share = sql.execute(
+            "SELECT s.id,s.reason,s.status FROM life_share_intents s WHERE s.event_id=?",
+            (result["life_event_id"],),
+        ).fetchone()
+        assert share and share["reason"] == "evidence_backed_discovery" and share["status"] == "pending"
+
+    from app.contact import AdapterContactGenerator, ContactService
+    conversations, messages = ConversationRepository(db), MessageRepository(db)
+    with character_scope("big_fish"):
+        conversation = conversations.create()
+        user = messages.add(conversation["id"], "user", "你好呀")
+    now = datetime.now(UTC)
+    with db.connection() as sql:
+        sql.execute("UPDATE messages SET created_at=? WHERE id=?", ((now - timedelta(hours=3)).isoformat(), user["id"]))
+    contact = ContactService(life)
+    contact.set_preferences(quiet_start_minute=0, quiet_end_minute=0, now=now)
+    assert asyncio.run(contact.tick(now=now)) is None
+    queued = contact.list_intents()[0]
+    assert queued["status"] == "pending" and queued["retry_after"] is None
+
+    capture = CapturingContactModel()
+    generator = AdapterContactGenerator(capture, "大肥鱼：淘气、活泼、好奇。", life)
+    contact = ContactService(life, generator=generator)
+    ready = asyncio.run(contact.tick(now=now))
+    assert ready and ready["status"] == "ready"
+    assert contact.list_intents()[0]["reason"] == "evidence_backed_discovery"
+    assert "海獭会拿石块敲贝壳" in ready["content"]
+    prompt = "\n".join(message["content"] for message in capture.messages)
+    assert "https://example.org/otters" in prompt
+    assert "海獭会使用石块敲开贝类外壳" in prompt
+    assert "避免固定开场" in prompt
+    assert contact.inbox(now=now)[0]["id"] == ready["id"]
+
+    delivered = contact.deliver(ready["id"], conversation["id"], now=now)
+    assert delivered["status"] == "delivered"
+    snapshot = life.expression_snapshot("这条发现的来源是什么？", now=now)
+    research = next(event for event in snapshot["events"] if event["id"] == result["life_event_id"])
+    assert research["research_result"]["claims"][0]["text"] == "海獭会使用石块敲开贝类外壳。"
+    assert research["research_result"]["sources"][0]["url"] == "https://example.org/otters"
+
+    with character_scope("big_fish"):
+        duplicate, created = repo.create(character_id="big_fish", idempotency_key="same-discovery-0001",
+                                         requested_topic="海獭如何觅食")
+    assert created
+    duplicate_result = asyncio.run(agent.run(duplicate["id"], "big_fish"))
+    assert duplicate_result["status"] == "completed"
+    with db.connection() as sql:
+        decision = sql.execute("SELECT reason FROM life_share_decisions WHERE event_id=?",
+                               (duplicate_result["life_event_id"],)).fetchone()
+        assert decision["reason"] == "duplicate_discovery"
+        assert sql.execute("SELECT COUNT(*) FROM life_share_intents WHERE reason='evidence_backed_discovery'").fetchone()[0] == 1
+
+
 def test_empty_search_does_not_create_completed_experience_or_fabricate(tmp_path):
     _, _, repo, agent, run = setup(tmp_path, search=FakeSearch([]))
     result = asyncio.run(agent.run(run["id"], "big_fish"))
@@ -172,6 +265,66 @@ def test_read_failure_and_insufficient_information_are_failed_not_completed(tmp_
     result = asyncio.run(agent.run(run["id"], "big_fish"))
     assert result["status"] == "failed" and result["life_event_id"] is None
     assert any(item["tool_name"] == "read_webpage" and item["outcome"] == "failed" for item in result["evidence"])
+
+
+def test_unrelated_page_body_is_audited_but_cannot_complete_research(tmp_path):
+    _, life, repo, agent, run = setup(
+        tmp_path,
+        search=FakeSearch([SearchResult("海獭觅食研究", "https://example.org/language", "海獭使用工具觅食的研究，语言声音研究")]),
+        reader=FakeReader(text="言语起源研究涉及人类语言形成与演化，语音学关注人类元音与辅音。"),
+    )
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "failed" and result["phase"] == "inconclusive"
+    assert result["error_code"] == "insufficient_evidence"
+    assert result["claims"] == [] and result["unanswered"]
+    assert result["life_event_id"] is None
+    assert result["evidence"][-1]["outcome"] == "success"
+    assert result["evidence"][-1]["page_relevance"] == "irrelevant"
+    next_payload = json.loads(agent.model.calls[1][-1]["content"])
+    assert "read_webpage" not in next_payload["available_actions"]
+    assert next_payload["read_source_evidence_ids"] == [result["evidence"][0]["id"]]
+
+
+def test_autonomy_is_opt_in_bounded_and_persists_cooldown_and_pause(tmp_path):
+    _, life, repo, _, initial_run = setup(tmp_path)
+    now = datetime(2026, 11, 7, 10, tzinfo=UTC)
+    with character_scope("big_fish"):
+        repo.terminate(initial_run["id"], "big_fish", "cancelled", error_code="cancelled_by_user")
+        assert repo.autonomy_preferences("big_fish")["enabled"] is False
+        assert repo.create_autonomous_if_due("big_fish", now=now) == (None, False)
+        repo.set_autonomy_preferences("big_fish", enabled=True)
+        assert repo.create_autonomous_if_due("big_fish", now=now) == (None, False)
+        assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "no_eligible_topic"
+        from app.life_engine import LifeEngine
+        LifeEngine(life).set_preference("big_fish", "music", 1.8, reason="explicit_preference")
+        run, created = repo.create_autonomous_if_due("big_fish", now=now)
+        assert created and run["status"] == "planned"
+        assert run["trigger_mode"] == "autonomous" and run["topic_basis"] == "pending_selection"
+        assert repo.create_autonomous_if_due("big_fish", now=now + timedelta(minutes=1)) == (None, False)
+        assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "active_task"
+        repo.set_autonomy_preferences("big_fish", paused_until=(now + timedelta(days=2)).isoformat())
+        repo.terminate(run["id"], "big_fish", "cancelled", error_code="cancelled_by_user")
+        assert repo.create_autonomous_if_due("big_fish", now=now + timedelta(days=1)) == (None, False)
+        assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "paused"
+        repo.set_autonomy_preferences("big_fish", clear_pause=True, cooldown_hours=48)
+        assert repo.create_autonomous_if_due("big_fish", now=now + timedelta(days=1)) == (None, False)
+        assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "cooldown"
+        next_run, created = repo.create_autonomous_if_due("big_fish", now=now + timedelta(days=3))
+        assert created and next_run["idempotency_key"].startswith("autonomous:")
+
+
+def test_autonomous_topic_candidates_include_unresolved_questions_and_keep_basis(tmp_path):
+    _, life, repo, _, _ = setup(tmp_path)
+    with character_scope("big_fish"):
+        from app.life_engine import LifeEngine
+        LifeEngine(life).set_preference("big_fish", "music", 1.8, reason="explicit_preference")
+        items = life.exploration_candidate_items("big_fish")
+        assert {item["basis"] for item in items} == {"stable_interest"}
+        run, _ = repo.create(character_id="big_fish", idempotency_key="unresolved-0001", requested_topic="鲸鱼声音研究")
+        repo.terminate(run["id"], "big_fish", "failed", error_code="insufficient_evidence",
+                       summary="目前没有取得相关资料。", unanswered=["鲸鱼为什么会唱歌？"])
+        items = life.exploration_candidate_items("big_fish")
+        assert any(item["topic"] == "继续查清：鲸鱼为什么会唱歌？" and item["basis"] == "unresolved_question" for item in items)
 
 
 def test_model_cannot_call_disallowed_tools_or_finish_without_evidence(tmp_path):
@@ -279,7 +432,7 @@ def test_successful_read_on_last_step_without_finish_stays_failed(tmp_path):
                           source_url="https://example.org/whales", title="鲸鱼声音研究", excerpt="摘要", outcome="success")
         repo.add_evidence(run["id"], "big_fish", tool_name="read_webpage", source_url="https://example.org/whales",
                           title="鲸鱼声音研究", retrieved_at="2026-11-06T00:00:00+00:00",
-                          excerpt="受控的已读取网页正文。", outcome="success")
+                          excerpt="鲸鱼歌声以及科学家使用水听器研究鲸鱼声音。", outcome="success", page_relevance="relevant")
         for _ in range(4):
             repo.step(run["id"], "big_fish", model_call=True)
         result = repo.terminate(run["id"], "big_fish", "failed", error_code="step_limit_reached")
@@ -367,13 +520,18 @@ def test_autonomous_agent_can_select_a_previously_confirmed_stable_interest(tmp_
 
     model = InterestModel()
     settings = Settings(model_enabled=False)
+
+    class MusicReader:
+        async def read(self, url):
+            return ReadPage("Music", url, "2026-11-06T00:00:00+00:00", "Music song information from a controlled page.")
+
     agent = ExplorationAgent(repo, life, settings, model=model,
                              search=FakeSearch([SearchResult("Music", "https://example.org/music", "music song reference")]),
-                             reader=FakeReader())
+                             reader=MusicReader())
     result = asyncio.run(agent.run(run["id"], "big_fish"))
     assert result["status"] == "completed"
     assert result["topic_origin"] == "character" and result["selected_topic"] == "music"
-    assert result["step_count"] == 4
+    assert result["step_count"] == 3
 
 
 def test_explicitly_confirmed_saved_interest_is_an_autonomous_topic_candidate(tmp_path):
@@ -439,6 +597,14 @@ def test_manual_exploration_api_runs_agent_and_returns_saved_status(tmp_path, mo
     with TestClient(main.app, base_url="http://127.0.0.1:8001", client=("127.0.0.1", 50000)) as client:
         paired = client.post("/api/auth/session", json={"secret": TEST_PAIRING_SECRET})
         assert paired.status_code == 200
+        autonomy = client.get("/api/characters/big_fish/exploration-autonomy")
+        assert autonomy.status_code == 200 and autonomy.json()["enabled"] is False
+        enabled = client.put("/api/characters/big_fish/exploration-autonomy", json={"enabled": True})
+        assert enabled.status_code == 200 and enabled.json()["enabled"] is True
+        paused = client.put("/api/characters/big_fish/exploration-autonomy", json={"paused_until": "2030-01-02T00:00:00+00:00"})
+        assert paused.status_code == 200 and paused.json()["paused_until"].startswith("2030-01-02")
+        resumed = client.put("/api/characters/big_fish/exploration-autonomy", json={"paused_until": None})
+        assert resumed.status_code == 200 and resumed.json()["paused_until"] is None
         response = client.post("/api/characters/big_fish/explorations", json={"topic": "海獭如何觅食", "idempotency_key": "api-explore-key-001"})
         assert response.status_code == 202
         run_id = response.json()["id"]
@@ -626,11 +792,23 @@ def test_search_relevance_rejects_the_saved_unrelated_wikipedia_pages():
 
 
 def test_search_relevance_accepts_real_topic_terms_in_english_results():
-    from app.web_research import is_search_result_relevant
+    from app.web_research import is_page_relevant, is_search_result_relevant
 
     assert is_search_result_relevant(
         "whale song hydrophone research", "Whale vocalization",
         "Underwater hydrophones record whale songs for scientific research.",
+    )
+    assert not is_search_result_relevant(
+        "鲸鱼 声音 功能 研究 被动声学监测", "言语起源",
+        "在 305 种人类语言研究中讨论声学特征。",
+    )
+    assert not is_page_relevant(
+        "鲸鱼为什么会唱歌？科学家是如何研究鲸鱼声音的？", "鲸鱼声学研究",
+        "本文讨论人类言语起源、元音和辅音，没有鲸类资料。",
+    )
+    assert is_page_relevant(
+        "whale song hydrophone research", "Whale vocalization",
+        "Whale songs are recorded by hydrophones and analyzed by researchers.",
     )
 
 

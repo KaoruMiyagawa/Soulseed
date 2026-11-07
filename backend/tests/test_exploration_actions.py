@@ -78,12 +78,12 @@ def test_real_adapter_json_protocol_completes_controlled_exploration_and_correla
     _, _, repo, agent, run = setup(tmp_path, model=adapter)
     result = asyncio.run(agent.run(run["id"], "big_fish"))
     assert result["status"] == "completed"
-    assert result["model_call_count"] == len(requests) == 3
+    assert result["model_call_count"] == len(requests) == 2
     assert result["tool_call_count"] == 2
     assert len(repo.list_evidence(run["id"], "big_fish")) == 2
     entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert {entry["exploration_run_id"] for entry in entries} == {run["id"]}
-    for step in (1, 2, 3):
+    for step in (1, 2):
         events = [entry for entry in entries if entry["exploration_step"] == step]
         assert {entry["event"] for entry in events} == {"started", "finished", "action_validation"}
         assert len({entry["id"] for entry in events}) == 1

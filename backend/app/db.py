@@ -464,6 +464,31 @@ ALTER TABLE exploration_evidence ADD COLUMN relevance TEXT
     CHECK (relevance IS NULL OR relevance IN ('relevant', 'irrelevant'));
 """
 
+MIGRATIONS[17] = """
+ALTER TABLE exploration_runs ADD COLUMN trigger_mode TEXT NOT NULL DEFAULT 'manual'
+    CHECK (trigger_mode IN ('manual', 'autonomous'));
+ALTER TABLE exploration_runs ADD COLUMN topic_basis TEXT;
+ALTER TABLE exploration_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'planned';
+ALTER TABLE exploration_runs ADD COLUMN timings_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE exploration_evidence ADD COLUMN page_relevance TEXT
+    CHECK (page_relevance IS NULL OR page_relevance IN ('relevant', 'irrelevant'));
+CREATE TABLE exploration_autonomy (
+    character_id TEXT PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    paused_until TEXT,
+    cooldown_hours INTEGER NOT NULL DEFAULT 24 CHECK (cooldown_hours BETWEEN 24 AND 720),
+    last_started_at TEXT,
+    last_run_id TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(last_run_id, character_id) REFERENCES exploration_runs(id, character_id) ON DELETE RESTRICT
+);
+"""
+
+MIGRATIONS[18] = """
+ALTER TABLE exploration_autonomy ADD COLUMN last_checked_at TEXT;
+ALTER TABLE exploration_autonomy ADD COLUMN last_skip_reason TEXT;
+"""
+
 
 class Database:
     def __init__(self, path: str, *, environment: str | None = None,

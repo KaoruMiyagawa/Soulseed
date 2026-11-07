@@ -35,12 +35,22 @@ def test_launcher_discards_inherited_database_and_uses_only_local_model_file(tmp
     assert env["SOULSEED_DATABASE_PATH"] == str(launcher.DATABASE.resolve())
     assert env["SOULSEED_MODEL_API_KEY"] == "fake-local-key"
     assert env["SOULSEED_MODEL_ENABLED"] == "false"
+    assert env["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "false"
     assert "SOULSEED_LOCAL_PAIRING_SECRET" not in env
     frontend = launcher._frontend_environment(env)
     assert frontend["VITE_API_URL"] == "http://127.0.0.1:8001/api"
     assert frontend["VITE_SOULSEED_DEVELOPMENT_MODE"] == "true"
     assert not any(key.upper().startswith("SOULSEED_") for key in frontend)
     assert not (root / "backend" / "data").exists()
+
+
+def test_contact_model_generation_requires_explicit_launcher_opt_in(monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", "C:/fake-appdata")
+    default = launcher._child_environment(model_enabled=True)
+    enabled = launcher._child_environment(model_enabled=True, contact_model_generation_enabled=True)
+    assert default["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "false"
+    assert enabled["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "true"
+    assert enabled["SOULSEED_MODEL_ENABLED"] == "true"
 
 
 @pytest.mark.asyncio

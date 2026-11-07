@@ -48,6 +48,24 @@ async def test_background_loop_advances_without_chat(services):
     assert len(repo.list_events()) == 1
 
 
+@pytest.mark.asyncio
+async def test_life_scheduler_runs_optional_autonomy_hook_on_its_existing_cycle(services):
+    _, repo, _, _ = services
+    calls = []
+    stop = asyncio.Event()
+
+    async def hook():
+        calls.append("checked")
+        stop.set()
+
+    await LifeScheduler(repo, after_tick=hook).run_forever(stop)
+    assert calls == ["checked"]
+    disabled_calls = []
+    disabled = LifeScheduler(repo, enabled=False, after_tick=lambda: disabled_calls.append("unexpected"))
+    await disabled.run_forever(asyncio.Event())
+    assert disabled_calls == []
+
+
 def test_concurrent_advance_creates_one_activity(services):
     _, repo, engine, _ = services
     now = datetime(2026, 11, 2, 5, tzinfo=UTC)

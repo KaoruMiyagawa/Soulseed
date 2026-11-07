@@ -240,7 +240,7 @@ class LifeRepository:
         """Return a bounded, character-scoped snapshot for natural expression."""
         excluded = ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "烦")
         topic_cues = (
-            ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现"), ("research", "exploring")),
+            ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现", "研究经过", "研究过程", "怎么查到", "来源", "出处", "根据什么"), ("research", "exploring")),
             ("reading", ("阅读", "读书", "读的", "书名", "什么书"), ("reading",)),
             ("music", ("音乐", "歌曲", "首歌", "曲名", "旋律"), ("music",)),
             ("meal", ("吃", "饭", "食物", "做菜", "菜"), ("meal", "cooking")),
@@ -273,18 +273,26 @@ class LifeRepository:
                     sources = db.execute(
                         "SELECT id,source_url,title,retrieved_at,excerpt FROM exploration_evidence "
                         "WHERE run_id=(SELECT id FROM exploration_runs WHERE life_event_id=? AND character_id=?) "
-                        "AND tool_name='read_webpage' AND outcome='success' ORDER BY sequence_no LIMIT 4",
+                        "AND tool_name='read_webpage' AND outcome='success' AND page_relevance='relevant' ORDER BY sequence_no LIMIT 4",
                         (event["id"], character_id),
                     ).fetchall()
+                    import json
+                    claims = json.loads(run["claims_json"] or "[]")
+                    if not claims or not sources:
+                        # Keep legacy records untouched in storage, but do not
+                        # present an unsubstantiated historical run as learned knowledge.
+                        event["_omit_from_expression"] = True
+                        continue
                     event["research_result"] = {
                         "summary": run["summary"],
-                        "claims": json.loads(run["claims_json"] or "[]"),
+                        "claims": claims,
                         "unanswered": json.loads(run["unanswered_json"] or "[]"),
                         "sources": [{"evidence_id": source["id"], "url": source["source_url"],
                                      "title": source["title"], "retrieved_at": source["retrieved_at"],
                                      "excerpt": source["excerpt"][:500] if source["excerpt"] else None}
                                     for source in sources],
                     }
+            recent = [event for event in recent if not event.get("_omit_from_expression")]
         today_only = "今天" in query or "今日" in query
         if today_only:
             today = datetime.fromisoformat(local_date).date()
@@ -319,6 +327,10 @@ class LifeRepository:
 
     def exploration_candidates(self, character_id: str = "big_fish", limit: int = 8) -> list[str]:
         """Only interests reinforced by completed character experiences count as candidates."""
+        return [item["topic"] for item in self.exploration_candidate_items(character_id, limit)]
+
+    def exploration_candidate_items(self, character_id: str = "big_fish", limit: int = 8) -> list[dict[str, str]]:
+        """Return attributable stable interests, unfinished questions, and planned goals."""
         with self.database.connection() as db:
             rows = db.execute(
                 "SELECT DISTINCT p.event_type FROM life_preferences p "
@@ -326,11 +338,29 @@ class LifeRepository:
                 "WHERE p.character_id=? AND c.reason IN ('completed_feeling','explicit_preference') "
                 "ORDER BY p.event_type LIMIT ?", (character_id, max(1, min(limit, 12))),
             ).fetchall()
-            candidates = [str(row["event_type"]) for row in rows]
+            candidates = [{"topic": str(row["event_type"]), "basis": "stable_interest"} for row in rows]
             goals = db.execute(
                 "SELECT content FROM life_events WHERE character_id=? AND event_type='goal' "
                 "AND status IN ('completed','planned') ORDER BY created_at DESC LIMIT ?",
                 (character_id, max(1, min(limit, 8))),
             ).fetchall()
-            candidates.extend("目标：" + " ".join(str(row["content"]).split())[:160] for row in goals)
-            return list(dict.fromkeys(candidates))[:limit]
+            candidates.extend({"topic": "目标：" + " ".join(str(row["content"]).split())[:160], "basis": "planned_goal"} for row in goals)
+            open_runs = db.execute(
+                "SELECT requested_topic,selected_topic,unanswered_json,status,error_code FROM exploration_runs "
+                "WHERE character_id=? AND (error_code='insufficient_evidence' OR (status='completed' AND unanswered_json IS NOT NULL)) "
+                "ORDER BY updated_at DESC LIMIT 8", (character_id,),
+            ).fetchall()
+            import json
+            for run in open_runs:
+                topic = run["selected_topic"] or run["requested_topic"]
+                if not topic:
+                    continue
+                questions = json.loads(run["unanswered_json"] or "[]")
+                if not questions and run["error_code"] == "insufficient_evidence":
+                    questions = [topic]
+                candidates.extend({"topic": "继续查清：" + " ".join(str(question).split())[:200], "basis": "unresolved_question"}
+                                  for question in questions if isinstance(question, str) and question.strip())
+            unique = {}
+            for item in candidates:
+                unique.setdefault(item["topic"], item)
+            return list(unique.values())[:limit]

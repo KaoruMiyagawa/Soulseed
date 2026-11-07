@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ApiError, createApiRequest } from "../src/apiRequest.ts";
+import { ApiError, apiErrorMessage, createApiRequest } from "../src/apiRequest.ts";
 
 test("a lost chat response is unknown, sends once and logs no private payload", async (t) => {
   let calls = 0;
@@ -36,4 +36,20 @@ test("session expiry is signalled even if an intermediary returned a non-JSON bo
   const request = createApiRequest("http://127.0.0.1:9/api", () => expired++, () => {});
   await assert.rejects(request("/conversations/fake/messages", { method: "POST" }));
   assert.equal(expired, 1);
+});
+
+test("structured API errors are rendered as safe text, never object coercions", async (t) => {
+  assert.equal(apiErrorMessage({ detail: { code: "no_saved_interest", extra: { token: "secret" } } }, 409), "请求失败（409）");
+  assert.equal(apiErrorMessage({ detail: { message: "没有可用选题依据" } }, 409), "没有可用选题依据");
+  assert.equal(apiErrorMessage({ detail: [{ msg: "主题不能为空", input: "private" }] }, 422), "主题不能为空");
+
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ detail: { code: "internal_error", secret: "do-not-display" } }), { status: 500 }));
+  const request = createApiRequest("http://127.0.0.1:9/api", () => {}, () => {});
+  await assert.rejects(request("/explorations"), error => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.message, "请求失败（500）");
+    assert.equal(error.message.includes("object Object"), false);
+    assert.equal(error.message.includes("do-not-display"), false);
+    return true;
+  });
 });

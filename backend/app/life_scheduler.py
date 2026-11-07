@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Awaitable, Callable
 
 from .life import LifeRepository, _iso
 from .life_engine import LifeEngine
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 class LifeScheduler:
     def __init__(self, repository: LifeRepository, *, enabled: bool = True,
-                 interval: timedelta = timedelta(minutes=30), character_ids: tuple[str, ...] = ("big_fish",), seed: int = 0):
+                 interval: timedelta = timedelta(minutes=30), character_ids: tuple[str, ...] = ("big_fish",), seed: int = 0,
+                 after_tick: Callable[[], Awaitable[None]] | None = None):
         if interval < timedelta(minutes=5):
             raise ValueError("后台生活推进间隔不能短于 5 分钟")
         self.repository = repository
@@ -22,6 +24,7 @@ class LifeScheduler:
         self.interval = interval
         self.character_ids = character_ids
         self.seed = seed
+        self.after_tick = after_tick
 
     def tick(self, *, now: datetime | None = None) -> list[dict]:
         if not self.enabled:
@@ -50,6 +53,7 @@ class LifeScheduler:
             return
         try:
             self.tick()
+            await self._after_tick()
         except Exception:
             logger.exception("后台生活推进失败，将在下个周期重试")
         while not stop.is_set():
@@ -58,5 +62,10 @@ class LifeScheduler:
             except TimeoutError:
                 try:
                     self.tick()
+                    await self._after_tick()
                 except Exception:
                     logger.exception("后台生活推进失败，将在下个周期重试")
+
+    async def _after_tick(self) -> None:
+        if self.after_tick:
+            await self.after_tick()

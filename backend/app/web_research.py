@@ -92,11 +92,55 @@ def is_search_result_relevant(query: str, title: str, snippet: str) -> bool:
         return False
     content = f"{title} {snippet}".casefold()
     traditional_content = content.translate(_SIMPLIFIED_TO_TRADITIONAL)
-    matches = sum(
-        1 for term in terms
+    matches = {
+        term for term in terms
         if term.casefold() in content or term.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
-    )
-    return matches >= (2 if len(terms) >= 3 else 1)
+    }
+    # A result must match a topic noun, not just generic words such as
+    # "research", "sound", or "method". Take anchors from the query itself
+    # so this works across subjects without a topic-specific allowlist.
+    anchors = _topic_anchors(query, terms)
+    if anchors and not any(
+        anchor.casefold() in content
+        or anchor.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
+        for anchor in anchors
+    ):
+        return False
+    threshold = 2 if len(terms) >= 3 else 1
+    return len(matches) >= threshold
+
+
+def is_page_relevant(query: str, title: str, text: str) -> bool:
+    """Check the retrieved page body as well as its title before using it as evidence."""
+    terms = search_query_terms(query)
+    if not terms or not text:
+        return False
+    # A matching headline alone is not evidence: disambiguation, redirects, or
+    # thin pages can have an on-topic title with unrelated body text.
+    content = text[:MAX_PAGE_TEXT_CHARS].casefold()
+    traditional_content = content.translate(_SIMPLIFIED_TO_TRADITIONAL)
+    matches = {
+        term for term in terms
+        if term.casefold() in content or term.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
+    }
+    anchors = _topic_anchors(query, terms)
+    if anchors and not any(
+        anchor.casefold() in content
+        or anchor.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
+        for anchor in anchors
+    ):
+        return False
+    return len(matches) >= (2 if len(terms) >= 3 else 1)
+
+
+def _topic_anchors(query: str, terms: set[str]) -> set[str]:
+    generic = {
+        "研究", "如何", "原因", "方法", "功能", "声音", "聲音", "科学", "科學", "学家", "學家",
+        "介绍", "介紹", "资料", "資料", "相关", "相關", "信息", "資訊", "声音", "声学", "聲學",
+        "study", "research", "method", "methods", "sound", "sounds", "acoustic", "acoustics",
+        "why", "how", "what", "cause", "causes", "scientist", "scientists",
+    }
+    return {term for term in terms if term.casefold() not in generic}
 
 
 def _tag_search_results(query: str, rows: list[SearchResult], provider: str) -> list[SearchResult]:
@@ -588,7 +632,10 @@ class DuckDuckGoSearchProvider:
     """Free, keyless public web search. Network failures are reported as failures."""
 
     def __init__(self, fetcher: PublicHttpFetcher | None = None):
-        self.fetcher = fetcher or PublicHttpFetcher(max_response_bytes=600_000)
+        # DuckDuckGo HTML is the volatile, non-keyed provider. Bound its wait
+        # so a blocked response does not consume almost the whole task budget
+        # before the already configured Wikimedia fallback is tried.
+        self.fetcher = fetcher or PublicHttpFetcher(max_response_bytes=600_000, total_timeout=6)
 
     async def search(self, query: str) -> list[SearchResult]:
         if not isinstance(query, str) or not 3 <= len(query.strip()) <= 240:

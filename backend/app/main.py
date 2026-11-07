@@ -101,6 +101,12 @@ class StartExplorationRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class ExplorationAutonomyRequest(BaseModel):
+    enabled: bool | None = None
+    paused_until: datetime | None = None
+    cooldown_hours: int | None = Field(default=None, ge=24, le=720)
+
+
 settings = get_settings()
 allowed_origins = set(ALLOWED_ORIGINS)
 if settings.environment == "testing" and settings.test_frontend_origin:
@@ -212,12 +218,13 @@ async def lifespan(_: FastAPI):
                     MemoryCorrectionService(database),
                 ).recover_after_restart()
         scheduler = LifeScheduler(life_repository, enabled=settings.life_background_enabled,
-                                  interval=timedelta(minutes=settings.life_background_interval_minutes))
+                                  interval=timedelta(minutes=settings.life_background_interval_minutes),
+                                  after_tick=_autonomous_exploration_tick)
         if scheduler.enabled:
             tasks.append(asyncio.create_task(scheduler.run_forever(stop)))
         if settings.contact_enabled and settings.contact_background_enabled:
             tasks.append(asyncio.create_task(ContactScheduler(
-                ContactService(life_repository, enabled=settings.contact_enabled),
+                ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled),
                 interval=timedelta(minutes=settings.contact_check_interval_minutes),
             ).run_forever(stop)))
         tasks.append(asyncio.create_task(runtime.run_heartbeat(stop)))
@@ -301,7 +308,7 @@ async def time_chat_request(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(allowed_origins),
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     allow_credentials=True,
     expose_headers=["X-Request-ID", "Server-Timing"],
@@ -369,15 +376,58 @@ def _launch_exploration(run_id: str, character_id: str) -> None:
     task.add_done_callback(clear)
 
 
+async def _autonomous_exploration_tick() -> None:
+    if not settings.exploration_enabled:
+        return
+    with database.connection() as db:
+        character_ids = [row[0] for row in db.execute("SELECT character_id FROM exploration_autonomy WHERE enabled=1")]
+    for character_id in character_ids:
+        with character_scope(character_id):
+            run, created = exploration_repository.create_autonomous_if_due(character_id)
+            if created and run:
+                logger.info("autonomous_exploration_started run_id=%s character_id=%s", run["id"], character_id)
+                _launch_exploration(run["id"], character_id)
+
+
 @app.post("/api/characters/{character_id}/explorations", status_code=202)
 async def start_exploration(character_id: str, request: StartExplorationRequest) -> dict:
     topic = " ".join(request.topic.split()) if request.topic else None
-    run, created = exploration_repository.create(character_id=character_id,
-                                                 idempotency_key=request.idempotency_key,
-                                                 requested_topic=topic)
+    try:
+        run, created = exploration_repository.create(character_id=character_id,
+                                                     idempotency_key=request.idempotency_key,
+                                                     requested_topic=topic,
+                                                     enforce_single_active=True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if run["status"] == "planned":
         _launch_exploration(run["id"], character_id)
     return {**run, "created": created}
+
+
+@app.get("/api/characters/{character_id}/exploration-autonomy")
+def get_exploration_autonomy(character_id: str) -> dict:
+    result = exploration_repository.autonomy_preferences(character_id)
+    with database.connection() as db:
+        active = db.execute("SELECT * FROM exploration_runs WHERE character_id=? AND status IN ('planned','active') ORDER BY created_at LIMIT 1", (character_id,)).fetchone()
+        latest = db.execute("SELECT * FROM exploration_runs WHERE character_id=? ORDER BY created_at DESC LIMIT 1", (character_id,)).fetchone()
+    result["current"] = exploration_repository.get(active["id"], character_id) if active else None
+    result["latest"] = exploration_repository.get(latest["id"], character_id) if latest else None
+    return result
+
+
+@app.put("/api/characters/{character_id}/exploration-autonomy")
+def set_exploration_autonomy(character_id: str, request: ExplorationAutonomyRequest) -> dict:
+    fields = request.model_fields_set
+    try:
+        return exploration_repository.set_autonomy_preferences(
+            character_id,
+            enabled=request.enabled if "enabled" in fields else None,
+            paused_until=request.paused_until.isoformat() if request.paused_until else None,
+            clear_pause="paused_until" in fields and request.paused_until is None,
+            cooldown_hours=request.cooldown_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/characters/{character_id}/explorations")
@@ -409,7 +459,7 @@ async def cancel_exploration(character_id: str, run_id: str) -> dict:
 
 
 def current_contact_service() -> ContactService:
-    return ContactService(life_repository, enabled=settings.contact_enabled)
+    return ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled)
 
 
 @app.get("/api/characters/{character_id}/contact/preferences")

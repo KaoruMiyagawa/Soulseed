@@ -41,7 +41,7 @@ NORMAL_OUTPUT_YUAN_PER_M = 8.0
 
 sys.path.insert(0, str(BACKEND_ROOT))
 from app.config import validate_test_database_path  # noqa: E402
-from app.contact import AdapterContactGenerator, ContactService, SafeContactGenerator  # noqa: E402
+from app.contact import AdapterContactGenerator, ContactService  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.expression import ExpressionContextBuilder  # noqa: E402
 from app.life import LifeRepository  # noqa: E402
@@ -174,6 +174,22 @@ class LegacyContactGenerator:
             {"role": "system", "content": f"写一条简短、自然、无催促的站内主动消息。依据：{source}。不要编造经历、施压或索要回复。"},
             {"role": "user", "content": f"主题：{intent['topic']}；是否提醒：{reminder}"},
         ])
+
+
+class BaselineSafeContactGenerator:
+    """Reproduce the historical canned reply only inside the fictional A/B baseline."""
+
+    async def generate(self, intent: dict, *, reminder: bool = False) -> str:
+        topic = (intent.get("topic") or "").strip()
+        if not topic:
+            raise ValueError("联系意图缺少可表达的内容")
+        if reminder:
+            return f"之前提到的「{topic}」还在。等你方便时再看就好。"
+        if intent["source"] == "life_share":
+            return f"有件小事想和你分享：{topic}。"
+        if intent["source"] == "reminder":
+            return f"想轻轻提醒你一下「{topic}」。等你方便时再看就好。"
+        return f"之前你提到「{topic}」，我还想继续听听。你有空再说也好。"
 
 
 def clone_database(source: Database, root: Path, name: str) -> Database:
@@ -333,7 +349,7 @@ def main() -> int:
                         adapter = model or DryCaptureModel()
                         service = prepare_contact_branch(db, root, variant, adapter, persona)
                         if not args.execute and variant == "old":
-                            reference = asyncio.run(SafeContactGenerator().generate(service.list_intents()[0]))
+                            reference = asyncio.run(BaselineSafeContactGenerator().generate(service.list_intents()[0]))
                             print(f"old_deployed_safe_reference_sha256={hashlib.sha256(reference.encode('utf-8')).hexdigest()[:16]}")
                         ready = asyncio.run(service.tick(now=FIXED_NOW))
                         if not ready or ready["status"] != "ready":

@@ -31,7 +31,8 @@ def _ensure_free(port: int) -> None:
             raise RuntimeError(f"127.0.0.1:{port} 已被占用；未启动或停止任何服务。") from exc
 
 
-def _child_environment(*, model_enabled: bool = True) -> dict[str, str]:
+def _child_environment(*, model_enabled: bool = True,
+                       contact_model_generation_enabled: bool = False) -> dict[str, str]:
     # The parent process, including an old SOULSEED_DATABASE_PATH, is never
     # allowed to override this launcher's fixed database target.
     env = {key: value for key, value in os.environ.items()
@@ -51,7 +52,7 @@ def _child_environment(*, model_enabled: bool = True) -> dict[str, str]:
         "SOULSEED_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "model-requests.jsonl"),
         "SOULSEED_EXPLORATION_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "exploration-model-requests.jsonl"),
         "SOULSEED_CHAT_TIMING_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "chat-timings.jsonl"),
-        "SOULSEED_CONTACT_MODEL_GENERATION_ENABLED": "false",
+        "SOULSEED_CONTACT_MODEL_GENERATION_ENABLED": "true" if contact_model_generation_enabled else "false",
         "VITE_API_URL": f"http://127.0.0.1:{BACKEND_PORT}/api",
         "VITE_SOULSEED_DEVELOPMENT_MODE": "true",
     })
@@ -71,12 +72,13 @@ def _preflight(env: dict[str, str], python: Path) -> str:
     if not env.get("SOULSEED_MODEL_API_KEY"):
         raise RuntimeError("项目 .env 缺少 SOULSEED_MODEL_API_KEY；未启动开发服务。")
     code = (
-        "from app.config import get_settings, DEVELOPMENT_DATABASE_PATH; "
+        "import os; from app.config import get_settings, DEVELOPMENT_DATABASE_PATH; "
         "from pathlib import Path; s=get_settings(); "
         "assert s.environment=='development'; "
         "assert Path(s.database_path).resolve()==DEVELOPMENT_DATABASE_PATH.resolve(); "
         "assert s.model_api_key and s.model_base_url and s.model_name; "
         "assert s.local_pairing_secret is None; "
+        "assert s.contact_model_generation_enabled == (os.environ.get('SOULSEED_CONTACT_MODEL_GENERATION_ENABLED') == 'true'); "
         "assert s.development_frontend_origin=='http://127.0.0.1:5174'; "
         "from app.build_info import BUILD_ID; print(BUILD_ID)"
     )
@@ -103,9 +105,14 @@ def _stop(children: list[subprocess.Popen]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-off", action="store_true", help="disable all paid model requests for this run")
+    parser.add_argument("--contact-model-generation", action="store_true",
+                        help="explicitly allow model-generated proactive messages; may incur model usage")
     args = parser.parse_args()
+    if args.model_off and args.contact_model_generation:
+        raise RuntimeError("--contact-model-generation 需要启用模型；请移除 --model-off 并确认愿意承担模型调用。")
     python = ROOT / ".venv" / "Scripts" / "python.exe"
-    env = _child_environment(model_enabled=not args.model_off)
+    env = _child_environment(model_enabled=not args.model_off,
+                             contact_model_generation_enabled=args.contact_model_generation)
     build_id = _preflight(env, python)
     frontend_env = _frontend_environment(env)
     node = shutil.which("node")
@@ -116,7 +123,8 @@ def main() -> int:
     print(f"开发代码标识 build_id={build_id}；启动后可与 /api/health 的 build_id 对照。", flush=True)
     model_state = "已关闭" if args.model_off else "已启用"
     print(f"模型{model_state}；每次最多 1024 输出 Token，每 UTC 日最多 20 次请求；调用记录位于本机 LOCALAPPDATA/Soulseed/development。", flush=True)
-    print("自主探索仅由用户手动触发；每任务最多 4 次决策请求、每 UTC 日最多 8 次探索请求、每次最多 512 输出 Token，调用记录单独保存。", flush=True)
+    print(f"主动消息模型表达{'已显式开启' if args.contact_model_generation else '默认关闭'}；只有已有联系规则批准的消息才会调用。", flush=True)
+    print("后台自主探索默认关闭；可在 5174 开启。仅后端运行时按 LifeScheduler 检查，默认最多每 24 小时一次；每任务最多 4 次决策请求、每 UTC 日最多 8 次探索请求、每次最多 512 输出 Token，调用记录单独保存。", flush=True)
     children: list[subprocess.Popen] = []
     try:
         children.append(subprocess.Popen(

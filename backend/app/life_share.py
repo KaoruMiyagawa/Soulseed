@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import UTC, datetime, timedelta
 from html import escape
 from uuid import uuid4
@@ -10,9 +12,22 @@ from .life import LifeRepository, _iso
 
 
 class LifeShareService:
-    def __init__(self, repository: LifeRepository, *, minimum_gap: timedelta = timedelta(hours=6)):
+    def __init__(self, repository: LifeRepository, *, minimum_gap: timedelta = timedelta(hours=6),
+                 discovery_gap: timedelta = timedelta(hours=24)):
         self.repository = repository
         self.minimum_gap = minimum_gap
+        self.discovery_gap = discovery_gap
+
+    @staticmethod
+    def _claim_fingerprints(claims: list[dict]) -> set[str]:
+        result = set()
+        for claim in claims:
+            if not isinstance(claim, dict) or claim.get("kind") != "sourced":
+                continue
+            value = re.sub(r"[^\w]", "", str(claim.get("text", "")).casefold())
+            if len(value) >= 12:
+                result.add(value)
+        return result
 
     @staticmethod
     def relevant_chat(query: str) -> bool:
@@ -37,8 +52,94 @@ class LifeShareService:
             kind = event["event_type"]
             pref = db.execute("SELECT weight FROM life_preferences WHERE character_id = ? AND event_type = ?", (event["character_id"], kind)).fetchone()
             liked = bool(pref and pref[0] >= 1.25)
-            worthy = kind == "exploring" or kind == "cooking" and positive or kind in ("music", "reading") and positive and liked
-            reason = "interesting_discovery" if kind == "exploring" else "positive_preferred_activity" if worthy else "ordinary_activity"
+            evidence_backed_research = False
+            sourced_claims: list[dict] = []
+            if kind == "research":
+                run = db.execute(
+                    "SELECT id, summary, claims_json FROM exploration_runs WHERE life_event_id=? AND character_id=? AND status='completed'",
+                    (event_id, event["character_id"]),
+                ).fetchone()
+                if run:
+                    try:
+                        claims = json.loads(run["claims_json"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        claims = []
+                    relevant_sources = db.execute(
+                        "SELECT id FROM exploration_evidence WHERE run_id=? AND character_id=? AND tool_name='read_webpage' AND outcome='success' AND page_relevance='relevant' AND excerpt IS NOT NULL",
+                        (run["id"], event["character_id"]),
+                    ).fetchall()
+                    verified_ids = {source["id"] for source in relevant_sources}
+                    sourced_claims = [
+                        claim for claim in claims if isinstance(claim, dict)
+                        and claim.get("kind") == "sourced"
+                        and isinstance(claim.get("source_ids"), list)
+                        and claim.get("source_ids")
+                        and all(isinstance(source_id, str) for source_id in claim["source_ids"])
+                        and set(claim["source_ids"]) <= verified_ids
+                    ]
+                    evidence_backed_research = bool(sourced_claims)
+                    research_summary = (run["summary"] or "").strip()
+                    share_worthy_research = evidence_backed_research and (
+                        len(sourced_claims) >= 2 or len(research_summary) >= 90
+                    )
+                else:
+                    share_worthy_research = False
+            else:
+                share_worthy_research = False
+            discovery_skip = None
+            if share_worthy_research:
+                fingerprints = self._claim_fingerprints(sourced_claims)
+                previous = db.execute(
+                    "SELECT r.claims_json FROM life_share_intents s "
+                    "JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id "
+                    "JOIN exploration_runs r ON r.life_event_id=e.id AND r.character_id=e.character_id "
+                    "WHERE s.character_id=? AND s.reason='evidence_backed_discovery'",
+                    (event["character_id"],),
+                ).fetchall()
+                duplicate = False
+                for prior in previous:
+                    try:
+                        prior_claims = json.loads(prior["claims_json"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        prior_claims = []
+                    if fingerprints & self._claim_fingerprints(prior_claims):
+                        duplicate = True
+                        break
+                if duplicate:
+                    discovery_skip = "duplicate_discovery"
+                elif db.execute(
+                    "SELECT 1 FROM life_share_intents WHERE character_id=? AND status='pending' "
+                    "AND reason='evidence_backed_discovery' LIMIT 1", (event["character_id"],),
+                ).fetchone():
+                    discovery_skip = "discovery_already_pending"
+                else:
+                    last_discovery = db.execute(
+                        "SELECT created_at FROM life_share_intents WHERE character_id=? "
+                        "AND reason='evidence_backed_discovery' ORDER BY created_at DESC LIMIT 1",
+                        (event["character_id"],),
+                    ).fetchone()
+                    if last_discovery and datetime.fromisoformat(at) - datetime.fromisoformat(last_discovery[0]) < self.discovery_gap:
+                        discovery_skip = "discovery_frequency_limit"
+            # LifeEngine's rule_engine "exploring" rows are simulated activities,
+            # not evidence that the character actually researched or discovered anything.
+            worthy = (
+                share_worthy_research
+                or kind == "exploring" and event["generation_method"] != "rule_engine"
+                or kind == "cooking" and positive
+                or kind in ("music", "reading") and positive and liked
+            )
+            reason = (
+                "evidence_backed_discovery" if share_worthy_research and not discovery_skip
+                else discovery_skip if discovery_skip
+                else "not_share_worthy_discovery" if kind == "research" and evidence_backed_research
+                else "not_evidence_backed_research" if kind == "research"
+                else "interesting_discovery" if kind == "exploring" and worthy
+                else "simulated_activity_not_research" if kind == "exploring"
+                else "positive_preferred_activity" if worthy
+                else "ordinary_activity"
+            )
+            if discovery_skip:
+                worthy = False
             last = db.execute("SELECT created_at FROM life_share_intents WHERE character_id = ? ORDER BY created_at DESC LIMIT 1", (event["character_id"],)).fetchone()
             if worthy and last and datetime.fromisoformat(at) - datetime.fromisoformat(last[0]) < self.minimum_gap:
                 worthy, reason = False, "frequency_limit"
@@ -81,7 +182,7 @@ class LifeShareService:
         with self.repository.database.connection() as db:
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT i.id, e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method FROM life_share_intents i JOIN life_events e ON e.id = i.event_id AND e.character_id=i.character_id WHERE i.character_id = ? AND i.status = 'pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after <= ?) AND (i.selection_token IS NULL OR i.selection_expires_at <= ?) AND e.status='completed' AND e.activity_status='completed' ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
+            row = db.execute("SELECT i.id, e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method FROM life_share_intents i JOIN life_events e ON e.id = i.event_id AND e.character_id=i.character_id WHERE i.character_id = ? AND i.status = 'pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after <= ?) AND (i.selection_token IS NULL OR i.selection_expires_at <= ?) AND e.status='completed' AND e.activity_status='completed' AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine') ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
             if not row:
                 return None
             changed = db.execute("UPDATE life_share_intents SET selection_token=?, selection_expires_at=? WHERE id=? AND status='pending' AND (selection_token IS NULL OR selection_expires_at <= ?)", (token, _iso(current + timedelta(minutes=10)), row["id"], at)).rowcount
@@ -109,7 +210,7 @@ class LifeShareService:
             return ""
         at = _iso(now)
         with self.repository.database.connection() as db:
-            row = db.execute("SELECT e.content, e.occurred_at FROM life_share_intents i JOIN life_events e ON e.id=i.event_id AND e.character_id=i.character_id WHERE i.character_id=? AND i.status='pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after<=?) AND (i.selection_token IS NULL OR i.selection_expires_at<=?) AND e.status='completed' AND e.activity_status='completed' ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
+            row = db.execute("SELECT e.content, e.occurred_at FROM life_share_intents i JOIN life_events e ON e.id=i.event_id AND e.character_id=i.character_id WHERE i.character_id=? AND i.status='pending' AND (i.delivery_channel IS NULL OR i.delivery_channel='chat') AND (i.chat_retry_after IS NULL OR i.chat_retry_after<=?) AND (i.selection_token IS NULL OR i.selection_expires_at<=?) AND e.status='completed' AND e.activity_status='completed' AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine') ORDER BY i.created_at LIMIT 1", (character_id, at, at)).fetchone()
         return self._chat_context(dict(row)) if row else ""
 
     def transition(self, intent_id: str, target: str, *, character_id: str = "big_fish", now: datetime | None = None) -> dict:

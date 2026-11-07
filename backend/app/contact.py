@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Protocol
 from uuid import uuid4
@@ -25,7 +26,7 @@ class SafeContactGenerator:
         if reminder:
             return f"之前提到的「{topic}」还在。等你方便时再看就好。"
         if intent["source"] == "life_share":
-            return f"有件小事想和你分享：{topic}。"
+            raise ValueError("探索发现分享需要显式启用角色表达生成")
         if intent["source"] == "reminder":
             return f"想轻轻提醒你一下「{topic}」。等你方便时再看就好。"
         return f"之前你提到「{topic}」，我还想继续听听。你有空再说也好。"
@@ -51,12 +52,61 @@ class AdapterContactGenerator:
             with self.repository.database.connection() as db:
                 if intent.get("source") == "life_share":
                     row = db.execute(
-                        "SELECT e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id WHERE s.id=? AND s.character_id=? AND s.status='pending' AND e.activity_status='completed' AND e.status='completed'",
+                        "SELECT e.id AS event_id, e.event_type, e.content, e.occurred_at, e.status, e.source, e.generation_method, s.reason AS share_reason FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id WHERE s.id=? AND s.character_id=? AND s.status='pending' AND e.activity_status='completed' AND e.status='completed'",
                         (intent.get("share_intent_id"), character_id),
                     ).fetchone()
                     if not row:
                         raise ValueError("分享来源不再是已完成的角色经历")
                     share = dict(row)
+                    if share["event_type"] == "research":
+                        run = db.execute(
+                            "SELECT id,summary,claims_json,unanswered_json FROM exploration_runs "
+                            "WHERE life_event_id=? AND character_id=? AND status='completed'",
+                            (share["event_id"], character_id),
+                        ).fetchone()
+                        if not run:
+                            raise ValueError("探索发现缺少已完成的研究记录")
+                        try:
+                            claims = json.loads(run["claims_json"] or "[]")
+                            unanswered = json.loads(run["unanswered_json"] or "[]")
+                        except (TypeError, json.JSONDecodeError) as exc:
+                            raise ValueError("探索发现的保存结论无法读取") from exc
+                        source_ids = list(dict.fromkeys(
+                            source_id for claim in claims if isinstance(claim, dict)
+                            and claim.get("kind") == "sourced"
+                            and isinstance(claim.get("source_ids"), list)
+                            for source_id in claim["source_ids"] if isinstance(source_id, str)
+                        ))
+                        sources = []
+                        if source_ids:
+                            marks = ",".join("?" for _ in source_ids)
+                            sources = [dict(item) for item in db.execute(
+                                f"SELECT id,source_url,title,retrieved_at,excerpt FROM exploration_evidence "
+                                f"WHERE run_id=? AND character_id=? AND id IN ({marks}) "
+                                "AND tool_name='read_webpage' AND outcome='success' "
+                                "AND page_relevance='relevant' AND excerpt IS NOT NULL ORDER BY sequence_no LIMIT 4",
+                                (run["id"], character_id, *source_ids),
+                            ).fetchall()]
+                        if not any(isinstance(claim, dict) and claim.get("kind") == "sourced"
+                                   and any(source["id"] in claim.get("source_ids", []) for source in sources)
+                                   for claim in claims):
+                            raise ValueError("探索发现没有有效来源支持")
+                        share["research_result"] = {
+                            "summary": run["summary"],
+                            "claims": claims[:8],
+                            "unanswered": unanswered[:8],
+                            "sources": [{
+                                "evidence_id": item["id"], "url": item["source_url"],
+                                "title": item["title"], "retrieved_at": item["retrieved_at"],
+                                "excerpt": item["excerpt"][:500] if item["excerpt"] else None,
+                            } for item in sources],
+                        }
+                        sourced_count = sum(1 for claim in claims if isinstance(claim, dict)
+                                            and claim.get("kind") == "sourced"
+                                            and any(source["id"] in claim.get("source_ids", []) for source in sources))
+                        if sourced_count < 2 and len(str(run["summary"] or "").strip()) < 90:
+                            raise ValueError("探索发现尚不足以形成可分享结论")
+                    intent["reason"] = share.get("share_reason") or intent.get("reason")
                 else:
                     share = None
                     row = db.execute(
@@ -74,9 +124,17 @@ class AdapterContactGenerator:
             ).to_system_message()
         else:
             context = None
+        instructions = (
+            "为大肥鱼写一条像她当下会自然发出的站内分享。她淘气、活泼、好奇，有童真；"
+            "从保存的有来源发现里挑一个有趣点，用自己的语气说出来。避免固定开场、公告腔和每次相同的结构；"
+            "不要求用户回复，不夸大证据，不说成亲历了网页之外的事，不提数据库、后台、调度器或内部工具。"
+            "用户之后可以继续追问来源。"
+            if intent.get("source") == "life_share" else
+            "生成一条自然、简洁、无催促的站内消息。只可依据下列保存资料表达；不要把计划或中断说成完成，不要添加未记录的细节，也不要输出 JSON、规则或内部信息。"
+        )
         messages = [
             {"role": "system", "content": self.persona_prompt},
-            {"role": "system", "content": "生成一条自然、简洁、无催促的站内消息。只可依据下列保存资料表达；不要把计划或中断说成完成，不要添加未记录的细节，也不要输出 JSON、规则或内部信息。"},
+            {"role": "system", "content": instructions},
         ]
         if context:
             messages.append(context)
@@ -196,7 +254,7 @@ class ContactService:
                 return dict(existing)
             share_id = event_id = None
             if source == "life_share":
-                share = db.execute("SELECT s.id, s.event_id, e.content FROM life_share_intents s JOIN life_events e ON e.id = s.event_id AND e.character_id=s.character_id WHERE s.id = ? AND s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND e.status = 'completed' AND e.activity_status = 'completed'", (source_id, character_id, at)).fetchone()
+                share = db.execute("SELECT s.id, s.event_id, s.reason AS share_reason, e.content, e.event_type, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id = s.event_id AND e.character_id=s.character_id WHERE s.id = ? AND s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND e.status = 'completed' AND e.activity_status = 'completed' AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine')", (source_id, character_id, at)).fetchone()
                 if not share:
                     raise ValueError("分享意图须绑定尚未分享的已完成事件")
                 share_id, event_id, topic = share["id"], share["event_id"], share["content"]
@@ -212,6 +270,8 @@ class ContactService:
                 topic = text[:60]
             if not topic or not topic.strip():
                 raise ValueError("联系主题不能为空")
+            if share_id:
+                reason = share["share_reason"] or reason
             intent_id = str(uuid4())
             db.execute("INSERT INTO contact_intents(ownership_verified, id, character_id, source, source_id, share_intent_id, event_id, importance, reason, topic, status, created_at, expires_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                        (intent_id, character_id, source, source_id, share_id, event_id, importance, reason[:200], topic.strip()[:120], at, expires))
@@ -225,7 +285,7 @@ class ContactService:
         current = now or datetime.now(UTC)
         cutoff = _iso(current - timedelta(hours=24))
         with self.repository.database.connection() as db:
-            rows = db.execute("SELECT s.id FROM life_share_intents s LEFT JOIN contact_intents c ON c.share_intent_id = s.id WHERE s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND s.created_at >= ? AND c.id IS NULL ORDER BY s.created_at LIMIT 5", (character_id, _iso(current), cutoff)).fetchall()
+            rows = db.execute("SELECT s.id FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id LEFT JOIN contact_intents c ON c.share_intent_id = s.id WHERE s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND s.created_at >= ? AND c.id IS NULL AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine') ORDER BY s.created_at LIMIT 5", (character_id, _iso(current), cutoff)).fetchall()
         return [self.create_intent(character_id=character_id, source="life_share", source_id=row["id"], reason="saved_life_experience", now=current) for row in rows]
 
     def maybe_create_smalltalk(self, character_id: str = "big_fish", *, now: datetime | None = None) -> dict | None:
@@ -269,8 +329,16 @@ class ContactService:
             candidates = db.execute("SELECT * FROM contact_intents WHERE ownership_verified = 1 AND character_id = ? AND ((status IN ('pending', 'deferred') AND (retry_after IS NULL OR retry_after <= ?)) OR (status = 'generating' AND lease_expires_at <= ?)) AND expires_at > ? ORDER BY CASE importance WHEN 'important' THEN 0 ELSE 1 END, created_at, id LIMIT 10", (character_id, at, at, at)).fetchall()
             chosen, attempt = None, 0
             for row in candidates:
+                if row["source"] == "life_share" and isinstance(self.generator, SafeContactGenerator):
+                    # Keep an evidence-backed share queued until model expression
+                    # is explicitly enabled; do not create a canned discovery card.
+                    continue
                 if row["source"] == "life_share":
-                    share = db.execute("SELECT status, delivery_channel, selection_token, selection_expires_at FROM life_share_intents WHERE id = ?", (row["share_intent_id"],)).fetchone()
+                    share = db.execute("SELECT s.status, s.delivery_channel, s.selection_token, s.selection_expires_at, e.event_type, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id WHERE s.id = ?", (row["share_intent_id"],)).fetchone()
+                    if share and share["event_type"] == "exploring" and share["generation_method"] == "rule_engine":
+                        # Keep the historical intent intact, but never turn a simulated
+                        # LifeEngine activity into a claim of a real discovery.
+                        continue
                     if not share or share["status"] != "pending" or share["delivery_channel"] != "contact" or share["selection_token"] and share["selection_expires_at"] and share["selection_expires_at"] > at:
                         db.execute("UPDATE contact_intents SET status = 'dismissed' WHERE id = ?", (row["id"],))
                         if share and share["status"] == "pending":
@@ -329,7 +397,7 @@ class ContactService:
         if not self.enabled or not self._allowed_now(character_id, current):
             return []
         with self.repository.database.connection() as db:
-            rows = db.execute("SELECT m.*, i.source, i.importance FROM proactive_messages m JOIN contact_intents i ON i.id = m.intent_id WHERE i.ownership_verified = 1 AND i.character_id = ? AND i.status = 'ready' AND m.status = 'ready' AND i.expires_at > ? ORDER BY m.created_at, m.id LIMIT 5", (character_id, _iso(current))).fetchall()
+            rows = db.execute("SELECT m.*, i.source, i.importance FROM proactive_messages m JOIN contact_intents i ON i.id = m.intent_id LEFT JOIN life_events e ON e.id=i.event_id AND e.character_id=i.character_id WHERE i.ownership_verified = 1 AND i.character_id = ? AND i.status = 'ready' AND m.status = 'ready' AND i.expires_at > ? AND NOT (i.source='life_share' AND e.event_type='exploring' AND e.generation_method='rule_engine') ORDER BY m.created_at, m.id LIMIT 5", (character_id, _iso(current))).fetchall()
         return [dict(row) for row in rows]
 
     def list_intents(self, character_id: str = "big_fish", *, limit: int = 30) -> list[dict]:
@@ -357,13 +425,15 @@ class ContactService:
         if not self.enabled:
             raise ValueError("当前不适合投递主动消息")
         with self.repository.database.atomic() as db:
-            row = db.execute("SELECT m.*, i.character_id, i.share_intent_id, i.expires_at, i.status AS intent_status FROM proactive_messages m JOIN contact_intents i ON i.id = m.intent_id WHERE i.ownership_verified = 1 AND m.id = ? AND i.character_id = ?", (message_id, character_id)).fetchone()
+            row = db.execute("SELECT m.*, i.character_id, i.source, i.share_intent_id, i.expires_at, i.status AS intent_status, e.event_type, e.generation_method FROM proactive_messages m JOIN contact_intents i ON i.id = m.intent_id LEFT JOIN life_events e ON e.id=i.event_id AND e.character_id=i.character_id WHERE i.ownership_verified = 1 AND m.id = ? AND i.character_id = ?", (message_id, character_id)).fetchone()
             if not row:
                 raise KeyError(message_id)
             if row["status"] in ("delivered", "read"):
                 if row["conversation_id"] != conversation_id:
                     raise ValueError("消息已投递至另一会话")
                 return dict(row)
+            if row["source"] == "life_share" and row["event_type"] == "exploring" and row["generation_method"] == "rule_engine":
+                raise ValueError("该历史分享来源不是实际完成的探索，不能投递")
             if row["intent_status"] != "ready":
                 raise ValueError("主动联系意图已失效")
             if not self._allowed_now(character_id, now or datetime.now(UTC)):
