@@ -298,7 +298,8 @@ function App({ characterId }: { characterId: string }) {
         </div>
 
         <section className="room-stage" aria-label="大肥鱼的生活世界">
-          <div className="room-art-slot"><span className="art-slot-mark" aria-hidden="true">✧</span><p className="art-slot-title">大肥鱼的生活世界</p><p className="art-slot-note">角色与房间插画待接入</p></div>
+          <div className="room-art-slot"><span className="art-slot-note">生活世界场景素材待接入</span></div>
+          <div className="character-crop"><img src="/assets/characters/big-fish-turnaround.jpg" alt="大肥鱼正面形象：蓝色长发与眼睛、带鲸鱼徽记的蓝白女仆装和深蓝色鱼尾。" draggable={false} /></div>
           <div className="scene-caption"><span>DA FEIYU’S LIVING WORLD</span><strong>大肥鱼的生活世界</strong><small>探索 · 发现 · 记录 · 一起成长</small></div>
           <button className="scene-action" type="button" onClick={() => setView("chat")} aria-label="与大肥鱼对话">↗</button>
         </section>
