@@ -16,7 +16,8 @@ from .model_adapter import (ActionModelReply, ModelConfigurationError, ModelRequ
                             ModelDailyQuotaExhausted, ModelQuotaUnavailable, OpenAICompatibleAdapter)
 from .ownership import character_scope
 from .web_research import (FallbackSearchProvider, SafeWebPageReader, WebResearchError,
-                           is_page_relevant_to_topic, is_search_result_relevant_to_topic)
+                           is_page_relevant_to_topic, is_search_result_relevant_to_topic,
+                           search_query_terms, search_result_read_priority)
 
 logger = logging.getLogger("soulseed.exploration")
 
@@ -162,7 +163,11 @@ class ExplorationAgent:
                             # One model-selected query can fetch its best safe, relevant page
                             # before the next model decision. This keeps the evidence-driven
                             # continue/finish decision while avoiding a needless read_webpage turn.
-                            best_source = next((item for item in observation.get("results", []) if item.get("relevant") and item.get("evidence_id")), None)
+                            target = run.get("selected_topic") or run.get("requested_topic") or ""
+                            approved = [item for item in observation.get("results", [])
+                                        if item.get("relevant") and item.get("evidence_id")]
+                            best_source = max(approved, key=lambda item: search_result_read_priority(
+                                target, query, item["title"], item["snippet"]), default=None)
                             if best_source and calls < self.settings.exploration_max_tool_calls:
                                 await self._read_source(run_id, character_id, best_source["evidence_id"], started, calls)
                                 calls += 1
@@ -269,6 +274,8 @@ class ExplorationAgent:
                 remaining_tool_calls = max(0, self.settings.exploration_max_tool_calls - tool_calls_used)
                 if not successful_reads and remaining_tool_calls == 0:
                     raise ExplorationError("tool_call_limit_reached")
+                if not searched_queries and not successful_reads and remaining_tool_calls < 2:
+                    raise ExplorationError("tool_call_limit_reached")
                 if not successful_reads and remaining_steps == 0:
                     raise ExplorationError("step_limit_reached")
                 selection_required = run["topic_origin"] == "character" and not run.get("selected_topic") and step == 0
@@ -279,9 +286,15 @@ class ExplorationAgent:
                 elif not selection_required and unread_relevant_results and remaining_tool_calls and remaining_steps >= 1:
                     # Keep one model step after a successful read for source-checked conclusion.
                     available_actions.append("read_webpage")
-                if not selection_required and remaining_tool_calls and remaining_steps >= 2:
-                    # A new search must leave room for reading a result and finishing.
+                if (not selection_required and remaining_tool_calls >= 2 and remaining_steps >= 1
+                        and len(searched_queries) < 2):
+                    # Search and its automatic read share one model decision.
+                    # Reserve two tool calls and one later decision for finish.
                     available_actions.append("search_web")
+                required_query_language = (
+                    "en" if searched_queries and self._uses_cjk(searched_queries[-1])
+                    and not successful_reads else None
+                )
                 payload = {
                     "task": {"requested_topic": run.get("requested_topic"), "selected_topic": run.get("selected_topic"), "topic_origin": run["topic_origin"]},
                     "saved_interest_candidates": [item["topic"] for item in candidates] if run["topic_origin"] == "character" else [],
@@ -300,6 +313,13 @@ class ExplorationAgent:
                         "successful_page_read_count": len(successful_reads),
                     },
                     "available_actions": available_actions,
+                    "search_strategy": {
+                        "required_query_language": required_query_language,
+                        "reason": "chinese_search_without_verified_body" if required_query_language else None,
+                        "searches_remaining": max(0, 2 - len(searched_queries)),
+                        "automatic_read": True,
+                        "tool_calls_required_for_search_and_read": 2,
+                    },
                     "search_history": searched_queries,
                     "read_evidence_ids": read_evidence_ids,
                     "read_source_evidence_ids": sorted(attempted_source_ids),
@@ -341,6 +361,15 @@ class ExplorationAgent:
                     shape["action"] = action["action"]
                     self._audit_action(reply, run["id"], step + 1, "action_not_available", shape)
                     raise ExplorationError("action_not_available")
+                if action["action"] == "search_web" and required_query_language == "en":
+                    query = action["query"].strip()
+                    fingerprint = ("search", " ".join(query.casefold().split()))
+                    if fingerprint in self._seen(run["id"]):
+                        raise ExplorationError("repeated_tool_call")
+                    latin_terms = {term for term in search_query_terms(query) if term.isascii() and term.isalpha()}
+                    if self._uses_cjk(query) or len(latin_terms) < 2:
+                        self._audit_action(reply, run["id"], step + 1, "search_query_language_required", shape)
+                        raise ExplorationError("search_query_language_required")
                 self.repository.record_timing(run["id"], character_id, "evaluation", int((time.monotonic() - evaluation_started) * 1000))
                 self._audit_action(reply, run["id"], step + 1, None, shape)
                 yield action
@@ -531,6 +560,9 @@ class ExplorationAgent:
             "角色自主探索时只能从提供的已保存兴趣候选中选 topic。完成选题后使用 search_web 查询，"
             "只能用搜索结果中的 evidence_id 调用 read_webpage。每轮请求会给出当前步数、剩余步骤、"
             "工具调用预算、已有证据、搜索历史和 available_actions；只能选择 available_actions 中的动作。"
+            "search_strategy 是服务端约束：required_query_language=en 时，若选择搜索，query 必须是原主题的英文等价表达，"
+            "不含汉字且至少两个英文检索词；仍可用空 claims 结束并说明资料不足。每任务最多两次搜索。"
+            "search_web 会在同一步自动读取最相关的获准候选，需两次工具预算；之后保留一次决策生成结论。"
             "先检查已有搜索结果，主题相关时优先阅读其 evidence_id。搜索为空或结果明显无关时，"
             "只在剩余步骤足以完成阅读和结论时进行一次聚焦的新搜索；不要重复 search_history 中的查询，"
             "若中文查询没有找到相关来源，下一次搜索应尝试对原主题的英文等价表达；已有英文查询时可反向尝试中文。"

@@ -1,6 +1,7 @@
 """Search parsing/relevance regressions and an isolated search->read->evidence loop."""
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -117,7 +118,7 @@ def test_cross_language_search_fallback_reads_sources_and_finishes_with_evidence
                             "Humpback whale songs form structured sequences. Researchers study whale song and social communication.")
 
     model = Model()
-    _, life, repo, agent, run = setup(tmp_path, model=model)
+    _, life, repo, agent, run = setup(tmp_path, model=model, topic=WHALE_TOPIC)
     agent.search = FallbackSearchProvider(Challenged(), ChineseIndex(), EnglishIndex())
     agent.reader = Reader()
     result = asyncio.run(agent.run(run["id"], "big_fish"))
@@ -149,3 +150,172 @@ def test_search_failure_never_creates_a_discovery_or_share_intent(tmp_path):
     assert result["status"] == "failed" and result["life_event_id"] is None
     assert result["error_code"] == "insufficient_evidence"
     assert LifeShareService(life).list_intents() == []
+
+
+def saved_search_trace():
+    return json.loads((Path(__file__).parent / "fixtures" / "exploration_search_relevance_trace.json").read_text(encoding="utf-8"))
+
+
+def test_saved_false_positive_and_single_character_bridges_are_rejected():
+    trace = saved_search_trace()
+    candidate = trace["false_positive"]
+    assert not is_search_result_relevant_to_topic(
+        trace["topic"], trace["actions"][1]["query"], candidate["title"], candidate["snippet"])
+    assert not is_search_result_relevant_to_topic(
+        "海獭如何使用工具", "海盗 游戏 道具", "海盗游戏道具", "海盗游戏中的道具与角色技能。")
+    assert not is_search_result_relevant_to_topic(
+        "鲸鱼为什么需要唱歌？", "鲸鱼 唱歌 原因", "音乐游戏", "游戏角色需要唱歌才能升级。")
+    assert is_search_result_relevant_to_topic(
+        "海豚为什么跃出海面", "海豚 跃水 群体交流", "海豚跃水",
+        "海豚跃出海面可与群体交流有关，研究比较了海豚跃水行为。")
+
+
+class StrategyModel:
+    def __init__(self, *, retry_query="whale song humpback communication research", invalid_citation=False,
+                 first_query=WHALE_QUERY):
+        self.payloads = []
+        self.retry_query = retry_query
+        self.invalid_citation = invalid_citation
+        self.first_query = first_query
+
+    async def reply(self, messages):
+        payload = json.loads(messages[-1]["content"])
+        self.payloads.append(payload)
+        if not payload["observations"]:
+            return json.dumps({"action": "search_web", "query": self.first_query}, ensure_ascii=False)
+        last = payload["observations"][-1]
+        if last["tool"] == "read_webpage" and last["status"] == "ok":
+            source_id = last["source_evidence_id"] if self.invalid_citation else last["evidence_id"]
+            return json.dumps({"action": "finish", "summary": "已获得关于鲸类歌声的资料。",
+                               "claims": [{"text": "座头鲸发出有组织的歌声。", "kind": "sourced",
+                                           "source_ids": [source_id]}], "unanswered": []}, ensure_ascii=False)
+        if len(payload["search_history"]) == 1 and "search_web" in payload["available_actions"]:
+            return json.dumps({"action": "search_web", "query": self.retry_query}, ensure_ascii=False)
+        return json.dumps({"action": "finish", "summary": "没有足够相关正文。", "claims": [],
+                           "unanswered": ["需要相关正文资料"]}, ensure_ascii=False)
+
+
+class StrategySearch:
+    def __init__(self, first_results=None, failure=None, first_error=None):
+        self.queries = []
+        self.first_results = first_results or []
+        self.failure = failure
+        self.first_error = first_error
+
+    async def search(self, query):
+        self.queries.append(query)
+        if self.failure:
+            raise WebResearchError("search_unavailable", "controlled unavailable")
+        if len(self.queries) == 1:
+            if self.first_error:
+                raise WebResearchError(self.first_error, "controlled first failure")
+            return self.first_results
+        return [SearchResult("Whale vocalization", "https://en.wikipedia.org/wiki/Whale_vocalization",
+                             "Humpback whale songs are used in courtship and social communication.", "wikimedia_en", True)]
+
+
+class StrategyReader:
+    def __init__(self, *, reject_all=False):
+        self.urls = []
+        self.reject_all = reject_all
+
+    async def read(self, url):
+        self.urls.append(url)
+        text = ("Human speech and language origins concern gestures and human communication."
+                if self.reject_all or not url.startswith("https://en.wikipedia.org/") else
+                "Humpback whale song has structured sequences used in social communication. Researchers record whale songs with hydrophones.")
+        return ReadPage("Whale vocalization", url, "2030-01-01T00:00:00+00:00", text)
+
+
+@pytest.mark.parametrize("first_error", [None, "search_unavailable"])
+def test_chinese_empty_search_switches_to_english_reads_and_finishes_in_three_decisions(tmp_path, first_error):
+    first_query = saved_search_trace()["actions"][0]["query"]
+    model = StrategyModel(first_query=first_query)
+    search, reader = StrategySearch(first_error=first_error), StrategyReader()
+    _, _, _, agent, run = setup(tmp_path, model=model, search=search, reader=reader,
+                                topic=WHALE_TOPIC, exploration_max_steps=3)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "completed"
+    assert result["model_call_count"] == 3 and result["tool_call_count"] == 3
+    assert search.queries == [first_query, model.retry_query]
+    second = model.payloads[1]
+    assert second["search_strategy"]["required_query_language"] == "en"
+    assert second["progress"]["remaining_steps_after_this"] == 1
+    assert "search_web" in second["available_actions"]
+    body = next(item for item in result["evidence"] if item["tool_name"] == "read_webpage")
+    assert body["page_relevance"] == "relevant"
+    assert result["claims"][0]["source_ids"] == [body["id"]]
+    assert reader.urls == ["https://en.wikipedia.org/wiki/Whale_vocalization"]
+
+
+def test_saved_anime_candidate_is_never_automatically_read_and_english_retry_succeeds(tmp_path):
+    row = saved_search_trace()["false_positive"]
+    bad = SearchResult(row["title"], row["url"], row["snippet"], "wikimedia_zh", True)
+    model, search, reader = StrategyModel(), StrategySearch([bad]), StrategyReader()
+    _, _, _, agent, run = setup(tmp_path, model=model, search=search, reader=reader, topic=WHALE_TOPIC)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "completed"
+    assert result["evidence"][0]["relevance"] == "irrelevant"
+    assert row["url"] not in reader.urls
+    assert result["model_call_count"] == 3 and result["tool_call_count"] == 3
+
+
+@pytest.mark.parametrize("retry", ["为什么鲸鱼需要唱歌？", "whale song 鲸鱼", "research"])
+def test_server_rejects_non_english_retry_before_another_tool_call(tmp_path, retry):
+    model, search = StrategyModel(retry_query=retry), StrategySearch()
+    _, life, _, agent, run = setup(tmp_path, model=model, search=search, topic=WHALE_TOPIC)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["error_code"] == "search_query_language_required"
+    assert result["model_call_count"] == 2 and result["tool_call_count"] == 1
+    assert len(search.queries) == 1 and result["life_event_id"] is None
+    assert LifeShareService(life).list_intents() == []
+
+
+def test_unrelated_chinese_body_can_retry_english_within_four_tool_calls(tmp_path):
+    candidate = SearchResult("鲸歌", "https://example.org/chinese", "鲸歌的功能与座头鲸求偶和群体交流有关。")
+    model, search, reader = StrategyModel(), StrategySearch([candidate]), StrategyReader()
+    _, _, _, agent, run = setup(tmp_path, model=model, search=search, reader=reader, topic=WHALE_TOPIC)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "completed"
+    assert result["model_call_count"] == 3 and result["tool_call_count"] == 4
+    bodies = [item for item in result["evidence"] if item["tool_name"] == "read_webpage"]
+    assert [item["page_relevance"] for item in bodies] == ["irrelevant", "relevant"]
+    assert result["claims"][0]["source_ids"] == [bodies[1]["id"]]
+
+
+@pytest.mark.parametrize("failure", ["unrelated_body", "search_unavailable", "invalid_citation"])
+def test_retry_failures_do_not_create_discovery_or_share(tmp_path, failure):
+    model = StrategyModel(invalid_citation=failure == "invalid_citation")
+    search = StrategySearch(failure=failure == "search_unavailable")
+    reader = StrategyReader(reject_all=failure == "unrelated_body")
+    _, life, _, agent, run = setup(tmp_path, model=model, search=search, reader=reader, topic=WHALE_TOPIC)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "failed" and result["life_event_id"] is None
+    assert result["model_call_count"] <= 4 and result["tool_call_count"] <= 4
+    assert LifeShareService(life).list_intents() == []
+
+
+def test_retry_requires_both_search_and_read_tool_budget(tmp_path):
+    model, search = StrategyModel(), StrategySearch()
+    _, _, _, agent, run = setup(tmp_path, model=model, search=search, topic=WHALE_TOPIC,
+                                exploration_max_tool_calls=2)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["error_code"] == "insufficient_evidence" and result["tool_call_count"] == 1
+    assert "search_web" not in model.payloads[1]["available_actions"]
+
+
+def test_automatic_read_prefers_subject_focused_title_over_broad_first_result(tmp_path):
+    broad = SearchResult("哺乳动物", "https://example.org/broad", WHALE_EXCERPT)
+    focused = SearchResult("鲸歌", "https://en.wikipedia.org/wiki/Whale_vocalization", "座头鲸的鲸歌可用于求偶及群体交流。")
+    class ChineseReader(StrategyReader):
+        async def read(self, url):
+            self.urls.append(url)
+            return ReadPage("鲸歌", url, "2030-01-01T00:00:00+00:00", WHALE_EXCERPT)
+    model, reader = StrategyModel(), ChineseReader()
+    search = StrategySearch([broad, focused])
+    _, _, _, agent, run = setup(tmp_path, model=model, search=search, reader=reader, topic=WHALE_TOPIC,
+                                exploration_max_steps=2)
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "completed" and len(search.queries) == 1
+    assert result["model_call_count"] == 2 and result["tool_call_count"] == 2
+    assert reader.urls == [focused.url]

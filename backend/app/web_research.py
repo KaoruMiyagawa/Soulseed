@@ -16,7 +16,7 @@ import certifi
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 
 MAX_REDIRECTS = 3
@@ -29,6 +29,8 @@ TOTAL_FETCH_TIMEOUT_SECONDS = 15
 MAX_RESPONSE_HEADERS_BYTES = 32_768
 RESEARCH_USER_AGENT = "SoulseedResearchBot/1.0 (https://github.com/KaoruMiyagawa/Soulseed)"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+MEDIAWIKI_DOMAINS = {"en.wikipedia.org", "zh.wikipedia.org"}
+MEDIAWIKI_EXTRACT_MAX_CHARS = MAX_PAGE_TEXT_CHARS
 DOH_SERVER = "cloudflare-dns.com"
 DOH_SERVER_IP = ipaddress.ip_address("1.1.1.1")
 logger = logging.getLogger("soulseed.web_research")
@@ -59,7 +61,7 @@ class SearchResult:
 
 
 _LATIN_STOPWORDS = {"the", "and", "for", "with", "from", "what", "why", "how", "does", "are"}
-_CJK_STOP_TERMS = ("为什么", "为何", "科学家", "如何", "怎样", "怎么", "什么", "原因", "方法", "研究", "介绍", "请问")
+_CJK_STOP_TERMS = ("为什么", "为何", "科学家", "如何", "怎样", "怎么", "什么", "原因", "方法", "研究", "介绍", "请问", "需要", "是否", "能否", "关于", "有关")
 _CJK_STOP_BIGRAMS = {"为什么", "为何", "科学", "学家", "如何", "怎样", "怎么", "什么", "原因", "方法", "研究", "介绍", "请问"}
 _SIMPLIFIED_TO_TRADITIONAL = str.maketrans({
     "鲸": "鯨", "鱼": "魚", "声": "聲", "学": "學", "国": "國", "体": "體",
@@ -102,7 +104,7 @@ def is_search_result_relevant(query: str, title: str, snippet: str) -> bool:
     # A result must match a topic noun, not just generic words such as
     # "research", "sound", or "method". Take anchors from the query itself
     # so this works across subjects without a topic-specific allowlist.
-    anchors = _topic_anchors(query, terms)
+    anchors = _focus_anchors(query, terms)
     if anchors and not any(
         anchor.casefold() in content
         or anchor.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
@@ -110,6 +112,10 @@ def is_search_result_relevant(query: str, title: str, snippet: str) -> bool:
     ):
         return False
     threshold = 2 if len(terms) >= 3 else 1
+    # A passing reference in a snippet needs an additional signal. A focused
+    # title can support short queries such as a subject plus one predicate.
+    if len(terms) > 1 and not _contains_anchor(title, anchors):
+        threshold = max(2, threshold)
     return len(matches) >= threshold
 
 
@@ -126,7 +132,7 @@ def is_page_relevant(query: str, title: str, text: str) -> bool:
         term for term in terms
         if term.casefold() in content or term.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
     }
-    anchors = _topic_anchors(query, terms)
+    anchors = _focus_anchors(query, terms)
     if anchors and not any(
         anchor.casefold() in content
         or anchor.translate(_SIMPLIFIED_TO_TRADITIONAL).casefold() in traditional_content
@@ -141,6 +147,37 @@ def _cjk_anchor_characters(query: str) -> set[str]:
     generic = set("的了是和与及为因怎何如什么研究科学方法功能声相关资料信息介绍")
     return {char for term in _topic_anchors(query, terms) for char in term
             if "\u3400" <= char <= "\u9fff" and char not in generic}
+
+
+def _contains_anchor(content: str, anchors: set[str]) -> bool:
+    content = content.casefold().translate(_SIMPLIFIED_TO_TRADITIONAL)
+    return any(anchor.casefold().translate(_SIMPLIFIED_TO_TRADITIONAL) in content
+               for anchor in anchors)
+
+
+def _focus_anchors(query: str, terms: set[str]) -> set[str]:
+    """Keep the query's subject mandatory instead of accepting any matched verb."""
+    anchors = _topic_anchors(query, terms)
+    separators = (*_CJK_STOP_TERMS, "通过", "使用", "发出", "进行", "可以", "能够", "应该", "的", "会")
+    parts = re.split("|".join(re.escape(value) for value in separators), query.casefold())
+    for part in parts:
+        for token in re.findall(r"[a-z0-9]+|[\u3400-\u9fff]+", part):
+            candidates = search_query_terms(token) & anchors
+            if candidates:
+                # The leading subject signal is more specific than bigrams
+                # crossing from a subject into a predicate or question word.
+                leading = token[:2] if re.fullmatch(r"[\u3400-\u9fff]+", token) else token
+                return {leading} if leading in candidates else candidates
+    return anchors
+
+
+def search_result_read_priority(topic: str, query: str, title: str, snippet: str) -> tuple[int, int]:
+    """Prefer a subject-focused headline among already approved candidates."""
+    title_focus = any(_contains_anchor(title, _focus_anchors(value, search_query_terms(value)))
+                      for value in (topic, query))
+    content = f"{title} {snippet}"
+    matches = sum(_contains_anchor(content, {term}) for term in search_query_terms(query))
+    return int(title_focus), matches
 
 
 def _related_query_match(topic: str, query: str, title: str, text: str,
@@ -160,8 +197,15 @@ def _related_query_match(topic: str, query: str, title: str, text: str,
         return True
     if topic_cjk and query_cjk:
         shared = _cjk_anchor_characters(topic) & _cjk_anchor_characters(query)
-        content = f"{title} {text}"
-        return any(char in content for char in shared)
+        # Synonymous Chinese reformulations may share characters across words,
+        # but one shared character cannot establish the subject relationship.
+        content = text if matcher is is_page_relevant else f"{title} {text}"
+        normalized = content.translate(_SIMPLIFIED_TO_TRADITIONAL)
+        query_focus = _focus_anchors(query, search_query_terms(query))
+        return any(
+            len(set(anchor) & shared) >= 2 and _contains_anchor(normalized, {anchor})
+            for anchor in query_focus
+        )
     return False
 
 
@@ -204,6 +248,53 @@ class ReadPage:
     url: str
     retrieved_at: str
     text: str
+
+
+def _mediawiki_extract_url(article_url: str) -> str | None:
+    """Build a bounded official extract request for a canonical public article URL."""
+    parsed = urlsplit(article_url)
+    host = (parsed.hostname or "").casefold()
+    if (parsed.scheme != "https" or host not in MEDIAWIKI_DOMAINS
+            or parsed.port not in {None, 443} or parsed.query):
+        return None
+    prefix = "/wiki/"
+    if not parsed.path.startswith(prefix):
+        return None
+    title = unquote(parsed.path[len(prefix):]).replace("_", " ").strip()
+    if not title or len(title) > 300 or any(ord(char) < 32 or ord(char) == 127 for char in title):
+        return None
+    params = urlencode({
+        "action": "query", "format": "json", "formatversion": "2",
+        "prop": "extracts", "explaintext": "1", "exchars": str(MEDIAWIKI_EXTRACT_MAX_CHARS),
+        "redirects": "1", "titles": title,
+    })
+    return f"https://{host}/w/api.php?{params}"
+
+
+def _parse_mediawiki_extract(response: HttpResponse, article_url: str, max_chars: int) -> ReadPage:
+    parsed = urlsplit(response.url)
+    if ((parsed.hostname or "").casefold() not in MEDIAWIKI_DOMAINS
+            or parsed.path != "/w/api.php"):
+        raise WebResearchError("mediawiki_api_unavailable", "百科正文接口跳转到了未授权的来源")
+    if "application/json" not in response.headers.get("content-type", "").casefold():
+        raise WebResearchError("mediawiki_api_invalid", "百科正文接口返回格式无效")
+    if len(response.body) > MAX_RESPONSE_BYTES:
+        raise WebResearchError("response_too_large", "百科正文接口响应超过大小限制")
+    try:
+        payload = json.loads(response.body)
+        pages = payload["query"]["pages"]
+        page = next((item for item in pages if isinstance(item, dict) and "missing" not in item), None)
+        title = page.get("title") if page else None
+        extract = page.get("extract") if page else None
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, StopIteration) as exc:
+        raise WebResearchError("mediawiki_api_invalid", "百科正文接口返回格式无效") from exc
+    if not isinstance(title, str) or not isinstance(extract, str):
+        raise WebResearchError("insufficient_page_text", "百科正文接口没有返回可读文章内容")
+    text = " ".join(extract.split())[:max_chars]
+    if len(text) < 40:
+        raise WebResearchError("insufficient_page_text", "百科文章没有足够的可读正文")
+    return ReadPage(title=title[:240], url=article_url,
+                    retrieved_at=datetime.now(UTC).isoformat(), text=text)
 
 
 class PublicHttpFetcher:
@@ -394,8 +485,14 @@ class PublicHttpFetcher:
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
                 reader, writer = await self._open_pinned(address, port, use_tls, host)
-        except (OSError, TimeoutError, ssl.SSLError) as exc:
-            raise WebResearchError("connect_failed", "无法连接目标网页") from exc
+        except WebResearchError:
+            raise
+        except ssl.SSLError as exc:
+            raise WebResearchError("tls_handshake_failed", "网页 TLS 握手或证书验证失败") from exc
+        except (OSError, TimeoutError) as exc:
+            if self.proxy is not None:
+                raise WebResearchError("proxy_connection_failed", "无法连接本机 HTTP 代理") from exc
+            raise WebResearchError("connect_failed", "无法建立到公网网页的连接") from exc
 
         try:
             path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
@@ -459,7 +556,10 @@ class PublicHttpFetcher:
             )
 
         proxy_host, proxy_port = self.proxy
-        reader, writer = await self.opener(proxy_host, proxy_port)
+        try:
+            reader, writer = await self.opener(proxy_host, proxy_port)
+        except (OSError, TimeoutError) as exc:
+            raise WebResearchError("proxy_connection_failed", "无法连接本机 HTTP 代理") from exc
         target = f"[{address}]" if address.version == 6 else str(address)
         try:
             writer.write(
@@ -817,7 +917,18 @@ class SafeWebPageReader:
         self.max_text_chars = max(500, min(max_text_chars, MAX_PAGE_TEXT_CHARS))
 
     async def read(self, url: str) -> ReadPage:
-        response = await self.fetcher.fetch(url)
+        article_url = PublicHttpFetcher._validate_url_syntax(url)
+        try:
+            response = await self.fetcher.fetch(article_url)
+        except WebResearchError as exc:
+            api_url = _mediawiki_extract_url(article_url) if exc.code == "response_too_large" else None
+            if api_url is None:
+                raise
+            # The direct page remains capped at MAX_RESPONSE_BYTES. Only a
+            # verified English/Chinese Wikipedia article may use its public,
+            # bounded plain-text extract API as a size fallback.
+            response = await self.fetcher.fetch(api_url, accept="application/json")
+            return _parse_mediawiki_extract(response, article_url, self.max_text_chars)
         source = _decode_body(response)
         content_type = response.headers.get("content-type", "").casefold()
         if "text/plain" in content_type:

@@ -106,7 +106,7 @@ class FakeReader:
         return ReadPage("海獭的觅食行为", url, "2026-11-06T00:00:00+00:00", self.text)
 
 
-def setup(tmp_path, *, model=None, search=None, reader=None, **settings_update):
+def setup(tmp_path, *, model=None, search=None, reader=None, topic="海獭如何觅食", **settings_update):
     db = Database(str(tmp_path / "exploration-isolated.db"))
     db.initialize()
     life = LifeRepository(db)
@@ -116,7 +116,7 @@ def setup(tmp_path, *, model=None, search=None, reader=None, **settings_update):
                              search=search or FakeSearch([SearchResult("海獭", "https://example.org/otters", "海獭使用石头" )]),
                              reader=reader or FakeReader())
     with character_scope("big_fish"):
-        run, created = repo.create(character_id="big_fish", idempotency_key="explore-key-0001", requested_topic="海獭如何觅食")
+        run, created = repo.create(character_id="big_fish", idempotency_key="explore-key-0001", requested_topic=topic)
     assert created
     return db, life, repo, agent, run
 
@@ -344,7 +344,7 @@ def test_step_and_tool_budgets_are_hard_limits(tmp_path, settings, expected):
     assert result["status"] == "failed" and result["error_code"] == expected
 
 
-def test_saved_whale_step_limit_trace_is_stopped_before_unbudgeted_searches(tmp_path):
+def test_saved_whale_step_limit_trace_is_stopped_before_repeated_chinese_search(tmp_path):
     from pathlib import Path
 
     trace = json.loads((Path(__file__).parent / "fixtures" / "exploration_step_limit_trace.json").read_text(encoding="utf-8"))
@@ -369,20 +369,18 @@ def test_saved_whale_step_limit_trace_is_stopped_before_unbudgeted_searches(tmp_
     _, _, repo, agent, run = setup(tmp_path, model=model, search=search)
     result = asyncio.run(agent.run(run["id"], "big_fish"))
 
-    assert result["status"] == "failed" and result["error_code"] == "action_not_available"
-    assert result["model_call_count"] == 3
-    assert result["tool_call_count"] == 2
-    assert [row["tool_name"] for row in result["evidence"]] == ["search_web", "search_web", "search_web"]
-    assert [row["outcome"] for row in result["evidence"]] == ["empty", "success", "success"]
-    assert search.queries == [step["query"] for step in trace["steps"][:2]]
-    last_payload = json.loads(model.calls[2][-1]["content"])
-    assert last_payload["progress"]["current_step"] == 3
-    assert last_payload["progress"]["remaining_steps_after_this"] == 1
+    assert result["status"] == "failed" and result["error_code"] == "search_query_language_required"
+    assert result["model_call_count"] == 2
+    assert result["tool_call_count"] == 1
+    assert [row["tool_name"] for row in result["evidence"]] == ["search_web"]
+    assert [row["outcome"] for row in result["evidence"]] == ["empty"]
+    assert search.queries == [trace["steps"][0]["query"]]
+    last_payload = json.loads(model.calls[1][-1]["content"])
+    assert last_payload["progress"]["current_step"] == 2
+    assert last_payload["progress"]["remaining_steps_after_this"] == 2
     assert last_payload["progress"]["successful_search_result_count"] == 0
-    assert last_payload["progress"]["irrelevant_search_result_count"] == 2
-    assert [item["relevance"] for item in result["evidence"][1:]] == ["irrelevant", "irrelevant"]
-    assert last_payload["search_history"] == [step["query"] for step in trace["steps"][:2]]
-    assert "search_web" not in last_payload["available_actions"]
+    assert last_payload["search_strategy"]["required_query_language"] == "en"
+    assert last_payload["search_history"] == [trace["steps"][0]["query"]]
     assert not any(row["tool_name"] == "read_webpage" for row in result["evidence"])
     assert result["life_event_id"] is None
 
