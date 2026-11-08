@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, date
+from threading import RLock
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -20,11 +21,24 @@ class ModelConfigurationError(RuntimeError):
     pass
 
 
+class ModelDailyQuotaExhausted(ModelConfigurationError):
+    pass
+
+
+class ModelQuotaUnavailable(ModelConfigurationError):
+    pass
+
+
+_reservation_lock = RLock()
+
+
 class ModelRequestError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502, *, message_saved: bool = True):
+    def __init__(self, message: str, status_code: int = 502, *, message_saved: bool = True,
+                 code: str = "model_provider_error"):
         super().__init__(message)
         self.status_code = status_code
         self.message_saved = message_saved
+        self.code = code
 
 
 class ModelTimeoutError(ModelRequestError):
@@ -34,7 +48,8 @@ class ModelTimeoutError(ModelRequestError):
                   "deadline": "模型请求超过后端总等待时限"}
         self.kind = kind
         super().__init__(labels.get(kind, "模型请求超时") + "；当前消息已保存，但没有完整回复。"
-                         "系统未自动重试，请勿原样重复提交。上游是否已计费未知。", status_code=504)
+                         "系统未自动重试，请勿原样重复提交。上游是否已计费未知。", status_code=504,
+                         code="model_timeout")
 
 
 class StructuredOutputError(RuntimeError):
@@ -89,9 +104,11 @@ class ActionModelReply:
 
 
 class OpenAICompatibleAdapter:
-    def __init__(self, settings: Settings, client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient):
+    def __init__(self, settings: Settings, client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
+                 *, clock: Callable[[], datetime] | None = None):
         self.settings = settings
         self.client_factory = client_factory
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     async def reply(self, messages: list[dict[str, str]]) -> str:
         content = await self._request_content(messages)
@@ -214,6 +231,14 @@ class OpenAICompatibleAdapter:
         started = perf_counter()
         async def headers_received(_response):
             metrics["response_headers_ms"] = round((perf_counter() - started) * 1000, 3)
+        async def request_started(_request):
+            if request_id and request_context and request_context.get("exploration_run_id"):
+                # Runs inside client.post: an HTTP attempt, not proof of receipt/billing.
+                try:
+                    self._append_log({"event": "http_started", "at": self.clock().isoformat(),
+                                      "id": request_id, **request_context})
+                except OSError as exc:
+                    raise ModelQuotaUnavailable("无法持久记录探索请求，已暂停探索。") from exc
         def record(status, response=None):
             metrics["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
             self._record_result(request_id, status, response, metrics=metrics)
@@ -222,7 +247,7 @@ class OpenAICompatibleAdapter:
             with measure("model_http"):
                 async with asyncio.timeout(self.settings.model_timeout_seconds), self.client_factory(
                     timeout=self.settings.model_timeout_seconds, trust_env=self.settings.model_trust_env,
-                    event_hooks={"response": [headers_received]},
+                    event_hooks={"request": [request_started], "response": [headers_received]},
                 ) as client:
                     body = {"model": self.settings.model_name, "messages": messages}
                     if self.settings.model_max_output_tokens is not None:
@@ -244,7 +269,7 @@ class OpenAICompatibleAdapter:
             raise ModelTimeoutError("deadline") from exc
         except httpx.RequestError as exc:
             record("network_error")
-            raise ModelRequestError("无法连接硅基流动模型服务，请检查网络或稍后重试。") from exc
+            raise ModelRequestError("无法连接硅基流动模型服务，请检查网络或稍后重试。", code="model_network_error") from exc
         record(f"http_{response.status_code}", response)
         if response.is_error:
             status = response.status_code
@@ -259,7 +284,7 @@ class OpenAICompatibleAdapter:
             if status == 404:
                 raise ModelRequestError(f"硅基流动找不到模型 {self.settings.model_name}，请核对模型 ID。", status_code=502)
             if status == 429:
-                raise ModelRequestError("硅基流动请求受到限流或额度限制，请检查账户余额、配额和速率限制。", status_code=429)
+                raise ModelRequestError("硅基流动请求受到限流或额度限制，请检查账户余额、配额和速率限制。", status_code=429, code="model_provider_rate_limited")
             if status in (500, 502, 503, 504):
                 raise ModelRequestError(f"硅基流动服务返回 HTTP {status}；当前消息已保存但未获得回复，系统未自动重试。", status_code=502)
             raise ModelRequestError(f"硅基流动模型请求失败（HTTP {status}）。", status_code=502)
@@ -323,34 +348,111 @@ class OpenAICompatibleAdapter:
         target.parent.mkdir(parents=True, exist_ok=True)
         # The local instance lock allows one backend process for this database.
         # A started reservation is never refunded, including after a crash.
-        with target.open("a", encoding="utf-8") as log:
+        with _reservation_lock, target.open("a", encoding="utf-8") as log:
             log.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
             log.flush()
             os.fsync(log.fileno())
 
+    def _quota_records(self) -> list[dict]:
+        """Read only, fail closed: an absent/corrupt ledger is not an empty ledger."""
+        path = self.settings.model_request_log_path
+        if not path:
+            raise ModelQuotaUnavailable("探索额度记录未配置，已暂停探索。")
+        try:
+            with Path(path).expanduser().open("r", encoding="utf-8") as log:
+                rows = [json.loads(line) for line in log if line.strip()]
+            ids = set()
+            for row in rows:
+                if not isinstance(row, dict) or row.get("event") not in {"started", "finished", "action_validation", "http_started"}:
+                    raise ValueError("invalid ledger record")
+                if not isinstance(row.get("id"), str) or not row["id"]:
+                    raise ValueError("missing request id")
+                if row["event"] == "started":
+                    if date.fromisoformat(row["day"]).isoformat() != row["day"]:
+                        raise ValueError("invalid reservation day")
+                    if row["id"] in ids:
+                        raise ValueError("duplicate reservation")
+                    ids.add(row["id"])
+                elif row["id"] not in ids:
+                    raise ValueError("orphaned request record")
+            return rows
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ModelQuotaUnavailable("无法可靠读取探索额度记录，已暂停探索。") from exc
+
+    def quota_snapshot(self, *, now: datetime | None = None) -> dict:
+        current = (now or self.clock()).astimezone(UTC)
+        reset = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        result = {"limit": self.settings.model_daily_request_limit, "used": None,
+                  "remaining": None, "resets_at": reset.isoformat(), "day": current.date().isoformat(),
+                  "available": False, "reason": "exploration_quota_unavailable"}
+        with _reservation_lock:
+            try:
+                rows = self._quota_records()
+            except ModelQuotaUnavailable:
+                return result
+            limit = result["limit"]
+            if limit is None:
+                return result
+            used = sum(row["event"] == "started" and row.get("day") == result["day"] for row in rows)
+            result.update(used=used, remaining=max(0, limit - used), available=used < limit,
+                          reason=None if used < limit else "exploration_daily_quota_exhausted")
+        return result
+
+    def request_diagnostics(self, run_id: str) -> dict:
+        result = {"reservations": None, "http_attempts": None, "http_attempts_complete": False,
+                  "provider_receipt": "unknown", "provider_billing": "unknown"}
+        with _reservation_lock:
+            try:
+                rows = [row for row in self._quota_records() if row.get("exploration_run_id") == run_id]
+            except ModelQuotaUnavailable:
+                return result
+        reserved = {row["id"] for row in rows if row["event"] == "started"}
+        marked = {row["id"] for row in rows if row["event"] == "http_started"}
+        # Historical HTTP responses prove an attempt, but a missing finish record
+        # cannot establish whether a legacy reservation reached the transport.
+        proven = marked | {row["id"] for row in rows if row["event"] == "finished" and str(row.get("status", "")).startswith("http_")}
+        result.update(reservations=len(reserved), http_attempts=len(proven),
+                      http_attempts_complete=reserved <= proven)
+        return result
+
     def _reserve_request(self, metrics: dict | None = None) -> str | None:
+        with _reservation_lock:
+            return self._reserve_request_locked(metrics)
+
+    def _reserve_request_locked(self, metrics: dict | None = None) -> str | None:
         path = self.settings.model_request_log_path
         limit = self.settings.model_daily_request_limit
-        if limit is not None and not path:
+        exploration = bool(metrics and metrics.get("exploration_run_id"))
+        if (limit is not None or exploration) and not path:
+            if exploration:
+                raise ModelQuotaUnavailable("探索额度记录未配置，已暂停探索。")
             raise ModelConfigurationError("模型请求限额需要持久化调用记录路径。")
         if not path:
             return None
-        now = datetime.now(UTC)
+        now = self.clock().astimezone(UTC)
         day = now.date().isoformat()
         target = Path(path).expanduser()
-        if limit is not None and target.exists():
+        if exploration:
+            snapshot = self.quota_snapshot(now=now)
+            if snapshot["reason"] == "exploration_quota_unavailable":
+                raise ModelQuotaUnavailable("无法可靠读取探索额度记录，已暂停探索。")
+            if not snapshot["available"]:
+                raise ModelDailyQuotaExhausted("今日探索模型请求预留次数已达到上限。")
+        elif limit is not None and target.exists():
             try:
                 with target.open("r", encoding="utf-8") as log:
                     used = sum(1 for line in log if line.startswith('{"event":"started","day":"' + day + '"'))
             except OSError as exc:
                 raise ModelConfigurationError("无法读取模型调用记录；已拒绝本次请求。") from exc
             if used >= limit:
-                raise ModelConfigurationError("今日模型请求次数已达到开发环境上限。")
+                raise ModelDailyQuotaExhausted("今日模型请求次数已达到开发环境上限。")
         request_id = str(uuid4())
         try:
             self._append_log({"event": "started", "day": day, "at": now.isoformat(),
                               "id": request_id, "model": self.settings.model_name, **(metrics or {})})
         except OSError as exc:
+            if exploration:
+                raise ModelQuotaUnavailable("无法持久记录探索请求，已暂停探索。") from exc
             raise ModelConfigurationError("无法持久记录模型请求；已拒绝本次请求。") from exc
         return request_id
 

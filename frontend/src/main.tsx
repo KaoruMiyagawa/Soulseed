@@ -4,14 +4,15 @@ import "./styles.css";
 import "./home.css";
 import { confirmDeliveryAndSync } from "./proactiveDelivery";
 import { ApiError, createApiRequest } from "./apiRequest";
+import { quotaAllowsStart, quotaMessage, type ExplorationQuota } from "./explorationQuota";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; content: string };
 type Conversation = { id: string; title: string; messages?: Message[] };
 type ProactiveMessage = { id: string; content: string; status: "ready" | "delivered" | "read" };
 type DeliveryRetry = { message: ProactiveMessage; conversationId: string };
 type ExplorationEvidence = { id: string; tool_name: string; outcome: string; source_url: string | null; title: string | null; retrieved_at: string | null; excerpt: string | null; page_relevance?: string | null };
-type Exploration = { id: string; status: "planned" | "active" | "completed" | "interrupted" | "failed" | "cancelled"; phase?: string; trigger_mode?: string; topic_basis?: string | null; duration_ms?: number | null; timings?: Record<string, { count: number; total_ms: number; last_ms: number }>; requested_topic: string | null; selected_topic: string | null; topic_origin: string; summary: string | null; claims: { text: string; kind: string; source_ids: string[] }[]; unanswered: string[]; error_code: string | null; evidence: ExplorationEvidence[] };
-type ExplorationAutonomy = { enabled: boolean; paused_until: string | null; cooldown_hours: number; last_started_at: string | null; last_checked_at?: string | null; last_skip_reason?: string | null; current: Exploration | null; latest: Exploration | null };
+type Exploration = { model_call_count?: number; model_diagnostics?: { reservations: number | null; http_attempts: number | null; http_attempts_complete: boolean; provider_receipt: string; provider_billing: string }; id: string; status: "planned" | "active" | "completed" | "interrupted" | "failed" | "cancelled"; phase?: string; trigger_mode?: string; topic_basis?: string | null; duration_ms?: number | null; timings?: Record<string, { count: number; total_ms: number; last_ms: number }>; requested_topic: string | null; selected_topic: string | null; topic_origin: string; summary: string | null; claims: { text: string; kind: string; source_ids: string[] }[]; unanswered: string[]; error_code: string | null; evidence: ExplorationEvidence[] };
+type ExplorationAutonomy = { enabled: boolean; paused_until: string | null; cooldown_hours: number; last_started_at: string | null; last_checked_at?: string | null; last_skip_reason?: string | null; current: Exploration | null; latest: Exploration | null; quota: ExplorationQuota };
 type LifeEvent = { id: string; content: string; event_type: string; status: string; activity_status?: string | null; effective_status?: string | null; feeling?: string | null; location?: string | null; occurred_at?: string | null; planned_start_at?: string | null; planned_end_at?: string | null };
 type LifeSnapshot = { state: { mood: string | null; timezone_id: string; current_activity: LifeEvent | null }; events: LifeEvent[]; pending_shares: unknown[] };
 type View = "world" | "chat" | "diary" | "plan" | "exploration";
@@ -32,6 +33,17 @@ function explorationFailureMessage(code: string): string {
     disallowed_tool: "模型请求了不允许的操作，本次已停止。",
     action_not_available: "剩余步骤或工具预算不足以执行该动作，探索已停止。",
     model_unavailable: "模型服务暂时无法完成探索决策，请检查配置或额度。",
+    exploration_daily_quota_exhausted: "今日探索请求额度已用完，请在重置后继续。",
+    exploration_quota_unavailable: "探索额度记录暂时无法核验，已暂停探索。",
+    model_provider_rate_limited: "模型服务商返回限流或供应商额度限制，请稍后再试。",
+    model_network_error: "连接模型服务失败，请检查网络。",
+    model_timeout: "等待模型服务超时；服务商是否收到或计费未知。",
+    model_configuration_error: "探索模型配置不可用，请检查开发环境配置。",
+    exploration_model_unavailable: "探索模型未启用或尚未配置，请检查开发环境配置。",
+    search_unavailable: "搜索服务暂时不可用，没有取得资料；这次探索未完成。",
+    search_format_changed: "搜索服务返回了无法识别的格式，没有把它当成搜索结果。",
+    search_challenge: "搜索服务暂时要求验证，没有取得可用资料。",
+    model_provider_error: "模型服务商未能完成请求，请检查服务状态或接口兼容性。",
     insufficient_evidence: "资料与主题不够相关，或没有形成有来源支持的结论；本次探索未完成。",
     no_saved_interest: "目前没有可用于自主选题的已确认兴趣、已保存目标或待查问题；这次没有调用模型，也没有进行搜索。你可以输入主题手动开始。",
     step_limit_reached: "已达到本次探索的步骤上限。",
@@ -84,16 +96,25 @@ function App({ characterId }: { characterId: string }) {
   const [exploration, setExploration] = useState<Exploration | null>(null);
   const [explorationBusy, setExplorationBusy] = useState(false);
   const [autonomy, setAutonomy] = useState<ExplorationAutonomy | null>(null);
+  const [quota, setQuota] = useState<ExplorationQuota | null>(null);
   const [view, setView] = useState<View>("world");
   const [life, setLife] = useState<LifeSnapshot | null>(null);
   const [lifeError, setLifeError] = useState("");
   const onVisible = useCallback((id: string) => setVisibleInbox((ids) => new Set(ids).add(id)), []);
+  const refreshQuota = useCallback(() => {
+    return request<ExplorationAutonomy>(`/characters/${encodeURIComponent(characterId)}/exploration-autonomy`)
+      .then((state) => {
+        setQuota(state.quota); setAutonomy(state);
+        setExploration(state.current ?? state.latest);
+      }).catch(() => setQuota(null));
+  }, [characterId]);
 
   useEffect(() => {
-    request<ExplorationAutonomy>(`/characters/${encodeURIComponent(characterId)}/exploration-autonomy`)
-      .then((state) => { setAutonomy(state); setExploration(state.current ?? state.latest); })
-      .catch((e: Error) => setError(e.message));
-  }, [characterId]);
+    void refreshQuota();
+    if (view !== "exploration") return;
+    const timer = window.setInterval(() => void refreshQuota(), 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshQuota, view, exploration?.status]);
 
   useEffect(() => {
     request<LifeSnapshot>(`/characters/${encodeURIComponent(characterId)}/life`)
@@ -112,7 +133,7 @@ function App({ characterId }: { characterId: string }) {
 
   const startExploration = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (explorationBusy) return;
+    if (explorationBusy || !quotaAllowsStart(quota)) return;
     setExplorationBusy(true); setError("");
     try {
       const run = await request<Exploration>(`/characters/${encodeURIComponent(characterId)}/explorations`, {
@@ -121,7 +142,7 @@ function App({ characterId }: { characterId: string }) {
       });
       setExploration(run); setExplorationTopic("");
     } catch (e) { setError((e as Error).message); }
-    finally { setExplorationBusy(false); }
+    finally { setExplorationBusy(false); void refreshQuota(); }
   };
 
   const cancelExploration = async () => {
@@ -138,7 +159,7 @@ function App({ characterId }: { characterId: string }) {
         method: "PUT", body: JSON.stringify(update),
       });
       setAutonomy(state);
-      setExploration(state.current ?? state.latest);
+      void refreshQuota();
     } catch (e) { setError((e as Error).message); }
   };
 
@@ -336,9 +357,9 @@ function App({ characterId }: { characterId: string }) {
   if (view === "plan") return <main className="soulseed-app">{header}<section className="content-page journal-page"><header className="view-heading"><div><p className="eyebrow">A DAY AT HER OWN PACE</p><h1>今日计划</h1></div><span>已保存的活动安排</span></header>{lifeError && <p className="error" role="alert">{lifeError}</p>}{currentActivity && <article className="plan-current"><span className="eyebrow">正在进行</span><h2>{currentActivity.content}</h2><button className="button-secondary" type="button" onClick={() => void transitionLifeEvent(currentActivity.id, "completed")}>标记完成</button></article>}{plannedEvents.length ? <div className="journal-list">{plannedEvents.map((event) => <article className="journal-entry" key={event.id}><span className="entry-date">{event.planned_start_at ? new Date(event.planned_start_at).toLocaleTimeString("zh-CN", { timeZone: timezone, hour: "2-digit", minute: "2-digit" }) : "待安排"}</span><div><h2>{event.content}</h2><p>{event.location || "已保存的计划"}</p></div><span className="plan-actions"><button className="text-button" type="button" onClick={() => void transitionLifeEvent(event.id, "active")}>开始</button><button className="text-button" type="button" onClick={() => void transitionLifeEvent(event.id, "cancelled")}>取消</button></span></article>)}</div> : <p className="panel-empty">目前没有已保存的计划。</p>}</section></main>;
 
   if (view === "exploration") return <main className="soulseed-app">{header}<section className="content-page explore-page"><header className="view-heading"><div><p className="eyebrow">CURIOSITY, AT HER OWN PACE</p><h1>探索与发现</h1></div><span>研究任务与自主探索状态</span></header>
-    <form className="explore-form" onSubmit={startExploration}><input aria-label="探索主题" value={explorationTopic} onChange={(e) => setExplorationTopic(e.target.value)} maxLength={240} placeholder="输入一个主题；留空时从已保存兴趣中选题" disabled={explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)} /><button className="button-primary" disabled={explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)}>{explorationBusy ? "安排中…" : "开始探索"}</button></form>
-    <section className="autonomy-panel"><div><p className="eyebrow">BACKGROUND EXPLORATION</p><h2>后台自主探索：{autonomy ? autonomy.enabled ? "已启用" : "已关闭" : "状态未知"}</h2><p>{!autonomy ? "当前后端未返回设置状态。" : `后端运行时最多每 ${autonomy.cooldown_hours} 小时一次`}{autonomy?.paused_until && ` · 暂停至 ${new Date(autonomy.paused_until).toLocaleString()}`}</p>{autonomy?.last_skip_reason && <small>最近检查未启动：{({ no_eligible_topic: "没有符合条件的已保存兴趣、目标或待查问题", cooldown: "仍在冷却时间内", paused: "自主探索已暂停", active_task: "已有探索任务进行中" } as Record<string, string>)[autonomy.last_skip_reason] ?? "未满足启动条件"}</small>}</div><div className="autonomy-actions"><button className="button-secondary" type="button" disabled={!autonomy} onClick={() => updateAutonomy({ enabled: !autonomy?.enabled })}>{autonomy?.enabled ? "关闭自主探索" : "启用自主探索"}</button><label>探索间隔<select aria-label="自主探索间隔" disabled={!autonomy} value={autonomy?.cooldown_hours ?? 24} onChange={(event) => updateAutonomy({ cooldown_hours: Number(event.target.value) })}><option value={24}>每天最多一次</option><option value={48}>每两天一次</option><option value={168}>每周一次</option></select></label>{autonomy?.enabled && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() })}>暂停 24 小时</button>}{autonomy?.paused_until && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: null })}>恢复</button>}</div></section>
-    {exploration && <article className="exploration-result" aria-live="polite"><strong>探索状态：{exploration.error_code === "insufficient_evidence" || exploration.status === "completed" && (!exploration.claims?.length || !exploration.evidence?.some((item) => item.tool_name === "read_webpage" && item.page_relevance === "relevant")) ? "资料不足，未形成可靠结论" : ({ planned: "计划中", active: "进行中", completed: "已完成", interrupted: "已中断", failed: "失败", cancelled: "已取消" } as const)[exploration.status]}</strong><span> · {exploration.selected_topic || exploration.requested_topic || "等待自主选题"} · {exploration.trigger_mode === "autonomous" ? "大肥鱼自主发起" : exploration.topic_origin === "user" ? "你指定的主题" : "根据已保存兴趣选题"}</span>{exploration.topic_basis && <span> · 依据：{({ stable_interest: "稳定兴趣", unresolved_question: "未解决问题", planned_goal: "已保存目标", derived_question: "探索衍生问题", pending_selection: "等待依据选择" } as Record<string, string>)[exploration.topic_basis] ?? exploration.topic_basis}</span>}{exploration.status === "active" && <p>当前阶段：{({ planning: "选择主题", searching: "搜索资料", reading: "安全读取网页", evaluating: "核对证据", planned: "等待开始" } as Record<string, string>)[exploration.phase ?? ""] ?? "执行中"}</p>}{exploration.timings && <small>模型 {exploration.timings.model?.count ?? 0} 次 / {Math.round((exploration.timings.model?.total_ms ?? 0) / 1000)} 秒；搜索 {Math.round((exploration.timings.search?.total_ms ?? 0) / 1000)} 秒；网页读取 {Math.round((exploration.timings.read?.total_ms ?? 0) / 1000)} 秒；总计 {Math.round((exploration.duration_ms ?? 0) / 1000)} 秒。</small>}{["planned", "active"].includes(exploration.status) && <button className="text-button" type="button" onClick={cancelExploration}>取消探索</button>}{exploration.summary && <p>{exploration.summary}</p>}{exploration.claims?.map((claim, index) => <p key={`${index}-${claim.text}`}><small>{claim.kind === "inference" ? "推断" : "来源支持"}</small> {claim.text}</p>)}{exploration.unanswered?.length > 0 && <p>还没查清：{exploration.unanswered.join("；")}</p>}{exploration.evidence?.filter((item) => item.tool_name === "read_webpage" && item.outcome === "success").map((item) => <p key={item.id}><a href={item.source_url ?? undefined} target="_blank" rel="noreferrer">{item.title || item.source_url}</a><small> · {item.retrieved_at} · {item.page_relevance === "relevant" ? "与主题相关" : item.page_relevance === "irrelevant" ? "正文无关，仅留作审计" : "旧记录未评估正文相关性"}</small></p>)}{exploration.error_code && <p className="error">{explorationFailureMessage(exploration.error_code)} 没有记作已完成探索。</p>}</article>}
+    <p role="status">{quotaMessage(quota)}</p><form className="explore-form" onSubmit={startExploration}><input aria-label="探索主题" value={explorationTopic} onChange={(e) => setExplorationTopic(e.target.value)} maxLength={240} placeholder="输入一个主题；留空时从已保存兴趣中选题" disabled={!quotaAllowsStart(quota) || explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)} /><button className="button-primary" disabled={!quotaAllowsStart(quota) || explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)}>{explorationBusy ? "安排中…" : "开始探索"}</button></form>
+    <section className="autonomy-panel"><div><p className="eyebrow">BACKGROUND EXPLORATION</p><h2>后台自主探索：{autonomy ? autonomy.enabled ? "已启用" : "已关闭" : "状态未知"}</h2><p>{!autonomy ? "当前后端未返回设置状态。" : `后端运行时最多每 ${autonomy.cooldown_hours} 小时一次`}{autonomy?.paused_until && ` · 暂停至 ${new Date(autonomy.paused_until).toLocaleString()}`}</p>{autonomy?.last_skip_reason && <small>最近检查未启动：{({ no_eligible_topic: "没有符合条件的已保存兴趣、目标或待查问题", cooldown: "仍在冷却时间内", paused: "自主探索已暂停", active_task: "已有探索任务进行中", exploration_daily_quota_exhausted: "今日探索请求额度已用完，重置后再检查", exploration_quota_unavailable: "探索额度记录暂时无法核验" } as Record<string, string>)[autonomy.last_skip_reason] ?? "未满足启动条件"}</small>}</div><div className="autonomy-actions"><button className="button-secondary" type="button" disabled={!autonomy} onClick={() => updateAutonomy({ enabled: !autonomy?.enabled })}>{autonomy?.enabled ? "关闭自主探索" : "启用自主探索"}</button><label>探索间隔<select aria-label="自主探索间隔" disabled={!autonomy} value={autonomy?.cooldown_hours ?? 24} onChange={(event) => updateAutonomy({ cooldown_hours: Number(event.target.value) })}><option value={24}>每天最多一次</option><option value={48}>每两天一次</option><option value={168}>每周一次</option></select></label>{autonomy?.enabled && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() })}>暂停 24 小时</button>}{autonomy?.paused_until && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: null })}>恢复</button>}</div></section>
+    {exploration && <article className="exploration-result" aria-live="polite"><strong>探索状态：{exploration.error_code === "insufficient_evidence" || exploration.status === "completed" && (!exploration.claims?.length || !exploration.evidence?.some((item) => item.tool_name === "read_webpage" && item.page_relevance === "relevant")) ? "资料不足，未形成可靠结论" : ({ planned: "计划中", active: "进行中", completed: "已完成", interrupted: "已中断", failed: "失败", cancelled: "已取消" } as const)[exploration.status]}</strong><span> · {exploration.selected_topic || exploration.requested_topic || "等待自主选题"} · {exploration.trigger_mode === "autonomous" ? "大肥鱼自主发起" : exploration.topic_origin === "user" ? "你指定的主题" : "根据已保存兴趣选题"}</span>{exploration.topic_basis && <span> · 依据：{({ stable_interest: "稳定兴趣", unresolved_question: "未解决问题", planned_goal: "已保存目标", derived_question: "探索衍生问题", pending_selection: "等待依据选择" } as Record<string, string>)[exploration.topic_basis] ?? exploration.topic_basis}</span>}{exploration.status === "active" && <p>当前阶段：{({ planning: "选择主题", searching: "搜索资料", reading: "安全读取网页", evaluating: "核对证据", planned: "等待开始" } as Record<string, string>)[exploration.phase ?? ""] ?? "执行中"}</p>}{<small>决策尝试 {exploration.model_call_count ?? 0} 次；请求预留 {exploration.model_diagnostics?.reservations ?? "未知"} 次；HTTP 尝试 {exploration.model_diagnostics?.http_attempts ?? "未知"}{exploration.model_diagnostics?.http_attempts_complete === false ? "（仅可确认的次数）" : ""} 次；服务商收到或计费情况未知。</small>}{exploration.timings && <small>模型 {exploration.timings.model?.count ?? 0} 次 / {Math.round((exploration.timings.model?.total_ms ?? 0) / 1000)} 秒；搜索 {Math.round((exploration.timings.search?.total_ms ?? 0) / 1000)} 秒；网页读取 {Math.round((exploration.timings.read?.total_ms ?? 0) / 1000)} 秒；总计 {Math.round((exploration.duration_ms ?? 0) / 1000)} 秒。</small>}{["planned", "active"].includes(exploration.status) && <button className="text-button" type="button" onClick={cancelExploration}>取消探索</button>}{exploration.summary && <p>{exploration.summary}</p>}{exploration.claims?.map((claim, index) => <p key={`${index}-${claim.text}`}><small>{claim.kind === "inference" ? "推断" : "来源支持"}</small> {claim.text}</p>)}{exploration.unanswered?.length > 0 && <p>还没查清：{exploration.unanswered.join("；")}</p>}{exploration.evidence?.filter((item) => item.tool_name === "read_webpage" && item.outcome === "success").map((item) => <p key={item.id}><a href={item.source_url ?? undefined} target="_blank" rel="noreferrer">{item.title || item.source_url}</a><small> · {item.retrieved_at} · {item.page_relevance === "relevant" ? "与主题相关" : item.page_relevance === "irrelevant" ? "正文无关，仅留作审计" : "旧记录未评估正文相关性"}</small></p>)}{exploration.error_code && <p className="error">{explorationFailureMessage(exploration.error_code)} 没有记作已完成探索。</p>}</article>}
     {error && <p className="error" role="alert">{error}</p>}</section></main>;
 
   return <main className="soulseed-app">{header}<div className="content-page chat-layout">

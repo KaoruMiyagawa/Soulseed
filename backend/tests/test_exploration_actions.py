@@ -18,6 +18,7 @@ OBSERVED = json.loads((Path(__file__).parent / "fixtures/exploration_failure_met
 
 def model_adapter(tmp_path, handler):
     log_path = tmp_path / "exploration-audit.jsonl"
+    log_path.write_text("", encoding="utf-8")
     settings = Settings(
         model_enabled=True, model_api_key="PRIVATE_FAKE_KEY", model_name=OBSERVED["model"],
         model_base_url="http://127.0.0.1:9/v1", model_max_output_tokens=512,
@@ -85,7 +86,7 @@ def test_real_adapter_json_protocol_completes_controlled_exploration_and_correla
     assert {entry["exploration_run_id"] for entry in entries} == {run["id"]}
     for step in (1, 2):
         events = [entry for entry in entries if entry["exploration_step"] == step]
-        assert {entry["event"] for entry in events} == {"started", "finished", "action_validation"}
+        assert {entry["event"] for entry in events} == {"started", "http_started", "finished", "action_validation"}
         assert len({entry["id"] for entry in events}) == 1
         audit = next(entry for entry in events if entry["event"] == "action_validation")
         assert audit["reason"] is None and audit["finish_reason"] == "stop"
@@ -149,7 +150,7 @@ def test_unsupported_json_mode_fails_once_without_text_fallback(tmp_path):
     adapter, log_path = model_adapter(tmp_path, handler)
     _, _, _, agent, run = setup(tmp_path, model=adapter)
     result = asyncio.run(agent.run(run["id"], "big_fish"))
-    assert result["error_code"] == "model_unavailable"
+    assert result["error_code"] == "model_provider_error"
     assert result["tool_call_count"] == 0 and len(calls) == 1
     entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert entries[-1]["status"] == "http_400"

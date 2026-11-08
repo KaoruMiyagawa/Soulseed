@@ -584,6 +584,9 @@ def test_manual_exploration_api_runs_agent_and_returns_saved_status(tmp_path, mo
     injected = []
 
     def agent_factory(repository, repository_life, settings):
+        ledger = tmp_path / "api-exploration-requests.jsonl"
+        ledger.write_text("", encoding="utf-8")
+        settings = settings.model_copy(update={"exploration_model_request_log_path": str(ledger)})
         agent = ExplorationAgent(repository, repository_life, settings,
                                  model=ScriptedModel(),
                                  search=FakeSearch([SearchResult("海獭", "https://example.org/otters", "工具使用")]),

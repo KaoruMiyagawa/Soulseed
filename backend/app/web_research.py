@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import re
 import socket
 import ssl
+import time
 import urllib.parse
 import urllib.request
 import certifi
@@ -29,6 +31,7 @@ RESEARCH_USER_AGENT = "SoulseedResearchBot/1.0 (https://github.com/KaoruMiyagawa
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DOH_SERVER = "cloudflare-dns.com"
 DOH_SERVER_IP = ipaddress.ip_address("1.1.1.1")
+logger = logging.getLogger("soulseed.web_research")
 _AUTO_PROXY = object()
 
 
@@ -131,6 +134,43 @@ def is_page_relevant(query: str, title: str, text: str) -> bool:
     ):
         return False
     return len(matches) >= (2 if len(terms) >= 3 else 1)
+
+
+def _cjk_anchor_characters(query: str) -> set[str]:
+    terms = search_query_terms(query)
+    generic = set("的了是和与及为因怎何如什么研究科学方法功能声相关资料信息介绍")
+    return {char for term in _topic_anchors(query, terms) for char in term
+            if "\u3400" <= char <= "\u9fff" and char not in generic}
+
+
+def _related_query_match(topic: str, query: str, title: str, text: str,
+                         matcher) -> bool:
+    """Accept a query reformulation only when both the query and result carry topic signals."""
+    if matcher(topic, title, text):
+        return True
+    if not matcher(query, title, text):
+        return False
+    topic_cjk = bool(re.search(r"[\u3400-\u9fff]", topic))
+    query_cjk = bool(re.search(r"[\u3400-\u9fff]", query))
+    topic_latin = bool(re.search(r"[a-z0-9]{3,}", topic.casefold()))
+    query_latin = bool(re.search(r"[a-z0-9]{3,}", query.casefold()))
+    # A model-produced translation is a valid bridge between scripts; verify the
+    # returned title/snippet or body against that query before accepting it.
+    if topic_cjk and query_latin or topic_latin and query_cjk:
+        return True
+    if topic_cjk and query_cjk:
+        shared = _cjk_anchor_characters(topic) & _cjk_anchor_characters(query)
+        content = f"{title} {text}"
+        return any(char in content for char in shared)
+    return False
+
+
+def is_search_result_relevant_to_topic(topic: str, query: str, title: str, snippet: str) -> bool:
+    return _related_query_match(topic, query, title, snippet, is_search_result_relevant)
+
+
+def is_page_relevant_to_topic(topic: str, query: str, title: str, text: str) -> bool:
+    return _related_query_match(topic, query, title, text, is_page_relevant)
 
 
 def _topic_anchors(query: str, terms: set[str]) -> set[str]:
@@ -583,17 +623,26 @@ class _DuckDuckGoResults(HTMLParser):
         self._snippet: list[str] | None = None
         self._href = ""
         self._last_result: int | None = None
+        self.recognized_page = False
+        self.no_results = False
+        self.page_text: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
+        if classes & {"results", "results_links", "results_links_deep", "no-results", "no-results__message"}:
+            self.recognized_page = True
+        if "no-results" in classes or "no-results__message" in classes:
+            self.no_results = True
         if tag.casefold() == "a" and "result__a" in classes:
+            self.recognized_page = True
             self._title = []
             self._href = attributes.get("href") or ""
         elif tag.casefold() == "a" and "result__snippet" in classes:
             self._snippet = []
 
     def handle_data(self, data):
+        self.page_text.append(data)
         if self._title is not None:
             self._title.append(data)
         if self._snippet is not None:
@@ -640,10 +689,20 @@ class DuckDuckGoSearchProvider:
     async def search(self, query: str) -> list[SearchResult]:
         if not isinstance(query, str) or not 3 <= len(query.strip()) <= 240:
             raise WebResearchError("invalid_query", "搜索词长度必须在 3 到 240 个字符之间")
+        started = time.monotonic()
         url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query.strip()})
-        response = await self.fetcher.fetch(url)
-        parser = _DuckDuckGoResults()
-        parser.feed(_decode_body(response))
+        try:
+            response = await self.fetcher.fetch(url)
+            parser = _DuckDuckGoResults()
+            parser.feed(_decode_body(response))
+            if re.search(r"\bno results(?: found)?\b|did not match any documents", " ".join(parser.page_text), re.I):
+                parser.no_results = True
+            if not parser.recognized_page and not parser.no_results:
+                raise WebResearchError("search_format_changed", "DuckDuckGo 搜索页面格式发生变化")
+        except WebResearchError as exc:
+            logger.info("search_provider_result provider=duckduckgo outcome=error error_code=%s duration_ms=%d",
+                        exc.code, int((time.monotonic() - started) * 1000))
+            raise
         results: list[SearchResult] = []
         seen: set[str] = set()
         for row in parser.results:
@@ -653,7 +712,11 @@ class DuckDuckGoSearchProvider:
             results.append(SearchResult(row["title"], row["url"], row["snippet"]))
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
-        return _tag_search_results(query.strip(), results, "duckduckgo")
+        tagged = _tag_search_results(query.strip(), results, "duckduckgo")
+        logger.info("search_provider_result provider=duckduckgo outcome=%s result_count=%d relevant_count=%d duration_ms=%d",
+                    "results" if tagged else "empty", len(tagged), sum(item.relevant is True for item in tagged),
+                    int((time.monotonic() - started) * 1000))
+        return tagged
 
 
 class WikimediaSearchProvider:
@@ -675,9 +738,15 @@ class WikimediaSearchProvider:
             "uselang": self.language,
         })
         url = f"https://{self.language}.wikipedia.org/w/api.php?{params}"
-        response = await self.fetcher.fetch(url, accept="application/json")
-        if "application/json" not in response.headers.get("content-type", "").casefold():
-            raise WebResearchError("search_format_changed", "百科搜索返回格式无效")
+        started = time.monotonic()
+        try:
+            response = await self.fetcher.fetch(url, accept="application/json")
+            if "application/json" not in response.headers.get("content-type", "").casefold():
+                raise WebResearchError("search_format_changed", "百科搜索返回格式无效")
+        except WebResearchError as exc:
+            logger.info("search_provider_result provider=wikimedia_%s outcome=error error_code=%s duration_ms=%d",
+                        self.language, exc.code, int((time.monotonic() - started) * 1000))
+            raise
         try:
             payload = json.loads(response.body)
             rows = payload["query"]["search"]
@@ -696,7 +765,11 @@ class WikimediaSearchProvider:
             article = f"https://{self.language}.wikipedia.org/wiki/{quote(title.replace(' ', '_'), safe='()_,-')}"
             results.append(SearchResult(title[:240], article, snippet[:600]))
         provider = f"wikimedia_{self.language}"
-        return _tag_search_results(query.strip(), results, provider)
+        tagged = _tag_search_results(query.strip(), results, provider)
+        logger.info("search_provider_result provider=%s outcome=%s result_count=%d relevant_count=%d duration_ms=%d",
+                    provider, "results" if tagged else "empty", len(tagged),
+                    sum(item.relevant is True for item in tagged), int((time.monotonic() - started) * 1000))
+        return tagged
 
 
 class FallbackSearchProvider:
@@ -733,6 +806,8 @@ class FallbackSearchProvider:
             raise
         if any(result.relevant is True for result in fallback_results):
             return fallback_results
+        if primary_error is not None and not fallback_results:
+            raise WebResearchError("search_unavailable", "主搜索服务不可用，备用搜索未返回候选结果") from primary_error
         return primary_results or fallback_results
 
 

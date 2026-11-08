@@ -16,7 +16,8 @@ from .chat_service import ChatService
 from .context_window import ContextBudgetExceeded, ContextWindowLimits, ModelContextWindow
 from .config import get_settings
 from .db import Database
-from .model_adapter import ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter
+from .model_adapter import (ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter,
+                            ModelDailyQuotaExhausted, ModelQuotaUnavailable)
 from .memory import ClarificationApplicationService, ClarificationRepository, CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryCorrectionService, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
 from .persona import resolve_system_prompt
 from .proposal_api import create_proposal_router
@@ -383,7 +384,8 @@ async def _autonomous_exploration_tick() -> None:
         character_ids = [row[0] for row in db.execute("SELECT character_id FROM exploration_autonomy WHERE enabled=1")]
     for character_id in character_ids:
         with character_scope(character_id):
-            run, created = exploration_repository.create_autonomous_if_due(character_id)
+            run, created = exploration_repository.create_autonomous_if_due(
+                character_id, quota_snapshot=exploration_agent.quota_snapshot)
             if created and run:
                 logger.info("autonomous_exploration_started run_id=%s character_id=%s", run["id"], character_id)
                 _launch_exploration(run["id"], character_id)
@@ -396,12 +398,34 @@ async def start_exploration(character_id: str, request: StartExplorationRequest)
         run, created = exploration_repository.create(character_id=character_id,
                                                      idempotency_key=request.idempotency_key,
                                                      requested_topic=topic,
-                                                     enforce_single_active=True)
+                                                     enforce_single_active=True,
+                                                     quota_snapshot=exploration_agent.quota_snapshot)
+    except (ModelDailyQuotaExhausted, ModelQuotaUnavailable) as exc:
+        exhausted = isinstance(exc, ModelDailyQuotaExhausted)
+        raise HTTPException(status_code=429 if exhausted else 503, detail={
+            "code": "exploration_daily_quota_exhausted" if exhausted else "exploration_quota_unavailable",
+            "message": str(exc), "quota": exploration_agent.quota_snapshot(),
+        }) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if run["status"] == "planned":
         _launch_exploration(run["id"], character_id)
-    return {**run, "created": created}
+    return {**_exploration_view(run), "created": created}
+
+
+def _exploration_view(run: dict) -> dict:
+    diagnostics = exploration_agent.quota_adapter().request_diagnostics(run["id"])
+    if run["model_call_count"] and diagnostics["reservations"] == 0 and run.get("error_code") not in {
+        "exploration_daily_quota_exhausted", "exploration_quota_unavailable",
+    }:
+        # Legacy runs may predate correlated audit records; do not invent zero calls.
+        diagnostics.update(reservations=None, http_attempts=None, http_attempts_complete=False)
+    return {**run, "model_diagnostics": diagnostics}
+
+
+@app.get("/api/characters/{character_id}/exploration-quota")
+def get_exploration_quota(character_id: str) -> dict:
+    return exploration_agent.quota_snapshot()
 
 
 @app.get("/api/characters/{character_id}/exploration-autonomy")
@@ -410,8 +434,9 @@ def get_exploration_autonomy(character_id: str) -> dict:
     with database.connection() as db:
         active = db.execute("SELECT * FROM exploration_runs WHERE character_id=? AND status IN ('planned','active') ORDER BY created_at LIMIT 1", (character_id,)).fetchone()
         latest = db.execute("SELECT * FROM exploration_runs WHERE character_id=? ORDER BY created_at DESC LIMIT 1", (character_id,)).fetchone()
-    result["current"] = exploration_repository.get(active["id"], character_id) if active else None
-    result["latest"] = exploration_repository.get(latest["id"], character_id) if latest else None
+    result["current"] = _exploration_view(exploration_repository.get(active["id"], character_id)) if active else None
+    result["latest"] = _exploration_view(exploration_repository.get(latest["id"], character_id)) if latest else None
+    result["quota"] = exploration_agent.quota_snapshot()
     return result
 
 
@@ -432,13 +457,13 @@ def set_exploration_autonomy(character_id: str, request: ExplorationAutonomyRequ
 
 @app.get("/api/characters/{character_id}/explorations")
 def list_explorations(character_id: str, limit: int = 20) -> list[dict]:
-    return exploration_repository.list(character_id, limit)
+    return [_exploration_view(run) for run in exploration_repository.list(character_id, limit)]
 
 
 @app.get("/api/characters/{character_id}/explorations/{run_id}")
 def get_exploration(character_id: str, run_id: str) -> dict:
     try:
-        return exploration_repository.get(run_id, character_id)
+        return _exploration_view(exploration_repository.get(run_id, character_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="探索记录不存在") from exc
 

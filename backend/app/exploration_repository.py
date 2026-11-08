@@ -6,9 +6,11 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
+from collections.abc import Callable
 
 from .db import Database
 from .life import LifeRepository
+from .model_adapter import ModelDailyQuotaExhausted, ModelQuotaUnavailable
 
 
 def _now() -> str:
@@ -22,7 +24,8 @@ class ExplorationRepository:
 
     def create(self, *, character_id: str, idempotency_key: str,
                requested_topic: str | None, trigger_mode: str = "manual",
-               topic_basis: str | None = None, enforce_single_active: bool = False) -> tuple[dict, bool]:
+               topic_basis: str | None = None, enforce_single_active: bool = False,
+               quota_snapshot: Callable[[], dict] | None = None) -> tuple[dict, bool]:
         if trigger_mode not in {"manual", "autonomous"}:
             raise ValueError("无效的探索触发方式")
         at, run_id = _now(), str(uuid4())
@@ -36,6 +39,12 @@ class ExplorationRepository:
                 return self._run(db, dict(existing)), False
             if enforce_single_active and db.execute("SELECT 1 FROM exploration_runs WHERE character_id=? AND status IN ('planned','active') LIMIT 1", (character_id,)).fetchone():
                 raise RuntimeError("该角色已有进行中的探索任务")
+            if quota_snapshot:
+                quota = quota_snapshot()
+                if quota["reason"] == "exploration_quota_unavailable":
+                    raise ModelQuotaUnavailable("探索额度暂时无法核验，请检查本地调用记录。")
+                if not quota["available"]:
+                    raise ModelDailyQuotaExhausted("今日探索额度已用完，请在额度重置后再试。")
             db.execute(
                 "INSERT INTO exploration_runs(id,character_id,idempotency_key,requested_topic,topic_origin,status,created_at,updated_at,trigger_mode,topic_basis) VALUES(?,?,?,?,?,'planned',?,?,?,?)",
                 (run_id, character_id, idempotency_key, requested_topic, origin, at, at, trigger_mode, topic_basis),
@@ -97,7 +106,8 @@ class ExplorationRepository:
             db.execute("INSERT INTO exploration_autonomy(character_id,enabled,paused_until,cooldown_hours,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(character_id) DO UPDATE SET enabled=excluded.enabled,paused_until=excluded.paused_until,cooldown_hours=excluded.cooldown_hours,updated_at=excluded.updated_at", (character_id, values["enabled"], values["paused_until"], values["cooldown_hours"], at))
         return self.autonomy_preferences(character_id)
 
-    def create_autonomous_if_due(self, character_id: str, *, now: datetime | None = None) -> tuple[dict | None, bool]:
+    def create_autonomous_if_due(self, character_id: str, *, now: datetime | None = None,
+                                 quota_snapshot: Callable[[], dict] | None = None) -> tuple[dict | None, bool]:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         at = current.isoformat()
         with self.database.atomic() as db:
@@ -119,6 +129,12 @@ class ExplorationRepository:
             if not self.life.exploration_candidate_items(character_id):
                 db.execute("UPDATE exploration_autonomy SET last_checked_at=?,last_skip_reason='no_eligible_topic',updated_at=? WHERE character_id=?", (at, at, character_id))
                 return None, False
+            if quota_snapshot:
+                quota = quota_snapshot()
+                if not quota["available"]:
+                    db.execute("UPDATE exploration_autonomy SET last_checked_at=?,last_skip_reason=?,updated_at=? WHERE character_id=?",
+                               (at, quota["reason"], at, character_id))
+                    return None, False
             run_id = str(uuid4())
             key = "autonomous:" + current.strftime("%Y-%m-%d")
             db.execute("INSERT INTO exploration_runs(id,character_id,idempotency_key,requested_topic,topic_origin,status,created_at,updated_at,trigger_mode,topic_basis) VALUES(?,?,?,NULL,'character','planned',?,?, 'autonomous','pending_selection')", (run_id, character_id, key, at, at))
