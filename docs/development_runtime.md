@@ -1,6 +1,8 @@
 # Fixed local development runtime
 
-Run this from `D:\Projects\soulseed`:
+See the [setup guide](setup_EN.md) ([简体中文](setup.md)) for installation,
+pairing-mode differences, database protection, and tests. Run this from the
+repository root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start-development.ps1
@@ -13,11 +15,11 @@ Ctrl+C to stop only the two child processes created by this launcher. The
 launcher refuses occupied ports and never selects a different port.
 
 The launcher sets `SOULSEED_ENVIRONMENT=development` and pins the database to
-`D:\Projects\soulseed\backend\data\soulseed-development.db` before importing
+`backend/data/soulseed-development.db` within the repository before importing
 the app. This database persists across restarts and is not used by tests.
 Tests continue through `backend/scripts/run_isolated.py` with temporary
-databases. The protected `backend/data/soulseed.db` and G1 backup remain
-separate.
+databases. Protected databases and preserved incident backups remain separate
+and are not development inputs.
 
 Development mode is unauthenticated for a single local user and is limited to
 the fixed `big_fish` character. The backend accepts requests only over
@@ -41,3 +43,23 @@ Request metadata and provider token usage are logged to
 `%LOCALAPPDATA%\Soulseed\development\model-requests.jsonl`; prompts,
 responses, and credentials are not logged. These request limits are not a
 currency cap, so check SiliconFlow billing for actual costs.
+
+Background autonomous exploration starts disabled. Its UI switch is separate
+from contact permission. Enabled exploration is checked by the existing
+LifeScheduler while the backend runs; closing the browser does not stop it.
+The default interval is at least 24 hours, with 48-hour and 168-hour options.
+Exploration has a separate eight-reservation UTC daily ledger, at most four
+model decisions per task, and a 512 output-token limit per decision. An
+unreadable or exhausted ledger blocks new tasks safely.
+
+Model-generated proactive contact also starts disabled. The launcher accepts
+`--contact-model-generation` only with models enabled. This may incur model
+usage and still obeys contact rules. Without it, evidence-backed research
+shares stay pending; the safe local generator does not create a canned
+discovery message.
+
+The launcher prints a `build_id` that can be compared with `GET /api/health`.
+`startup_id` identifies one process lifetime. Restart through the launcher
+after code changes; this command does not use Uvicorn reload. Frontend and
+backend ports remain fixed; an occupied port is reported without stopping
+another service.

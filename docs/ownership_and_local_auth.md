@@ -1,5 +1,7 @@
 # 2.7.6-F1：数据归属与本地身份验证
 
+> 这是归属与配对机制的阶段技术档案。当前 `development` 环境始终使用固定本机用户与 `big_fish`，不执行配对登录；`testing` 与 `production` 保留下述配对要求。当前启动入口及临时配对验证方式见 [安装、运行与维护](setup.md)。
+
 ## 运行方式
 
 当前身份提供方只认证本机安装的 `local` 用户。`users → characters → conversations → messages`
