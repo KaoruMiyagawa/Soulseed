@@ -187,7 +187,7 @@ def test_success_runs_decision_loop_saves_sources_and_is_retrievable_in_real_cha
     capture = Capture()
     chat = ChatService(conversations, messages, capture, "大肥鱼", life_repository=life)
     with character_scope("big_fish"):
-        asyncio.run(chat.send(conversation["id"], "你探索发现了什么？"))
+        asyncio.run(chat.send(conversation["id"], "你怎么知道的？"))
     context = next(item["content"] for item in capture.prompt if item["role"] == "system" and "<expression_context" in item["content"])
     assert "research_result" in context and "海獭会用石头敲开贝类" in context
     assert "https://example.org/otters" in context
@@ -233,6 +233,10 @@ def test_completed_discovery_flows_through_contact_and_remains_citable(tmp_path)
 
     delivered = contact.deliver(ready["id"], conversation["id"], now=now)
     assert delivered["status"] == "delivered"
+    read = contact.mark_read(ready["id"], now=now)
+    assert read["status"] == "read"
+    with db.connection() as sql:
+        assert sql.execute("SELECT status FROM life_share_intents WHERE id=?", (share["id"],)).fetchone()[0] == "delivered"
     snapshot = life.expression_snapshot("这条发现的来源是什么？", now=now)
     research = next(event for event in snapshot["events"] if event["id"] == result["life_event_id"])
     assert research["research_result"]["claims"][0]["text"] == "海獭会使用石块敲开贝类外壳。"
@@ -249,6 +253,70 @@ def test_completed_discovery_flows_through_contact_and_remains_citable(tmp_path)
                                (duplicate_result["life_event_id"],)).fetchone()
         assert decision["reason"] == "duplicate_discovery"
         assert sql.execute("SELECT COUNT(*) FROM life_share_intents WHERE reason='evidence_backed_discovery'").fetchone()[0] == 1
+
+
+def test_contact_share_generation_cannot_read_another_characters_research(tmp_path):
+    from app.contact import AdapterContactGenerator, ContactService
+    from app.life_share import LifeShareService
+
+    db, life, repo, _, initial_run = setup(tmp_path)
+    with character_scope("big_fish"):
+        repo.terminate(initial_run["id"], "big_fish", "cancelled")
+    with db.connection() as sql:
+        sql.execute("INSERT INTO characters VALUES ('fish_b','local','owned',datetime('now'))")
+    with character_scope("fish_b"):
+        life.ensure_state("fish_b")
+
+    def complete_for(character_id, key, topic, title, url, excerpt, claims):
+        with character_scope(character_id):
+            run, created = repo.create(character_id=character_id, idempotency_key=key, requested_topic=topic)
+            assert created
+            repo.activate(run["id"], character_id)
+            source = repo.add_evidence(
+                run["id"], character_id, tool_name="read_webpage", source_url=url,
+                title=title, retrieved_at="2026-11-08T10:00:00+00:00", excerpt=excerpt,
+                outcome="success", page_relevance="relevant",
+            )
+            result = repo.complete(
+                run["id"], character_id,
+                summary=(excerpt + " 这条资料让我对这个主题又多了一点可靠认识，也留下了可以继续追问的线索。") * 2,
+                claims=[{"text": claim, "kind": "sourced", "source_ids": [source["id"]]} for claim in claims],
+                unanswered=[],
+            )
+        assert result["status"] == "completed" and result["life_event_id"]
+        return result
+
+    claim_a = "海獭会用石块敲开贝类外壳。"
+    claim_b = "树蛙会通过鸣叫吸引同类并宣示领地。"
+    result_a = complete_for("big_fish", "share-a-0001", "海獭工具使用", "海獭工具研究", "https://example.org/otter", claim_a + " 海獭会用石块敲开贝类。", [claim_a, "这种行为帮助海獭取得食物。"])
+    result_b = complete_for("fish_b", "share-b-0001", "树蛙叫声", "树蛙鸣叫研究", "https://example.org/tree-frog", claim_b + " 树蛙的鸣叫也与繁殖有关。", [claim_b, "树蛙会使用鸣叫进行交流。"])
+
+    shares = LifeShareService(life)
+    share_a = shares.list_intents("big_fish", status="pending")[0]
+    share_b = shares.list_intents("fish_b", status="pending")[0]
+    assert share_a["event_id"] == result_a["life_event_id"]
+    assert share_b["event_id"] == result_b["life_event_id"]
+    assert [item["id"] for item in shares.list_intents("fish_b")] == [share_b["id"]]
+
+    class ContactCapture:
+        def __init__(self):
+            self.messages = []
+
+        async def reply(self, messages):
+            self.messages = messages
+            return f"欸，我查到一个有意思的点：{claim_b}"
+
+    contact_model = ContactCapture()
+    generator = AdapterContactGenerator(contact_model, "大肥鱼：淘气、活泼、好奇。", life)
+    contact = ContactService(life, generator=generator)
+    with pytest.raises(ValueError, match="分享意图须绑定"):
+        contact.create_intent(character_id="fish_b", source="life_share", source_id=share_a["id"], reason="cross-role")
+    intent_b = contact.create_intent(character_id="fish_b", source="life_share", source_id=share_b["id"], reason="saved", now=datetime(2026, 11, 8, 12, tzinfo=UTC))
+    message = asyncio.run(generator.generate(intent_b))
+    prompt = "\n".join(item["content"] for item in contact_model.messages)
+    assert claim_b in prompt and "https://example.org/tree-frog" in prompt
+    assert claim_a not in prompt and "https://example.org/otter" not in prompt
+    assert message
 
 
 def test_empty_search_does_not_create_completed_experience_or_fabricate(tmp_path):
@@ -311,6 +379,149 @@ def test_autonomy_is_opt_in_bounded_and_persists_cooldown_and_pause(tmp_path):
         assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "cooldown"
         next_run, created = repo.create_autonomous_if_due("big_fish", now=now + timedelta(days=3))
         assert created and next_run["idempotency_key"].startswith("autonomous:")
+
+
+@pytest.mark.parametrize("cooldown_hours", [24, 48, 168])
+def test_autonomous_daily_two_day_and_weekly_cadence_boundaries(tmp_path, cooldown_hours):
+    from app.life_engine import LifeEngine
+
+    _, life, repo, _, initial_run = setup(tmp_path)
+    now = datetime(2026, 11, 7, 10, tzinfo=UTC)
+    with character_scope("big_fish"):
+        repo.terminate(initial_run["id"], "big_fish", "cancelled")
+        repo.set_autonomy_preferences("big_fish", enabled=True, cooldown_hours=cooldown_hours)
+        LifeEngine(life).set_preference("big_fish", "music", 1.8, reason="explicit_preference")
+        first, created = repo.create_autonomous_if_due("big_fish", now=now)
+        assert created and first["status"] == "planned"
+        repo.terminate(first["id"], "big_fish", "cancelled")
+
+        before = now + timedelta(hours=cooldown_hours - 1)
+        assert repo.create_autonomous_if_due("big_fish", now=before) == (None, False)
+        assert repo.autonomy_preferences("big_fish")["last_skip_reason"] == "cooldown"
+        due = now + timedelta(hours=cooldown_hours)
+        next_run, created = repo.create_autonomous_if_due("big_fish", now=due)
+        assert created and next_run["status"] == "planned"
+        assert next_run["created_at"] == due.isoformat()
+
+
+def test_life_scheduler_starts_autonomous_exploration_without_frontend_and_persists_shareable_result(tmp_path, monkeypatch):
+    import app.main as main
+    from app.life_engine import LifeEngine
+    from app.life_scheduler import LifeScheduler
+
+    db, life, repo, _, initial_run = setup(tmp_path)
+    with character_scope("big_fish"):
+        repo.terminate(initial_run["id"], "big_fish", "cancelled")
+        repo.set_autonomy_preferences("big_fish", enabled=True)
+        life.record("music", event_type="goal", status="planned")
+
+    class AutonomousModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def reply(self, messages):
+            self.calls += 1
+            payload = json.loads(messages[-1]["content"])
+            if payload["task"]["selected_topic"] is None:
+                return json.dumps({"action": "select_topic", "topic": payload["saved_interest_candidates"][0]}, ensure_ascii=False)
+            if not payload["observations"]:
+                return json.dumps({"action": "search_web", "query": "music and rhythm"}, ensure_ascii=False)
+            page = next((item for item in payload["observations"] if "untrusted_page_text" in item), None)
+            if page:
+                return json.dumps({
+                    "action": "finish",
+                    "summary": "The reading describes how rhythm creates musical patterns and how those patterns can carry expressive feeling. This is a small, source-backed discovery connected to the saved interest in music.",
+                    "claims": [
+                        {"text": "Rhythm creates patterns in music.", "kind": "sourced", "source_ids": [page["evidence_id"]]},
+                        {"text": "Musical patterns can express feelings.", "kind": "sourced", "source_ids": [page["evidence_id"]]},
+                    ],
+                    "unanswered": [],
+                }, ensure_ascii=False)
+            return json.dumps({"action": "finish", "summary": "资料不足。", "claims": [], "unanswered": ["还需查证"]}, ensure_ascii=False)
+
+    model = AutonomousModel()
+    agent = ExplorationAgent(
+        repo, life, Settings(model_enabled=False, exploration_enabled=True), model=model,
+        search=FakeSearch([SearchResult("Music and rhythm", "https://example.org/music", "Music uses rhythm to express feelings")]),
+        reader=FakeReader(text="Music uses rhythm to create patterns and can express feelings."),
+    )
+    agent.quota_snapshot = lambda: {"available": True, "limit": 8, "used": 0, "remaining": 8}
+    now = datetime(2026, 11, 7, 10, tzinfo=UTC)
+    create_due = repo.create_autonomous_if_due
+
+    def controlled_due(character_id, *, now=None, quota_snapshot=None):
+        return create_due(character_id, now=now or datetime(2026, 11, 7, 10, tzinfo=UTC), quota_snapshot=quota_snapshot)
+
+    monkeypatch.setattr(repo, "create_autonomous_if_due", controlled_due)
+    monkeypatch.setattr(main, "database", db)
+    monkeypatch.setattr(main, "settings", Settings(model_enabled=False, exploration_enabled=True))
+    monkeypatch.setattr(main, "exploration_repository", repo)
+    monkeypatch.setattr(main, "exploration_agent", agent)
+    monkeypatch.setattr(main, "active_exploration_tasks", {})
+    monkeypatch.setattr(main, "active_exploration_characters", {})
+
+    async def run_background_cycle():
+        stop = asyncio.Event()
+        scheduler = LifeScheduler(life, interval=timedelta(minutes=5), after_tick=main._autonomous_exploration_tick)
+        scheduler_tick = scheduler.tick
+        scheduler.tick = lambda: scheduler_tick(now=now)
+        scheduler_task = asyncio.create_task(scheduler.run_forever(stop))
+        try:
+            for _ in range(1000):
+                runs = repo.list("big_fish")
+                autonomous = [item for item in runs if item["trigger_mode"] == "autonomous"]
+                if autonomous and autonomous[0]["status"] not in {"planned", "active"}:
+                    return autonomous[0]
+                await asyncio.sleep(0.001)
+            raise AssertionError("LifeScheduler did not complete the autonomous task")
+        finally:
+            stop.set()
+            await scheduler_task
+            tasks = list(main.active_exploration_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    result = asyncio.run(run_background_cycle())
+    assert result["status"] == "completed"
+    assert result["trigger_mode"] == "autonomous"
+    assert result["topic_origin"] == "character"
+    assert result["selected_topic"] == "目标：music" and result["topic_basis"] == "planned_goal"
+    assert result["model_call_count"] == model.calls == 3
+    assert result["life_event_id"]
+    assert any(item["tool_name"] == "read_webpage" and item["page_relevance"] == "relevant" for item in result["evidence"])
+    with db.connection() as sql:
+        share = sql.execute("SELECT reason,status FROM life_share_intents WHERE event_id=?", (result["life_event_id"],)).fetchone()
+        assert share and share["reason"] == "evidence_backed_discovery" and share["status"] == "pending"
+
+    asyncio.run(main._autonomous_exploration_tick())
+    assert len([item for item in repo.list("big_fish") if item["trigger_mode"] == "autonomous"]) == 1
+
+
+@pytest.mark.parametrize("started", [False, True], ids=["planned-before-start", "active"])
+def test_restart_interrupts_planned_or_active_autonomous_task_without_repeating_model_work(tmp_path, started):
+    from app.life_engine import LifeEngine
+
+    db, life, repo, _, initial_run = setup(tmp_path)
+    now = datetime(2026, 11, 7, 10, tzinfo=UTC)
+    with character_scope("big_fish"):
+        repo.terminate(initial_run["id"], "big_fish", "cancelled")
+        repo.set_autonomy_preferences("big_fish", enabled=True)
+        LifeEngine(life).set_preference("big_fish", "music", 1.8, reason="explicit_preference")
+        planned, created = repo.create_autonomous_if_due("big_fish", now=now)
+        assert created and planned["status"] == "planned" and planned["model_call_count"] == 0
+        if started:
+            repo.activate(planned["id"], "big_fish")
+
+    restarted_life = LifeRepository(Database(db.path))
+    restarted_repo = ExplorationRepository(Database(db.path), restarted_life)
+    with character_scope("big_fish"):
+        assert restarted_repo.recover_active("big_fish") == 1
+        recovered = restarted_repo.get(planned["id"], "big_fish")
+        assert recovered["status"] == "interrupted"
+        assert recovered["phase"] == "interrupted" and recovered["error_code"] == "service_restarted"
+        assert recovered["model_call_count"] == 0 and recovered["life_event_id"] is None
+        assert restarted_repo.create_autonomous_if_due("big_fish", now=now + timedelta(hours=1)) == (None, False)
+        assert restarted_repo.autonomy_preferences("big_fish")["last_skip_reason"] == "cooldown"
 
 
 def test_autonomous_topic_candidates_include_unresolved_questions_and_keep_basis(tmp_path):

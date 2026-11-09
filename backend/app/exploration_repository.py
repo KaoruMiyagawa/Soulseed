@@ -234,10 +234,14 @@ class ExplorationRepository:
     def recover_active(self, character_id: str = "big_fish") -> int:
         at = _now()
         with self.database.atomic() as db:
-            rows = db.execute("SELECT id,started_at FROM exploration_runs WHERE status='active' AND character_id=?", (character_id,)).fetchall()
+            # A process may exit after persisting a planned task but before its
+            # asyncio task gets CPU time. Such work cannot be safely resumed;
+            # close it just like active work so it cannot occupy the character
+            # forever or be mistaken for a successful exploration.
+            rows = db.execute("SELECT id,started_at FROM exploration_runs WHERE status IN ('planned','active') AND character_id=?", (character_id,)).fetchall()
             for row in rows:
                 duration = self._duration_ms(dict(row), at)
-                db.execute("UPDATE exploration_runs SET status='interrupted',error_code='service_restarted',ended_at=?,updated_at=?,duration_ms=? WHERE id=? AND character_id=? AND status='active'", (at, at, duration, row["id"], character_id))
+                db.execute("UPDATE exploration_runs SET status='interrupted',phase='interrupted',error_code='service_restarted',ended_at=?,updated_at=?,duration_ms=? WHERE id=? AND character_id=? AND status IN ('planned','active')", (at, at, duration, row["id"], character_id))
             return len(rows)
 
     def get(self, run_id: str, character_id: str) -> dict:

@@ -105,6 +105,48 @@ async def test_safe_fallback_does_not_send_a_fixed_exploration_share(context):
 
 
 @pytest.mark.asyncio
+async def test_disabled_model_generator_keeps_a_real_research_share_pending(context):
+    db, repo, _, conversation = context
+    from app.exploration_repository import ExplorationRepository
+
+    user_message(db, conversation["id"], when=NOW - timedelta(hours=3), content="你好")
+    exploration = ExplorationRepository(db, repo)
+    run, created = exploration.create(
+        character_id="big_fish", idempotency_key="safe-share-run-001", requested_topic="海獭觅食",
+    )
+    assert created
+    exploration.activate(run["id"], "big_fish")
+    source = exploration.add_evidence(
+        run["id"], "big_fish", tool_name="read_webpage", source_url="https://example.org/otters",
+        title="海獭觅食", retrieved_at=NOW.isoformat(), excerpt="海獭会用石块敲开贝类外壳。",
+        outcome="success", page_relevance="relevant",
+    )
+    result = exploration.complete(
+        run["id"], "big_fish",
+        summary="这份资料说明海獭会使用石块处理贝类，并展示了这种觅食行为的细节。这个发现有真实阅读来源支持，也可以继续追问相关过程。",
+        claims=[
+            {"text": "海獭会用石块敲开贝类外壳。", "kind": "sourced", "source_ids": [source["id"]]},
+            {"text": "这种工具使用帮助海獭取得食物。", "kind": "sourced", "source_ids": [source["id"]]},
+        ],
+        unanswered=[],
+    )
+    assert result["status"] == "completed"
+    share = LifeShareService(repo).list_intents(status="pending")[0]
+
+    safe_contact = ContactService(repo, generator=SafeContactGenerator())
+    assert await safe_contact.tick(now=NOW) is None
+    pending = safe_contact.list_intents()
+    assert len(pending) == 1 and pending[0]["status"] == "pending"
+    assert pending[0]["share_intent_id"] == share["id"]
+    assert safe_contact.inbox(now=NOW) == []
+    with db.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM proactive_messages").fetchone()[0] == 0
+        assert connection.execute("SELECT status FROM life_share_intents WHERE id=?", (share["id"],)).fetchone()[0] == "pending"
+    with pytest.raises(ValueError, match="显式启用"):
+        await SafeContactGenerator().generate(pending[0])
+
+
+@pytest.mark.asyncio
 async def test_smalltalk_is_derived_once_from_recent_real_interaction(context):
     db, repo, service, conversation = context
     user_message(db, conversation["id"], NOW - timedelta(hours=25), "下次聊聊那本童话")

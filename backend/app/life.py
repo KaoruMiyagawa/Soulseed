@@ -240,7 +240,7 @@ class LifeRepository:
         """Return a bounded, character-scoped snapshot for natural expression."""
         excluded = ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "烦")
         topic_cues = (
-            ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现", "研究经过", "研究过程", "怎么查到", "来源", "出处", "根据什么"), ("research", "exploring")),
+            ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现", "研究经过", "研究过程", "怎么查到", "怎么知道", "如何得知", "从哪里看到", "来源", "出处", "根据什么"), ("research", "exploring")),
             ("reading", ("阅读", "读书", "读的", "书名", "什么书"), ("reading",)),
             ("music", ("音乐", "歌曲", "首歌", "曲名", "旋律"), ("music",)),
             ("meal", ("吃", "饭", "食物", "做菜", "菜"), ("meal", "cooking")),
