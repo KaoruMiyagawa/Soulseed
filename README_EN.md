@@ -29,7 +29,7 @@ Growth is a direction supported by these foundations. The current rule-based pre
 
 ## Capabilities and status
 
-**2.8.0 is in development.** Implementation, isolated automated tests, and live acceptance are separate milestones. Status reviewed on 2026-11-08.
+**2.8.0 is in development.** Implementation, isolated automated tests, and live acceptance are separate milestones. Status reviewed on 2026-11-09.
 
 | Area | Implemented | Verification and boundaries |
 | --- | --- | --- |
@@ -37,12 +37,12 @@ Growth is a direction supported by these foundations. The current rule-based pre
 | Long-term memory and correction | Structured storage, conservative extraction, deterministic retrieval, correction proposals, clarification, atomic application, sources, and audit history | Isolated regression coverage. Extraction and retrieval use rules; semantic/vector retrieval is not implemented. |
 | Personality and early growth | Persona profile, `ExpressionContext`, experience/preference boundaries, and limited updates from completed activities | Validated with the first character; general character authoring and a complete growth engine remain future work. |
 | **2.8.0-A · Exploration** | Bounded model decisions, real search, safe webpage reading, relevance checks, source-backed claims, and persistent execution records | **First live manual success confirmed:** “Why do whales need to sing?” Read *Whale vocalization*, produced three sourced claims with scientific uncertainty, and completed in about 33 seconds with two model decisions. This is one successful case, not broad topic validation. |
-| **2.8.0-B · Background exploration** | Opt-in scheduling through `LifeScheduler`, saved-topic candidates, 24/48/168-hour intervals, pause/cooldown, quotas, and restart recovery | Isolated acceptance passed in the current development workspace. Unattended live model/network acceptance is pending. |
-| **2.8.0-C · Discovery sharing** | Worthwhile-result selection, character-scoped sources, deduplication, contact rules, and pending → ready → delivered → read handling | Isolated acceptance passed. Live autonomous sharing and natural expression still need review. Model-based contact generation is opt-in; the local safe generator keeps research shares pending. |
+| **2.8.0-B · Background exploration** | Opt-in scheduling through `LifeScheduler`, saved-topic candidates, 24/48/168-hour intervals, pause/cooldown, quotas, and restart recovery | Isolated acceptance passed, followed by one successful unattended live run. Its topic came from a saved unresolved question; independently generating a new interest remains unverified. |
+| **2.8.0-C · Discovery sharing** | Worthwhile-result selection, character-scoped sources, deduplication, contact rules, and pending → ready → delivered → read handling | Live delivery and a source follow-up were verified for the manual research result; its read status remains unconfirmed. The new autonomous run's share and contact intents remain pending, and message generation and delivery are not yet verified. |
 | **2.8.0-D · Exploration quota** | Separate UTC daily request reservations, quota snapshots, prechecks, and distinct provider/network errors | Isolated coverage. The default exploration limit is eight reservations per UTC day; it is not a monetary spending cap. |
 | Ownership and isolation | Local pairing sessions, character-scoped repositories, and database constraints against cross-character references | Isolated coverage. Fixed Development mode is limited to one local user and `big_fish`; this is not a multi-user deployment system. |
 
-The latest B/C fixes and supplementary tests are still uncommitted in the reviewed development workspace. Their local results must not be attributed to the published `main` snapshot. The [changelog](CHANGELOG.md) preserves historical checkpoints and their evidence.
+The B/C fixes and supplementary tests have been archived. Model-based contact generation is opt-in; the local safe generator keeps research shares pending. The [changelog](CHANGELOG.md) preserves historical checkpoints and their evidence.
 
 ## Architecture
 
@@ -114,7 +114,7 @@ CHANGELOG.md    Detailed technical history and verification boundaries
 
 ## Roadmap and limitations
 
-- **Next validation:** unattended live exploration, source-backed proactive sharing, and a wider range of search topics and failure conditions.
+- **Next validation:** message generation and delivery for autonomous discoveries, independently generated new interests, and a wider range of search topics and failure conditions.
 - **Character creation:** configurable character profiles, creation/selection interfaces, and character asset management.
 - **Growth:** richer interests, habits, and development that remain attributable, correctable, and capable of change.
 - **Later infrastructure:** broader identity providers and multi-user authorization, additional interaction channels, streaming, and improved retrieval.
