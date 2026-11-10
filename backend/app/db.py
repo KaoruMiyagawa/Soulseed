@@ -489,6 +489,150 @@ ALTER TABLE exploration_autonomy ADD COLUMN last_checked_at TEXT;
 ALTER TABLE exploration_autonomy ADD COLUMN last_skip_reason TEXT;
 """
 
+MIGRATIONS[19] = """
+CREATE TABLE autonomous_contact_candidates (
+    id TEXT PRIMARY KEY CHECK (length(id)=64),
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    candidate_type TEXT NOT NULL CHECK (candidate_type IN ('real_discovery','shared_topic')),
+    source_key TEXT NOT NULL,
+    evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json) AND json_type(evidence_json)='array'),
+    topic_fingerprint TEXT CHECK (topic_fingerprint IS NULL OR length(topic_fingerprint)=64),
+    status TEXT NOT NULL CHECK (status IN ('pending','claimed','deferred','completed','expired','cancelled','failed','outcome_unknown')),
+    reason_code TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    retry_after TEXT,
+    claim_count INTEGER NOT NULL DEFAULT 0 CHECK (claim_count >= 0),
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    CHECK ((status='claimed' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status<>'claimed' AND lease_token IS NULL AND lease_expires_at IS NULL)),
+    UNIQUE(id, character_id),
+    UNIQUE(character_id, candidate_type, source_key)
+);
+CREATE INDEX idx_autonomous_candidates_recovery
+    ON autonomous_contact_candidates(status, lease_expires_at, expires_at);
+CREATE INDEX idx_autonomous_candidates_topic
+    ON autonomous_contact_candidates(character_id, topic_fingerprint, created_at);
+
+CREATE TABLE autonomous_contact_reservations (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+    request_key TEXT NOT NULL UNIQUE,
+    timezone_id TEXT NOT NULL,
+    local_day TEXT NOT NULL,
+    request_status TEXT NOT NULL CHECK (request_status IN ('reserved','started','settled','released','outcome_unknown')),
+    message_status TEXT NOT NULL CHECK (message_status IN ('reserved','committed','released')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(candidate_id, character_id) REFERENCES autonomous_contact_candidates(id, character_id) ON DELETE RESTRICT,
+    UNIQUE(candidate_id, attempt_no)
+);
+CREATE INDEX idx_autonomous_reservations_budget
+    ON autonomous_contact_reservations(character_id, local_day, request_status, message_status);
+
+CREATE TRIGGER autonomous_candidates_owner_insert BEFORE INSERT ON autonomous_contact_candidates
+WHEN NEW.character_id IS NOT current_character()
+  OR NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+BEGIN SELECT RAISE(ABORT, 'autonomous candidate character is not owned in current scope'); END;
+CREATE TRIGGER autonomous_candidates_owner_update BEFORE UPDATE ON autonomous_contact_candidates
+WHEN NEW.character_id IS NOT current_character()
+  OR (NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+      AND NOT (NEW.character_id=OLD.character_id AND NEW.status IN ('cancelled','expired','failed','outcome_unknown')
+        AND NEW.lease_token IS NULL AND NEW.lease_expires_at IS NULL))
+BEGIN SELECT RAISE(ABORT, 'autonomous candidate character is not owned in current scope'); END;
+CREATE TRIGGER autonomous_candidates_state_transition BEFORE UPDATE OF status ON autonomous_contact_candidates
+WHEN NEW.status<>OLD.status AND NOT (
+    (OLD.status='pending' AND NEW.status IN ('claimed','deferred','expired','cancelled','failed')) OR
+    (OLD.status='deferred' AND NEW.status IN ('claimed','expired','cancelled','failed')) OR
+    (OLD.status='claimed' AND NEW.status IN ('pending','deferred','completed','expired','cancelled','failed','outcome_unknown'))
+)
+BEGIN SELECT RAISE(ABORT, 'invalid autonomous candidate state transition'); END;
+CREATE TRIGGER autonomous_reservations_owner_insert BEFORE INSERT ON autonomous_contact_reservations
+WHEN NEW.character_id IS NOT current_character()
+  OR NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+  OR NOT EXISTS (SELECT 1 FROM autonomous_contact_candidates c WHERE c.id=NEW.candidate_id AND c.character_id=NEW.character_id)
+BEGIN SELECT RAISE(ABORT, 'autonomous reservation character is not owned in current scope'); END;
+CREATE TRIGGER autonomous_reservations_owner_update BEFORE UPDATE ON autonomous_contact_reservations
+WHEN NEW.character_id IS NOT current_character()
+  OR (NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+      AND NOT (NEW.character_id=OLD.character_id AND NEW.request_status IN ('settled','released','outcome_unknown')
+        AND NEW.message_status='released'))
+  OR NOT EXISTS (SELECT 1 FROM autonomous_contact_candidates c WHERE c.id=NEW.candidate_id AND c.character_id=NEW.character_id)
+BEGIN SELECT RAISE(ABORT, 'autonomous reservation character is not owned in current scope'); END;
+"""
+
+MIGRATIONS[20] = """
+CREATE TABLE autonomous_contact_drafts (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL UNIQUE,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES autonomous_contact_reservations(id) ON DELETE RESTRICT,
+    evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json) AND json_type(evidence_json)='array'),
+    content TEXT NOT NULL CHECK (length(trim(content)) BETWEEN 1 AND 300),
+    content_hash TEXT NOT NULL CHECK (length(content_hash)=64),
+    review_status TEXT NOT NULL CHECK (review_status IN ('mock_approved','consumed','cancelled','expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE(id, character_id),
+    FOREIGN KEY(candidate_id, character_id) REFERENCES autonomous_contact_candidates(id, character_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_autonomous_drafts_recovery
+    ON autonomous_contact_drafts(review_status, expires_at, character_id);
+CREATE TRIGGER autonomous_drafts_owner_insert BEFORE INSERT ON autonomous_contact_drafts
+WHEN NEW.character_id IS NOT current_character()
+  OR NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+  OR NOT EXISTS (SELECT 1 FROM autonomous_contact_candidates c WHERE c.id=NEW.candidate_id AND c.character_id=NEW.character_id)
+  OR NOT EXISTS (SELECT 1 FROM autonomous_contact_reservations r WHERE r.id=NEW.reservation_id AND r.candidate_id=NEW.candidate_id AND r.character_id=NEW.character_id)
+BEGIN SELECT RAISE(ABORT, 'autonomous draft character is not owned in current scope'); END;
+CREATE TRIGGER autonomous_drafts_owner_update BEFORE UPDATE ON autonomous_contact_drafts
+WHEN NEW.character_id IS NOT current_character()
+  OR (NOT EXISTS (SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+      AND NOT (NEW.character_id=OLD.character_id AND NEW.review_status IN ('cancelled','expired')))
+BEGIN SELECT RAISE(ABORT, 'autonomous draft character is not owned in current scope'); END;
+CREATE TRIGGER autonomous_drafts_state_transition BEFORE UPDATE OF review_status ON autonomous_contact_drafts
+WHEN NEW.review_status<>OLD.review_status AND NOT (
+    OLD.review_status='mock_approved' AND NEW.review_status IN ('consumed','cancelled','expired')
+)
+BEGIN SELECT RAISE(ABORT, 'invalid autonomous draft state transition'); END;
+CREATE TRIGGER autonomous_drafts_content_immutable BEFORE UPDATE OF
+    candidate_id,character_id,reservation_id,evidence_json,content,content_hash,created_at,expires_at
+ON autonomous_contact_drafts
+BEGIN SELECT RAISE(ABORT, 'autonomous draft content is immutable'); END;
+"""
+
+
+MIGRATIONS[21] = """
+CREATE TABLE model_budget_windows (
+    day TEXT PRIMARY KEY,
+    policy_json TEXT NOT NULL,
+    history_ready INTEGER NOT NULL DEFAULT 0 CHECK(history_ready IN (0,1))
+);
+CREATE TABLE model_budget_requests (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    source TEXT NOT NULL,
+    day TEXT NOT NULL REFERENCES model_budget_windows(day),
+    status TEXT NOT NULL CHECK(status IN ('reserved','started','completed','failed','unknown','released')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    autonomous_reservation_id TEXT UNIQUE REFERENCES autonomous_contact_reservations(id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_model_budget_usage ON model_budget_requests(day,source,character_id,status);
+CREATE INDEX idx_model_budget_recovery ON model_budget_requests(character_id,status,lease_expires_at);
+CREATE TRIGGER model_budget_identity_immutable BEFORE UPDATE OF id,character_id,source,day,created_at,autonomous_reservation_id ON model_budget_requests
+BEGIN SELECT RAISE(ABORT, 'model budget identity is immutable'); END;
+CREATE TRIGGER model_budget_transition BEFORE UPDATE OF status ON model_budget_requests
+WHEN NEW.status<>OLD.status AND NOT (
+    (OLD.status='reserved' AND NEW.status IN ('started','released')) OR
+    (OLD.status='started' AND NEW.status IN ('completed','failed','unknown'))
+)
+BEGIN SELECT RAISE(ABORT, 'invalid model budget transition'); END;
+"""
+
 
 class Database:
     def __init__(self, path: str, *, environment: str | None = None,

@@ -239,47 +239,66 @@ class ContactService:
     def create_intent(self, *, character_id: str = "big_fish", source: str, source_id: str,
                       reason: str, topic: str | None = None, importance: str = "normal",
                       now: datetime | None = None) -> dict:
+        current = now or datetime.now(UTC)
+        self.preferences(character_id, now=current)
+        with self.repository.database.atomic() as db:
+            return self.create_intent_in_transaction(
+                db, character_id=character_id, source=source, source_id=source_id,
+                reason=reason, topic=topic, importance=importance, now=current,
+            )
+
+    def create_intent_in_transaction(self, db, *, character_id: str, source: str, source_id: str,
+                                     reason: str, topic: str | None = None,
+                                     importance: str = "normal", now: datetime | None = None,
+                                     status: str = "pending") -> dict:
+        """Create an allow-listed intent inside a caller-owned SQLite transaction.
+
+        This method deliberately does not open a transaction or initialize
+        preferences. Callers coordinating more than one row must use
+        Database.atomic() around this method.
+        """
+        if not db.in_transaction:
+            raise RuntimeError("contact_intent_transaction_required")
         if source not in {"life_share", "smalltalk", "conversation_followup", "reminder"} or importance not in {"normal", "important"}:
             raise ValueError("无效的联系意图类型")
         current = now or datetime.now(UTC)
+        if status not in {"pending", "ready"}:
+            raise ValueError("无效的联系意图状态")
         at = _iso(current)
         expires = _iso(current + timedelta(hours=72 if importance == "important" else 48))
-        self.preferences(character_id, now=current)
-        with self.repository.database.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT * FROM contact_intents WHERE character_id = ? AND source = ? AND source_id = ?", (character_id, source, source_id)).fetchone()
-            if existing:
-                if not existing["ownership_verified"]:
-                    raise ValueError("历史联系意图归属尚待确认")
-                return dict(existing)
-            share_id = event_id = None
-            if source == "life_share":
-                share = db.execute("SELECT s.id, s.event_id, s.reason AS share_reason, e.content, e.event_type, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id = s.event_id AND e.character_id=s.character_id WHERE s.id = ? AND s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND e.status = 'completed' AND e.activity_status = 'completed' AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine')", (source_id, character_id, at)).fetchone()
-                if not share:
-                    raise ValueError("分享意图须绑定尚未分享的已完成事件")
-                share_id, event_id, topic = share["id"], share["event_id"], share["content"]
-            elif source in {"smalltalk", "conversation_followup"}:
-                if importance != "normal":
-                    raise ValueError("普通闲聊不能标为重要提醒")
-                message = db.execute("SELECT m.content FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id = ? AND m.role = 'user' AND c.character_id = ?", (source_id, character_id)).fetchone()
-                if not message:
-                    raise ValueError("闲聊意图须引用真实用户消息")
-                text = message["content"].strip()
-                if len(text) < 2 or len(text) > 120 or any(word in text for word in ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "我在忙", "别打扰", "不要联系", "不要主动联系", "密码", "密钥")):
-                    raise ValueError("这条用户消息不适合作为主动闲聊主题")
-                topic = text[:60]
-            if not topic or not topic.strip():
-                raise ValueError("联系主题不能为空")
-            if share_id:
-                reason = share["share_reason"] or reason
-            intent_id = str(uuid4())
-            db.execute("INSERT INTO contact_intents(ownership_verified, id, character_id, source, source_id, share_intent_id, event_id, importance, reason, topic, status, created_at, expires_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                       (intent_id, character_id, source, source_id, share_id, event_id, importance, reason[:200], topic.strip()[:120], at, expires))
-            if share_id:
-                changed = db.execute("UPDATE life_share_intents SET delivery_channel='contact', selection_token=NULL, selection_expires_at=NULL WHERE id=? AND status='pending' AND (delivery_channel IS NULL OR delivery_channel='contact') AND (selection_token IS NULL OR selection_expires_at <= ?)", (share_id, at)).rowcount
-                if changed != 1:
-                    raise ValueError("分享经历正在由聊天处理")
-            return dict(db.execute("SELECT * FROM contact_intents WHERE id = ?", (intent_id,)).fetchone())
+        existing = db.execute("SELECT * FROM contact_intents WHERE character_id = ? AND source = ? AND source_id = ?", (character_id, source, source_id)).fetchone()
+        if existing:
+            if not existing["ownership_verified"]:
+                raise ValueError("历史联系意图归属尚待确认")
+            return dict(existing)
+        share_id = event_id = None
+        if source == "life_share":
+            share = db.execute("SELECT s.id, s.event_id, s.reason AS share_reason, e.content, e.event_type, e.generation_method FROM life_share_intents s JOIN life_events e ON e.id = s.event_id AND e.character_id=s.character_id WHERE s.id = ? AND s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND e.status = 'completed' AND e.activity_status = 'completed' AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine')", (source_id, character_id, at)).fetchone()
+            if not share:
+                raise ValueError("分享意图须绑定尚未分享的已完成事件")
+            share_id, event_id, topic = share["id"], share["event_id"], share["content"]
+        elif source in {"smalltalk", "conversation_followup"}:
+            if importance != "normal":
+                raise ValueError("普通闲聊不能标为重要提醒")
+            message = db.execute("SELECT m.content FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id = ? AND m.role = 'user' AND c.character_id = ?", (source_id, character_id)).fetchone()
+            if not message:
+                raise ValueError("闲聊意图须引用真实用户消息")
+            text = message["content"].strip()
+            if len(text) < 2 or len(text) > 120 or any(word in text for word in ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "我在忙", "别打扰", "不要联系", "不要主动联系", "密码", "密钥")):
+                raise ValueError("这条用户消息不适合作为主动闲聊主题")
+            topic = text[:60]
+        if not topic or not topic.strip():
+            raise ValueError("联系主题不能为空")
+        if share_id:
+            reason = share["share_reason"] or reason
+        intent_id = str(uuid4())
+        db.execute("INSERT INTO contact_intents(ownership_verified, id, character_id, source, source_id, share_intent_id, event_id, importance, reason, topic, status, created_at, expires_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (intent_id, character_id, source, source_id, share_id, event_id, importance, reason[:200], topic.strip()[:120], status, at, expires))
+        if share_id:
+            changed = db.execute("UPDATE life_share_intents SET delivery_channel='contact', selection_token=NULL, selection_expires_at=NULL WHERE id=? AND status='pending' AND (delivery_channel IS NULL OR delivery_channel='contact') AND (selection_token IS NULL OR selection_expires_at <= ?)", (share_id, at)).rowcount
+            if changed != 1:
+                raise ValueError("分享经历正在由聊天处理")
+        return dict(db.execute("SELECT * FROM contact_intents WHERE id = ?", (intent_id,)).fetchone())
 
     def sync_shares(self, character_id: str = "big_fish", *, now: datetime | None = None) -> list[dict]:
         current = now or datetime.now(UTC)

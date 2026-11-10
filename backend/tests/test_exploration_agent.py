@@ -135,7 +135,7 @@ def test_v14_database_upgrade_adds_exploration_without_changing_existing_life_re
     monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
     db.initialize(); db.initialize()
     with db.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
         evidence_columns = {row[1] for row in sql.execute("PRAGMA table_info(exploration_evidence)")}
         assert {"provider", "relevance", "page_relevance"} <= evidence_columns
         assert sql.execute("SELECT COUNT(*) FROM exploration_autonomy").fetchone()[0] == 0

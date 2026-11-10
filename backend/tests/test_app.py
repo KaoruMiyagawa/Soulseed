@@ -45,7 +45,7 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 18
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 21
 
 
 def test_health_exposes_non_secret_runtime_build_and_startup_ids():

@@ -282,4 +282,4 @@ def test_migration_14_failure_rolls_back_and_retry_preserves_schema(tmp_path, mo
         assert "delivery_channel" not in {row[1] for row in sql.execute("PRAGMA table_info(life_share_intents)")}
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21

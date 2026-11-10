@@ -286,7 +286,7 @@ def test_migration_12_to_14_preserves_legacy_event_and_marks_it_interrupted(tmp_
     new_db = Database(old_db.path)
     new_db.initialize()
     with new_db.connection() as sql:
-        assert [row[0] for row in sql.execute("SELECT version FROM schema_migrations ORDER BY version")] == list(range(1, 19))
+        assert [row[0] for row in sql.execute("SELECT version FROM schema_migrations ORDER BY version")] == list(range(1, 22))
         assert sql.execute("SELECT content FROM life_events WHERE id=?", (event["id"],)).fetchone()[0] == event["content"]
     repo = LifeRepository(new_db)
     owner = LifeInstance(new_db, repo)
@@ -316,4 +316,4 @@ def test_failed_migration_13_leaves_version_12_schema_intact(tmp_path, monkeypat
         assert sql.execute("SELECT name FROM sqlite_master WHERE name='life_service_instances'").fetchone() is None
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21

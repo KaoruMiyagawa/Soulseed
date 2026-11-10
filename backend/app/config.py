@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     contact_model_generation_enabled: bool = False
     contact_background_enabled: bool = True
     contact_check_interval_minutes: int = Field(default=60, ge=30)
+    autonomous_intent_shadow_enabled: bool = False
+    autonomous_intent_shadow_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    autonomous_contact_generation_enabled: bool = False
+    autonomous_contact_handoff_enabled: bool = False
+    autonomous_contact_daily_model_request_limit: int = Field(default=2, ge=1, le=100)
+    autonomous_contact_daily_message_limit: int = Field(default=1, ge=1, le=20)
+    autonomous_contact_candidate_lease_minutes: int = Field(default=2, ge=1, le=30)
+    autonomous_contact_topic_dedup_days: int = Field(default=30, ge=1, le=365)
     local_pairing_secret: str | None = Field(default=None, repr=False, min_length=32)
     migration_backup_path: str | None = Field(default=None, repr=False)
     migration_confirmation: str | None = Field(default=None, repr=False)

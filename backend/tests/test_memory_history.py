@@ -184,5 +184,5 @@ def test_synthetic_legacy_upgrade_preserves_data_and_adds_history_table(tmp_path
     with database.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == before[0]
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == before[1]
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_change_log'").fetchone()[0] == 1

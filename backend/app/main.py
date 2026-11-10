@@ -31,6 +31,7 @@ from .exploration_repository import ExplorationRepository
 from .life_share import LifeShareService
 from .contact import AdapterContactGenerator, ContactService
 from .contact_scheduler import ContactScheduler
+from .autonomous_intent_shadow import ShadowModeScheduler
 from .build_info import BUILD_ID, STARTUP_ID
 from .local_auth import LocalAuth, COOKIE, ALLOWED_ORIGINS
 from .ownership import character_scope
@@ -227,6 +228,13 @@ async def lifespan(_: FastAPI):
             tasks.append(asyncio.create_task(ContactScheduler(
                 ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled),
                 interval=timedelta(minutes=settings.contact_check_interval_minutes),
+            ).run_forever(stop)))
+        if settings.autonomous_intent_shadow_enabled:
+            tasks.append(asyncio.create_task(ShadowModeScheduler(
+                database,
+                enabled=True,
+                contact_enabled=settings.contact_enabled,
+                interval=timedelta(minutes=settings.autonomous_intent_shadow_interval_minutes),
             ).run_forever(stop)))
         tasks.append(asyncio.create_task(runtime.run_heartbeat(stop)))
         yield

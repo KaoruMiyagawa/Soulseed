@@ -62,7 +62,7 @@ def new_clarification(context):
 def test_fresh_database_has_migration_7_and_clarification_constraints(clarification_context):
     database = clarification_context[0]
     with database.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
         columns = {row["name"] for row in db.execute("PRAGMA table_info(memory_correction_clarifications)")}
         assert {
             "id", "conversation_id", "trigger_message_id", "source_proposal_id", "conflict_context",
@@ -95,6 +95,9 @@ def test_migration_7_upgrades_existing_database_and_preserves_data(tmp_path, mon
         patch.delitem(db_module.MIGRATIONS, 16)
         patch.delitem(db_module.MIGRATIONS, 17)
         patch.delitem(db_module.MIGRATIONS, 18)
+        patch.delitem(db_module.MIGRATIONS, 19)
+        patch.delitem(db_module.MIGRATIONS, 20)
+        patch.delitem(db_module.MIGRATIONS, 21)
         database.initialize()
         conversation, message = {"id": "legacy-conversation"}, {"id": "legacy-message"}
         with database.connection() as db:
@@ -105,7 +108,7 @@ def test_migration_7_upgrades_existing_database_and_preserves_data(tmp_path, mon
 
     database.initialize()
     with database.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 18
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
         assert db.execute("SELECT content FROM messages WHERE id = ?", (message["id"],)).fetchone()[0] == "历史消息仍保留"
         assert db.execute("SELECT title FROM conversations WHERE id = ?", (conversation["id"],)).fetchone()[0] == "新会话"
         assert db.execute("SELECT COUNT(*) FROM memory_correction_clarifications").fetchone()[0] == 0
