@@ -4,10 +4,12 @@
 
 **A future where everyone can create a digital individual of their own—one that keeps growing.**
 
+**A World for Every Individual.** The [product vision and decision record](docs/product_vision.md) preserves the confirmed long-term direction.
+
 [![Development](https://img.shields.io/badge/status-2.8.0%20development-476b85)](CHANGELOG.md)
 [![Local first](https://img.shields.io/badge/runtime-local%20first-527d70)](docs/setup_EN.md)
 
-Soulseed is building a foundation for different digital individuals: persistent characters with their own personality, memories, experiences, interests, and history. The vision is for people to create or choose a character, then develop a unique relationship through long-term interaction and growth.
+Soulseed is a platform for different digital individuals. Its long-term direction includes stable personality, memory, independent judgment, autonomous behavior, and continued growth, with distinctive relationships and interaction habits emerging over time. Character creation, interaction among multiple individuals, and a continuously unfolding digital world are future directions, not capabilities delivered by the current application.
 
 **Da Feiyu (大肥鱼, “Big Fish”) is the first validation character.** The current application is a local, single-user prototype centered on her. Character creation, character selection, and a multi-user service are future work.
 

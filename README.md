@@ -4,10 +4,12 @@
 
 **让每个人都能创造属于自己的、持续成长的数字个体。**
 
+**A World for Every Individual.** [产品愿景与决策档案](docs/product_vision.md)记录了已确认的长期方向。
+
 [![Development](https://img.shields.io/badge/status-2.8.0%20development-476b85)](CHANGELOG.md)
 [![Local first](https://img.shields.io/badge/runtime-local%20first-527d70)](docs/setup.md)
 
-Soulseed 正在构建一套面向不同数字个体的底层系统：让数字人物拥有延续的身份、独特的性格、记忆、经历和兴趣，并在长期相处中形成自己的成长轨迹。未来，每个人都能创造或选择想要的人物，让共同经历逐渐塑造出独一无二的数字个体。
+Soulseed 正在构建承载不同数字个体的平台。长期方向是让数字个体拥有稳定的人格内核、记忆、独立判断、自主行为和持续成长能力，并在长期相处中形成独特的关系与互动习惯。角色创作、多角色相互交流和持续发展的数字世界属于未来方向，当前应用尚未交付这些能力。
 
 **大肥鱼是第一个验证角色。** 当前应用是围绕她构建的本地单用户原型；角色创建、角色选择和多用户服务仍属于后续规划。
 
