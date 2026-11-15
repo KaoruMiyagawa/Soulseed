@@ -161,23 +161,28 @@ def _same_decision(supplied: Decision, fresh: Decision, candidate: Candidate) ->
 
 def build_draft_context(database: Database, character_id: str, candidate: Candidate,
                         decision: Decision, persona: PersonaProfile, *, now: datetime | None = None,
-                        allow_first_discovery: bool = False, extra_candidate: Candidate | None = None) -> DraftContext:
+                        allow_first_discovery: bool = False, extra_candidate: Candidate | None = None,
+                        include_self_social: bool = False) -> DraftContext:
     """Re-read B's candidate and its saved evidence; never trust caller-made objects."""
     if current_character.get() != character_id or persona.character_id != character_id or candidate.character_id != character_id:
         raise ValueError('character_scope_mismatch')
     if not persona.description.strip() or len(persona.description) > 1200 or not persona.allowed_styles or any(s not in _STYLES for s in persona.allowed_styles):
         raise ValueError('invalid_persona')
     snapshot = build_snapshot(database, character_id, now=now)
-    fresh = dry_run(snapshot, allow_first_discovery=allow_first_discovery, extra_candidate=extra_candidate)
-    if candidate not in (*generate_candidates(snapshot), *((extra_candidate,) if extra_candidate else ())) or not _same_decision(decision, fresh, candidate):
+    fresh = dry_run(snapshot, allow_first_discovery=allow_first_discovery, extra_candidate=extra_candidate, include_self_social=include_self_social)
+    if candidate not in (*generate_candidates(snapshot, include_self_social=include_self_social), *((extra_candidate,) if extra_candidate else ())) or not _same_decision(decision, fresh, candidate):
         raise ValueError('candidate_not_eligible')
     options: list[EvidenceOption] = []
     share = None
     interactions = []
     candidate_ids = {ref.id for ref in candidate.evidence}
-    if candidate.kind in ('smalltalk', 'conversation_followup'):
-        from .desktop_contact import DesktopContact
-        if DesktopContact.smalltalk_candidate_for_database(database, character_id, now=snapshot.observed_at) != candidate:
+    if candidate.kind == 'self_social':
+        topic = snapshot.mood or (snapshot.current_activity.content if snapshot.current_activity else snapshot.preferences[0].evidence.id)
+        options.append(EvidenceOption('state:' + candidate.evidence[0].id, 'self_social', topic, (candidate.evidence[0].id,)))
+        interactions = [f'{item.role}: {item.content}' for item in snapshot.interactions if not item.truncated][:4]
+    elif candidate.kind in ('smalltalk', 'conversation_followup'):
+        from .autonomous_social import AutonomousContact
+        if AutonomousContact.smalltalk_candidate_for_database(database, character_id, now=snapshot.observed_at) != candidate:
             raise ValueError('candidate_not_eligible')
         with database.connection() as db:
             anchor = db.execute("SELECT content FROM messages WHERE id=? AND role='user'", (candidate.evidence[0].id,)).fetchone()

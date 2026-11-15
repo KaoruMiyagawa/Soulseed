@@ -250,6 +250,8 @@ def commit_contact(state, contact, db, row, token, content, current, *, failure_
     ids = {item["kind"]: item["id"] for item in evidence if item["kind"] != "message"}
     if row["candidate_type"] == "real_discovery":
         source, source_id = "life_share", ids.get("share")
+    elif row["candidate_type"] == "self_social":
+        source, source_id = "self_social", ids.get("life_state")
     else:
         source = row["candidate_type"] if row["candidate_type"] in ("smalltalk", "conversation_followup") else "conversation_followup"
         message_ids = [item["id"] for item in evidence if item["kind"] == "message"]
@@ -263,7 +265,7 @@ def commit_contact(state, contact, db, row, token, content, current, *, failure_
         db.execute("UPDATE autonomous_contact_reservations SET message_status='released',updated_at=? WHERE id=?", (at, reservation["id"]))
         state._defer_or_end(db, row, "contact_source_not_allowlisted", None, "cancelled", current)
         return PipelineResult("rejected", candidate_id, reason_code="contact_source_not_allowlisted")
-    topic = state._topic_for_row(row, db)
+    topic = "角色当前状态" if row["candidate_type"] == "self_social" else state._topic_for_row(row, db)
     intent = contact.create_intent_in_transaction(
         db, character_id=character_id, source=source, source_id=source_id,
         reason="autonomous_evidence_backed_candidate", topic=topic,

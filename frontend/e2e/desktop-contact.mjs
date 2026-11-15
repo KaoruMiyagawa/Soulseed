@@ -9,13 +9,19 @@ import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { chromium, expect } from "@playwright/test";
 
-const [binary, isolatedData, evidenceDirectory] = process.argv.slice(2).map(value => resolve(value));
+const [binary, isolatedData, evidenceDirectory] = process.argv.slice(2, 5).map(value => resolve(value));
+const selfSocial = process.argv[5] === "self";
 assert(process.platform === "win32" && binary && isolatedData && evidenceDirectory);
 const installedFixture = resolve(process.env.LOCALAPPDATA, "com.soulseed.desktop", "data");
 assert(isolatedData.toLowerCase().includes("\\desktop-build\\qa\\") ||
   (process.env.SOULSEED_INSTALLED_QA === "1" && isolatedData.toLowerCase() === installedFixture.toLowerCase()));
 const database = new DatabaseSync(join(isolatedData, "soulseed-desktop.db"));
 assert.equal(database.prepare("SELECT COUNT(*) AS n FROM messages WHERE role='user'").get().n, 1);
+if (selfSocial) {
+  const historical = database.prepare("SELECT created_at FROM messages WHERE role='user'").get();
+  assert(Date.now() - Date.parse(historical.created_at) > 90 * 24 * 60 * 60 * 1000,
+    "self-social QA must not have a recent user interaction");
+}
 assert.equal(database.prepare("SELECT COUNT(*) AS n FROM desktop_model_config").get().n, 0);
 const [conversation] = database.prepare("SELECT id FROM conversations").all();
 assert(conversation);
@@ -31,6 +37,8 @@ const mock = createServer(async (request, response) => {
   let signals;
   try { signals = JSON.parse(body.messages.at(-1).content); } catch {}
   const kind = signals?.choices ? "contact" : "chat";
+  if (kind === "contact" && selfSocial) assert.equal(signals.candidate_type, "self_social");
+  if (kind === "contact" && selfSocial) assert(signals.memories.some(item => item.includes("蓝色玻璃珠")));
   requests.push(kind);
   if (kind === "chat") chatPayload = body;
   if (kind === "contact") await contactRelease;
@@ -80,7 +88,7 @@ async function start() {
   try {
     browser = await waitFor(() => chromium.connectOverCDP(`http://127.0.0.1:${port}`));
     const page = browser.contexts()[0].pages()[0];
-    await expect(page.getByRole("heading", { name: /大肥鱼的.*生活世界/ })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /大肥鱼的.*生活世界/ })).toBeVisible({ timeout: 30_000 });
     const call = (path, method = "GET", body = null) => page.evaluate(async ({ path, method, body }) => {
       const result = await window.__TAURI__.core.invoke("desktop_request", {
         path, method, body: body === null ? null : JSON.stringify(body),
@@ -142,7 +150,7 @@ try {
   execFileSync("powershell.exe", ["-NoProfile", "-File", fileURLToPath(new URL("./contact-window.ps1", import.meta.url)),
     "-ProcessId", String(app.child.pid), "-Command", "Restore"], { windowsHide: true });
   await expect(app.page.getByText(/今天想给你丢一颗快乐泡泡/)).toBeVisible();
-  await app.page.getByLabel("写给大肥鱼的消息").fill("我接住了！");
+  await app.page.getByLabel("写给大肥鱼的消息").fill("我接住了，也喜欢蓝色玻璃珠手链！");
   await app.page.getByRole("button", { name: "发送", exact: true }).click();
   await expect(app.page.getByText("我接住啦，泡泡还在！")).toBeVisible();
   await app.page.screenshot({ path: join(evidenceDirectory, "contact-conversation.png") });
@@ -150,12 +158,22 @@ try {
   assert.equal(chatPayload.max_tokens, 1024);
   const chatContext = chatPayload.messages.map(item => item.content).join("\n");
   assert.match(chatContext, /童真、活泼、好奇、淘气/);
-  assert.match(chatContext, /最近在听音乐/);
+  if (!selfSocial) assert.match(chatContext, /最近在听音乐/);
   assert.match(chatContext, /今天想给你丢一颗快乐泡泡/);
+  if (selfSocial) assert.match(chatContext, /蓝色玻璃珠/);
   await app.page.getByRole("button", { name: /模型设置/ }).click();
   await app.page.getByRole("button", { name: "一键暂停自主功能" }).click();
   await expect(app.page.getByText(/主动联系：已暂停/)).toBeVisible();
   await app.page.getByRole("button", { name: "取消", exact: true }).click();
+  await app.page.getByRole("button", { name: "手帐", exact: true }).click();
+  await expect(app.page.getByRole("heading", { name: "生活手帐" })).toBeVisible();
+  await app.page.getByRole("button", { name: "计划", exact: true }).click();
+  await expect(app.page.getByRole("heading", { name: "今日计划" })).toBeVisible();
+  await app.page.getByRole("button", { name: "探索", exact: true }).click();
+  await expect(app.page.getByRole("heading", { name: "探索与发现" })).toBeVisible();
+  await app.page.getByRole("button", { name: "她的世界", exact: true }).click();
+  await expect(app.page.getByRole("heading", { name: /大肥鱼的.*生活世界/ })).toBeVisible();
+  await app.page.getByRole("button", { name: "对话", exact: true }).click();
   const closed = app;
   const oldPid = app.pid;
   console.log("Verified proactive message and reply in the same chat. Closing the window.");
@@ -166,7 +184,7 @@ try {
   await app.page.getByRole("button", { name: "对话", exact: true }).click();
   await expect(app.page.getByText(/今天想给你丢一颗快乐泡泡/)).toHaveCount(1);
   assert.deepEqual(requests, ["contact", "chat"]);
-  console.log("Old smalltalk, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=1.");
+  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=1.`);
   assert(toast, "Windows toast did not appear");
   assert.equal(toastRows(tag).length, 1);
   console.log("Windows AUMID toast verified.");

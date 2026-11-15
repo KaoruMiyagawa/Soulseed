@@ -259,7 +259,7 @@ class ContactService:
         """
         if not db.in_transaction:
             raise RuntimeError("contact_intent_transaction_required")
-        if source not in {"life_share", "smalltalk", "conversation_followup", "reminder"} or importance not in {"normal", "important"}:
+        if source not in {"life_share", "smalltalk", "conversation_followup", "reminder", "self_social"} or importance not in {"normal", "important"}:
             raise ValueError("无效的联系意图类型")
         current = now or datetime.now(UTC)
         if status not in {"pending", "ready"}:

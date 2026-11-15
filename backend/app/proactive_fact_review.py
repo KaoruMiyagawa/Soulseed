@@ -94,6 +94,7 @@ def classify_review_text(text: str, *, evidence_available: bool, controlled: boo
 
 
 _EVIDENCE_QUERIES = {
+    "life_state": "SELECT * FROM life_states WHERE character_id=? AND character_id=?",
     "message": """SELECT m.id,m.role,m.content,m.created_at,m.conversation_id,c.character_id
                    FROM messages m JOIN conversations c ON c.id=m.conversation_id
                    WHERE m.id=? AND c.character_id=?""",
@@ -124,6 +125,9 @@ def _evidence_versions(sql, candidate, now):
         elif candidate["candidate_type"] in ("smalltalk", "conversation_followup"):
             if kinds != ["message"]:
                 return ()
+        elif candidate["candidate_type"] == "self_social":
+            if kinds != ["life_state"]:
+                return ()
         elif candidate["candidate_type"] != "shared_topic" or kinds != ["message", "message"]:
             return ()
         character_id = candidate["character_id"]
@@ -131,10 +135,16 @@ def _evidence_versions(sql, candidate, now):
             return ()
         versions = []
         for kind, ref_id in keys:
-            row = sql.execute(_EVIDENCE_QUERIES[kind], (ref_id, character_id)).fetchone()
+            row = sql.execute(_EVIDENCE_QUERIES[kind], (character_id if kind == 'life_state' else ref_id, character_id)).fetchone()
             if row is None:
                 return ()
-            payload = json.dumps([character_id, kind, dict(row)], ensure_ascii=False, sort_keys=True)
+            related = None
+            if kind == 'life_state':
+                related = {
+                    'preferences': [dict(item) for item in sql.execute('SELECT * FROM life_preferences WHERE character_id=? ORDER BY event_type', (character_id,))],
+                    'activity': [dict(item) for item in sql.execute('SELECT * FROM life_events WHERE character_id=? AND id=?', (character_id, row['current_activity_event_id']))],
+                }
+            payload = json.dumps([character_id, kind, dict(row)] + ([related] if related is not None else []), ensure_ascii=False, sort_keys=True)
             versions.append(EvidenceVersion(kind, ref_id, sha256(payload.encode("utf-8")).hexdigest()))
         return tuple(versions)
     except (KeyError, ValueError, TypeError):

@@ -24,6 +24,7 @@ from .config import get_settings
 from .db import Database
 from .desktop_runtime import ModelInput, RuntimeLimitsInput, runtime as desktop
 from .desktop_contact import DesktopContact
+from .autonomous_social import AutonomousContact
 from .model_adapter import (ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter,
                             ModelDailyQuotaExhausted, ModelQuotaUnavailable, ModelBudgetContext)
 from .model_budget import BudgetRejected, ModelBudgetService
@@ -227,6 +228,31 @@ contact_generator = (
 )
 contact_service = ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled)
 desktop_contact = DesktopContact(desktop, life_repository, model_adapter) if desktop else None
+
+
+class WebContactRuntime:
+    """Adapt the existing web model policy to the shared contact orchestration."""
+    def __init__(self, database, settings, model):
+        self.database, self.settings, self.model = database, settings, model
+        self.budget = self
+        self.legacy_contact_budget = not model.strict_budget
+
+    def require_autonomous_allowed(self, source):
+        if not self.settings.contact_enabled:
+            raise BudgetRejected('contact_globally_disabled')
+
+    def status(self):
+        return {'configured': bool(self.settings.model_enabled and self.settings.model_api_key)}
+
+    def runtime_status(self):
+        return {'remaining': None}
+
+    def model_settings(self):
+        return self.settings
+
+
+web_contact = (AutonomousContact(WebContactRuntime(database, settings, model_adapter), life_repository, model_adapter)
+               if not desktop and settings.contact_model_generation_enabled else None)
 proposal_service = MemoryProposalService(MemoryProposalRepository(database))
 memory_correction_service = MemoryCorrectionService(database)
 correction_flow = CorrectionFlowService(memory_service, proposal_service)
@@ -321,7 +347,7 @@ async def lifespan(application: FastAPI):
             tasks.append(asyncio.create_task(scheduler.run_forever(stop)))
         if not desktop and settings.contact_enabled and settings.contact_background_enabled:
             tasks.append(asyncio.create_task(ContactScheduler(
-                ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled),
+                web_contact or ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled),
                 interval=timedelta(minutes=settings.contact_check_interval_minutes),
             ).run_forever(stop)))
         if settings.autonomous_intent_shadow_enabled:

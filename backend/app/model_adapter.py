@@ -339,7 +339,7 @@ class OpenAICompatibleAdapter:
             raise ModelConfigurationError("unsupported_budget_source")
         if request_context and context.source not in {"exploration", "autonomous_exploration"}:
             raise ModelConfigurationError("exploration_budget_source_required")
-        linked = context.source == "autonomous" and self.desktop_strict and bool(
+        linked = context.source == "autonomous" and bool(
             context.autonomous_reservation_id and context.claim_token)
         if (context.autonomous_reservation_id is not None or context.claim_token is not None or context.source == "autonomous") and not linked:
             raise ModelConfigurationError("d2_joint_lifecycle_not_integrated")

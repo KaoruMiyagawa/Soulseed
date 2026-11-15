@@ -111,6 +111,8 @@ class CharacterSnapshot:
     memories: tuple[MemoryObservation, ...]
     handled_topics: tuple[HandledTopic, ...]
     handled_topics_complete: bool
+    life_state: EvidenceRef | None = None
+    mood: str = ''
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,7 @@ def build_snapshot(database: Database, character_id: str, *, now: datetime | Non
             owner = db.execute("SELECT 1 FROM characters WHERE id=? AND ownership_status='owned'", (character_id,)).fetchone()
             if not owner:
                 raise ValueError("character is not owned")
-            state = db.execute("SELECT timezone_id,current_activity_event_id FROM life_states WHERE character_id=?", (character_id,)).fetchone()
+            state = db.execute("SELECT timezone_id,current_activity_event_id,mood,updated_at FROM life_states WHERE character_id=?", (character_id,)).fetchone()
             pref = db.execute("SELECT allowed,quiet_start_minute,quiet_end_minute,busy_until,pause_until,updated_at FROM contact_preferences WHERE character_id=?", (character_id,)).fetchone()
             last = db.execute("SELECT m.id,m.status,m.created_at,m.delivered_at FROM proactive_messages m JOIN contact_intents i ON i.id=m.intent_id WHERE i.character_id=? AND i.ownership_verified=1 ORDER BY m.created_at DESC,m.id DESC LIMIT 1", (character_id,)).fetchone()
             ready = db.execute("SELECT 1 FROM proactive_messages m JOIN contact_intents i ON i.id=m.intent_id WHERE i.character_id=? AND i.ownership_verified=1 AND i.status='ready' AND m.status='ready' LIMIT 1", (character_id,)).fetchone()
@@ -270,8 +272,12 @@ def build_snapshot(database: Database, character_id: str, *, now: datetime | Non
                 discoveries.append(Discovery(_ref('share', row['share_id'], character_id, row['share_at'], 'pending', 'life_share'),
                     _ref('life_event', row['event_id'], character_id, row['occurred_at'], 'completed', 'web_research'),
                     _ref('exploration', row['run_id'], character_id, row['ended_at'], 'completed', 'exploration_agent'), refs))
+            state_ref = (_ref('life_state', character_id + ':' + current.date().isoformat(), character_id,
+                              state['updated_at'], 'saved', 'life_states')
+                         if state and (state['mood'] or current_activity or prefs) else None)
             return CharacterSnapshot(character_id, current, state['timezone_id'] if state else None, contact,
-                                     tuple(discoveries), life_events, current_activity, interactions, latest_user, prefs, tuple(memories), tuple(handled_topics), len(handled_rows) <= 100)
+                                     tuple(discoveries), life_events, current_activity, interactions, latest_user, prefs, tuple(memories), tuple(handled_topics), len(handled_rows) <= 100,
+                                     state_ref, (state['mood'] or '')[:100] if state else '')
         finally:
             db.rollback()
             db.execute(f"PRAGMA query_only={int(old_query_only)}")
@@ -292,11 +298,16 @@ def _topic_key(topic: str) -> str:
 
 
 def interest_candidates(snapshot: CharacterSnapshot) -> tuple[Candidate, ...]:
-    """Extension point: current preference weights alone cannot prove a new interest."""
-    return ()
+    """Offer a daily opportunity grounded in the saved state, without claiming novelty."""
+    ref = snapshot.life_state
+    if not ref:
+        return ()
+    end = datetime.combine(snapshot.observed_at.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
+    return (Candidate('self_social', snapshot.character_id, (ref,), 'character_state', 'subjective',
+                      _key(snapshot.character_id, 'self_social', ref.id), end),)
 
 
-def generate_candidates(snapshot: CharacterSnapshot) -> tuple[Candidate, ...]:
+def generate_candidates(snapshot: CharacterSnapshot, *, include_self_social: bool = False) -> tuple[Candidate, ...]:
     candidates = []
     now = snapshot.observed_at
     for discovery in snapshot.discoveries:
@@ -324,10 +335,13 @@ def generate_candidates(snapshot: CharacterSnapshot) -> tuple[Candidate, ...]:
         if reply.truncated or topic not in reply.content or _NEGATIVE.search(reply.content) or any(stop in reply.content for stop in _STOP) or not any(word in reply.content for word in ('好', '可以', '愿意', '期待', '想聊', '下次', '改天', '回头')):
             continue
         candidates.append(Candidate('shared_topic', snapshot.character_id, (msg.evidence, reply.evidence), 'explicit_followup_with_reply', 'explicit', _key(snapshot.character_id, 'shared_topic', msg.evidence.id), created + timedelta(hours=72)))
+    if include_self_social:
+        candidates.extend(interest_candidates(snapshot))
     return tuple(candidates[:20])
 
 
-def dry_run(snapshot: CharacterSnapshot, *, allow_first_discovery: bool = False, extra_candidate: Candidate | None = None) -> Decision:
+def dry_run(snapshot: CharacterSnapshot, *, allow_first_discovery: bool = False, extra_candidate: Candidate | None = None,
+            include_self_social: bool = False) -> Decision:
     """Evaluate only this snapshot; CONTACT is not a send authorization."""
     now, contact = snapshot.observed_at, snapshot.contact
     if contact.allowed is not True:
@@ -342,7 +356,8 @@ def dry_run(snapshot: CharacterSnapshot, *, allow_first_discovery: bool = False,
         local = now.astimezone(ZoneInfo(snapshot.timezone_id))
     except (ZoneInfoNotFoundError, ValueError):
         return Decision(DecisionKind.SILENT, None, (), ('contact_policy_unknown',), False)
-    candidates = generate_candidates(snapshot) or ((extra_candidate,) if extra_candidate else ())
+    candidates = generate_candidates(snapshot)
+    candidates = candidates or ((extra_candidate,) if extra_candidate else ()) or (interest_candidates(snapshot) if include_self_social else ())
     candidate = candidates[0] if candidates else None
     ids = tuple(ref.id for ref in candidate.evidence) if candidate else ()
     def deferred(reason: str, retry: datetime | None = None) -> Decision:
@@ -362,7 +377,7 @@ def dry_run(snapshot: CharacterSnapshot, *, allow_first_discovery: bool = False,
     if contact.ready_exists:
         return deferred('ready_message_pending')
     user_at = _time(snapshot.latest_user.evidence.observed_at) if snapshot.latest_user else None
-    if not snapshot.latest_user and not (allow_first_discovery and candidate and candidate.kind == 'real_discovery'):
+    if not snapshot.latest_user and not (candidate and (candidate.kind == 'self_social' or allow_first_discovery and candidate.kind == 'real_discovery')):
         return deferred('no_user_interaction')
     if snapshot.latest_user and (user_at is None or user_at > now):
         return deferred('user_interaction_time_unknown')

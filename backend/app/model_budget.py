@@ -162,9 +162,19 @@ class ModelBudgetService:
             db.execute('UPDATE model_budget_requests SET status=?,updated_at=?,lease_expires_at=? WHERE id=?', (target, now.isoformat(), (now+self.lease).isoformat(), request_id))
             return BudgetResult(request_id, target, True)
 
-    def mark_started(self, request_id, character_id):
+    def mark_started(self, request_id, character_id, *, claim_token=None):
         """Only changed=True authorizes the first transport attempt. Never retry it."""
-        return self._transition(request_id, character_id, 'started')
+        with self.database.atomic() as db:
+            row = db.execute("SELECT source,autonomous_reservation_id FROM model_budget_requests WHERE id=? AND character_id=?", (request_id, character_id)).fetchone()
+            if row and row['source'] == 'autonomous':
+                from .autonomous_intent_state import AutonomousIntentStateRepository
+                reservation = db.execute("SELECT candidate_id FROM autonomous_contact_reservations WHERE id=? AND character_id=?", (row['autonomous_reservation_id'], character_id)).fetchone()
+                if not reservation or not claim_token:
+                    raise BudgetRejected('autonomous_reservation_mismatch')
+                checked = AutonomousIntentStateRepository(self.database, enabled=True, allow_first_discovery=True).mark_request_started(reservation['candidate_id'], character_id, claim_token)
+                if not checked.allowed:
+                    raise BudgetRejected(checked.reason_code)
+            return self._transition(request_id, character_id, 'started')
 
     def complete(self, request_id, character_id, *, success=True):
         if type(success) is not bool:

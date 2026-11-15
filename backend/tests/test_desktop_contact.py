@@ -95,6 +95,88 @@ async def run_concurrently(pipeline):
     return await asyncio.gather(pipeline.tick(), pipeline.tick())
 
 
+@pytest.mark.parametrize('outcome,expected', [('friendly', 'delivered'), ('silent', 'silent')])
+def test_self_social_without_any_user_message_or_discovery(tmp_path, monkeypatch, outcome, expected):
+    with character_scope('big_fish'):
+        runtime, life, model, conversation, attempts = setup_desktop(tmp_path, monkeypatch, outcome=outcome, with_discovery=False)
+        with runtime.database.connection() as db:
+            db.execute("UPDATE life_states SET mood='好奇' WHERE character_id='big_fish'")
+        pipeline = DesktopContact(runtime, life, model)
+        assert asyncio.run(pipeline.tick()) == expected
+        assert attempts[0]['candidate_type'] == 'self_social'
+        with runtime.database.connection() as db:
+            assert db.execute('SELECT candidate_type FROM autonomous_contact_candidates').fetchone()[0] == 'self_social'
+            assert db.execute('SELECT count(*) FROM messages WHERE role=\'user\'').fetchone()[0] == 0
+        if outcome == 'friendly':
+            feed = MessageDeliveryRepository(runtime.database).feed(user_id='local', character_id='big_fish', conversation_id=conversation['id'], after_sequence=0, limit=10)
+            assert feed['messages'][0]['content'] == '我有点想你，想和你聊聊天。'
+            assert pipeline.consume_notification(foreground=False)
+        assert asyncio.run(DesktopContact(runtime, life, model).tick()) != 'delivered'
+        assert len(attempts) == 1
+
+
+def test_self_social_respects_pause_and_quiet_hours(tmp_path, monkeypatch):
+    with character_scope('big_fish'):
+        runtime, life, model, _, attempts = setup_desktop(tmp_path, monkeypatch, with_discovery=False)
+        with runtime.database.connection() as db:
+            db.execute("UPDATE life_states SET mood='好奇' WHERE character_id='big_fish'")
+        pipeline = DesktopContact(runtime, life, model)
+        runtime.save_runtime_limits(RuntimeLimitsInput(daily_limit=3, autonomous_paused=True, contact_enabled=True))
+        assert asyncio.run(pipeline.tick()) == 'paused'
+        runtime.save_runtime_limits(RuntimeLimitsInput(daily_limit=3, autonomous_paused=False, contact_enabled=True))
+        local = datetime.now(life.timezone('big_fish'))
+        minute = local.hour * 60 + local.minute
+        pipeline.contact.set_preferences(quiet_start_minute=minute, quiet_end_minute=(minute + 10) % 1440)
+        assert asyncio.run(pipeline.tick()) == 'quiet_hours'
+        assert not attempts
+
+
+def test_self_social_can_use_interest_without_saved_mood(tmp_path, monkeypatch):
+    with character_scope('big_fish'):
+        runtime, life, model, _, attempts = setup_desktop(tmp_path, monkeypatch, outcome='friendly', with_discovery=False)
+        with runtime.database.connection() as db:
+            db.execute("UPDATE life_states SET mood=NULL WHERE character_id='big_fish'")
+            db.execute("INSERT INTO life_preferences(character_id,event_type,weight,updated_at) VALUES('big_fish','reading',1.0,?)", (datetime.now(UTC).isoformat(),))
+        assert asyncio.run(DesktopContact(runtime, life, model).tick()) == 'delivered'
+        assert attempts[0]['interests'][0]['type'] == 'reading'
+
+
+def test_self_social_does_not_require_recent_interaction(tmp_path, monkeypatch):
+    with character_scope('big_fish'):
+        runtime, life, model, conversation, attempts = setup_desktop(tmp_path, monkeypatch, outcome='friendly', with_discovery=False)
+        message = MessageRepository(runtime.database).add(conversation['id'], 'user', '很久以前的一句问候')
+        with runtime.database.connection() as db:
+            db.execute("UPDATE messages SET created_at=? WHERE id=?", ((datetime.now(UTC) - timedelta(days=100)).isoformat(), message['id']))
+            db.execute("UPDATE life_states SET mood='好奇' WHERE character_id='big_fish'")
+        assert asyncio.run(DesktopContact(runtime, life, model).tick()) == 'delivered'
+        assert attempts[0]['candidate_type'] == 'self_social'
+
+
+def test_web_uses_shared_contact_flow_with_existing_legacy_budget(tmp_path, monkeypatch):
+    from app.autonomous_social import AutonomousContact
+    from app.main import WebContactRuntime
+    real_client = httpx.AsyncClient
+    with character_scope('big_fish'):
+        runtime, life, _, conversation, _ = setup_desktop(tmp_path, monkeypatch, with_discovery=False)
+        with runtime.database.connection() as db:
+            db.execute("UPDATE life_states SET mood='好奇' WHERE character_id='big_fish'")
+        def respond(request):
+            signals = json.loads(json.loads(request.content)['messages'][-1]['content'])
+            assert signals['candidate_type'] == 'self_social'
+            plan = {'decision': 'contact', 'choice': signals['choices'][0]['id'], 'style': 'curious',
+                    'message': '我有点想你，想和你聊聊天。', 'evidence_ids': [], 'claims': []}
+            return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(plan)}, 'finish_reason': 'stop'}]})
+        settings = runtime.model_settings().model_copy(update={'contact_enabled': True})
+        model = OpenAICompatibleAdapter(settings, client_factory=lambda **kw: real_client(transport=httpx.MockTransport(respond), **kw))
+        core = AutonomousContact(WebContactRuntime(runtime.database, settings, model), life, model)
+        assert asyncio.run(core.tick()) == 'delivered'
+        feed = MessageDeliveryRepository(runtime.database).feed(user_id='local', character_id='big_fish', conversation_id=conversation['id'], after_sequence=0, limit=10)
+        assert feed['messages'][0]['content'] == '我有点想你，想和你聊聊天。'
+        with runtime.database.connection() as db:
+            assert db.execute('SELECT request_status,message_status FROM autonomous_contact_reservations').fetchone()[:] == ('settled', 'committed')
+            assert not db.execute('SELECT 1 FROM desktop_contact_notifications').fetchone()
+
+
 @pytest.mark.parametrize("text,kind", [("最近在听音乐", "smalltalk"), ("改天聊音乐", "conversation_followup")])
 def test_old_smalltalk_end_to_end(tmp_path, monkeypatch, text, kind):
     with character_scope("big_fish"):
@@ -159,6 +241,7 @@ def test_candidate_migration_preserves_existing_reservations(tmp_path, monkeypat
     with character_scope("big_fish"):
         with monkeypatch.context() as old:
             old.delitem(MIGRATIONS, 27)
+            old.delitem(MIGRATIONS, 28)
             runtime, life, model, _, _ = setup_desktop(tmp_path, monkeypatch)
             pipeline = DesktopContact(runtime, life, model)
             from app.autonomous_intent import build_snapshot, generate_candidates
@@ -170,6 +253,23 @@ def test_candidate_migration_preserves_existing_reservations(tmp_path, monkeypat
             assert db.execute("PRAGMA foreign_key_check").fetchall() == []
             assert db.execute("SELECT status FROM autonomous_contact_candidates").fetchone()[0] == "claimed"
             assert db.execute("SELECT candidate_id FROM autonomous_contact_reservations").fetchone()[0] == candidate.dedup_key
+
+
+def test_self_social_migration_preserves_contact_rows_and_foreign_keys(tmp_path, monkeypatch):
+    with character_scope('big_fish'):
+        with monkeypatch.context() as old:
+            old.delitem(MIGRATIONS, 28)
+            runtime, life, model, conversation, _ = setup_desktop(tmp_path, monkeypatch, with_discovery=False)
+            message = MessageRepository(runtime.database).add(conversation['id'], 'user', '最近在听音乐')
+            intent = ContactService(life).create_intent(source='smalltalk', source_id=message['id'], reason='saved')
+            with runtime.database.connection() as db:
+                db.execute("INSERT INTO proactive_messages(id,intent_id,attempt_no,content,status,created_at) VALUES(?,?,0,'你好','ready',?)",
+                           (str(uuid4()), intent['id'], datetime.now(UTC).isoformat()))
+        runtime.database.initialize()
+        with runtime.database.connection() as db:
+            assert db.execute('PRAGMA foreign_key_check').fetchall() == []
+            assert db.execute('SELECT source FROM contact_intents').fetchone()[0] == 'smalltalk'
+            assert db.execute('SELECT intent_id FROM proactive_messages').fetchone()[0] == intent['id']
 
 
 def test_smalltalk_candidate_uses_saved_message_and_legacy_rules(tmp_path, monkeypatch):

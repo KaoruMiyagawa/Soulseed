@@ -143,23 +143,23 @@ class AutonomousIntentStateRepository:
                                   (candidate.dedup_key, candidate.character_id)).fetchone()
             if existing:
                 if existing["source_key"] != next((ref.id for ref in candidate.evidence
-                                                    if ref.kind == ("life_event" if candidate.kind == "real_discovery" else "message")), None):
+                                                    if ref.kind == ("life_event" if candidate.kind == "real_discovery" else "life_state" if candidate.kind == "self_social" else "message")), None):
                     raise ValueError("candidate_identity_mismatch")
                 return StateResult(existing["status"], existing["id"], created=False,
                                    reason_code=existing["reason_code"], retry_at=existing["retry_after"])
         snapshot = build_snapshot(self.database, candidate.character_id, now=current)
-        fresh = next((item for item in generate_candidates(snapshot) if item.dedup_key == candidate.dedup_key), None)
+        fresh = next((item for item in generate_candidates(snapshot, include_self_social=candidate.kind == 'self_social') if item.dedup_key == candidate.dedup_key), None)
         if fresh is None and candidate.kind in ("smalltalk", "conversation_followup"):
-            from .desktop_contact import DesktopContact
+            from .autonomous_social import AutonomousContact
             # Reconstruct from the database; never accept a caller's evidence as authoritative.
-            fresh = DesktopContact.smalltalk_candidate_for_database(self.database, candidate.character_id, now=current)
+            fresh = AutonomousContact.smalltalk_candidate_for_database(self.database, candidate.character_id, now=current)
             if fresh != candidate:
                 fresh = None
         if fresh is None:
             raise ValueError("candidate_not_currently_supported")
         if fresh.expires_at <= current:
             raise ValueError("candidate_expired")
-        source_kind = "life_event" if fresh.kind == "real_discovery" else "message"
+        source_kind = "life_event" if fresh.kind == "real_discovery" else "life_state" if fresh.kind == "self_social" else "message"
         source_id = next((ref.id for ref in fresh.evidence if ref.kind == source_kind), None)
         if not source_id:
             raise ValueError("candidate_source_missing")
@@ -192,6 +192,14 @@ class AutonomousIntentStateRepository:
     @staticmethod
     def _evidence_valid(db, character_id: str, candidate_type: str, evidence: list[dict], now: datetime) -> bool:
         refs = {item.get("kind"): item.get("id") for item in evidence if isinstance(item, dict)}
+        if candidate_type == "self_social":
+            state = db.execute("""SELECT s.mood,
+                EXISTS(SELECT 1 FROM life_events e WHERE e.id=s.current_activity_event_id AND e.character_id=s.character_id
+                       AND e.activity_status='active' AND e.execution_status='running') AS has_activity,
+                EXISTS(SELECT 1 FROM life_preferences p WHERE p.character_id=s.character_id) AS has_interest
+                FROM life_states s WHERE s.character_id=?""", (character_id,)).fetchone()
+            return bool(len(evidence) == 1 and refs.get('life_state') == character_id + ':' + now.date().isoformat()
+                        and state and (state['mood'] or state['has_activity'] or state['has_interest']))
         if candidate_type in ("smalltalk", "conversation_followup"):
             from .contact import ContactService
             if len(evidence) != 1 or evidence[0].get("kind") != "message":
@@ -289,7 +297,7 @@ class AutonomousIntentStateRepository:
             evidence = json.loads(row["evidence_json"])
         except (TypeError, ValueError):
             return "candidate_evidence_invalid", None, "cancelled"
-        source_kind = "life_event" if row["candidate_type"] == "real_discovery" else "message"
+        source_kind = "life_event" if row["candidate_type"] == "real_discovery" else "life_state" if row["candidate_type"] == "self_social" else "message"
         source_id = next((item.get("id") for item in evidence if isinstance(item, dict) and item.get("kind") == source_kind), None)
         if not source_id or row["source_key"] != source_id or row["id"] != _key(character_id, row["candidate_type"], source_id):
             return "candidate_evidence_invalid", None, "cancelled"
@@ -329,7 +337,7 @@ class AutonomousIntentStateRepository:
         if ready:
             return "ready_message_pending", None, "deferred"
         latest = db.execute("SELECT m.created_at,m.content FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.character_id=? AND m.role='user' ORDER BY m.created_at DESC,m.id DESC LIMIT 1", (character_id,)).fetchone()
-        if not latest and not (self.allow_first_discovery and row["candidate_type"] == "real_discovery"):
+        if not latest and not (row["candidate_type"] == "self_social" or self.allow_first_discovery and row["candidate_type"] == "real_discovery"):
             return "no_user_interaction", None, "deferred"
         if latest and (len(latest["content"]) > 500 or any(stop in latest["content"] for stop in _STOP)):
             return "user_refusal", None, "cancelled"

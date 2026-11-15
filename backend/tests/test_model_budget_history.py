@@ -312,6 +312,7 @@ def test_migration_22_closes_v21_boolean_gate_and_preserves_charges(tmp_path, mo
         patch.delitem(MIGRATIONS, 25)
         patch.delitem(MIGRATIONS, 26)
         patch.delitem(MIGRATIONS, 27)
+        patch.delitem(MIGRATIONS, 28)
         database.initialize()
         LifeRepository(database).ensure_state("big_fish")
         with database.atomic() as sql:

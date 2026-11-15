@@ -151,7 +151,8 @@ class DesktopBudget(ModelBudgetService):
                     started = state.mark_request_started(row["candidate_id"], character_id, claim_token)
                     if not started.allowed:
                         raise BudgetRejected(started.reason_code)
-            return super().mark_started(request_id, character_id)
+            # The desktop-specific recheck above already started the D2 reservation.
+            return self._transition(request_id, character_id, 'started')
 
 
 class ModelInput(BaseModel):

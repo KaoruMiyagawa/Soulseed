@@ -828,6 +828,7 @@ BEGIN SELECT RAISE(ABORT, 'invalid chat reply transition'); END;
 # The table rebuild is performed specially below so existing foreign keys keep
 # referring to the original table name throughout the atomic migration.
 MIGRATIONS[27] = "-- extend autonomous candidate types"
+MIGRATIONS[28] = "-- extend autonomous social sources"
 
 
 class Database:
@@ -997,6 +998,43 @@ class Database:
             current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
             for version, sql in sorted(MIGRATIONS.items()):
                 if version > current:
+                    if version == 28:
+                        connection.execute("PRAGMA foreign_keys=OFF")
+                        connection.execute("PRAGMA legacy_alter_table=ON")
+                        try:
+                            connection.execute("BEGIN IMMEDIATE")
+                            for table, old, new in (
+                                ("autonomous_contact_candidates", "'smalltalk','conversation_followup'", "'smalltalk','conversation_followup','self_social'"),
+                                ("contact_intents", "'conversation_followup', 'reminder'", "'conversation_followup', 'reminder', 'self_social'"),
+                            ):
+                                schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+                                objects = connection.execute("SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL", (table,)).fetchall()
+                                if old not in schema:
+                                    raise RuntimeError("social_migration_unexpected_schema")
+                                prefix = 'CREATE TABLE "' + table + '"' if schema.startswith('CREATE TABLE "') else 'CREATE TABLE ' + table
+                                schema = schema.replace(prefix, 'CREATE TABLE "' + table + '_new"', 1).replace(old, new, 1)
+                                connection.execute(schema)
+                                connection.execute(f"INSERT INTO {table}_new SELECT * FROM {table}")
+                                connection.execute(f"DROP TABLE {table}")
+                                connection.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+                                for obj in objects:
+                                    connection.execute(obj[0])
+                            connection.execute("""CREATE TABLE IF NOT EXISTS desktop_generated_reviews (
+                                draft_id TEXT PRIMARY KEY, character_id TEXT NOT NULL,
+                                candidate_id TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+                                evidence_json TEXT NOT NULL, status TEXT NOT NULL,
+                                reason TEXT NOT NULL, expires_at TEXT NOT NULL)""")
+                            if connection.execute("PRAGMA foreign_key_check").fetchone():
+                                raise RuntimeError("social_migration_foreign_key_check_failed")
+                            connection.execute("INSERT INTO schema_migrations VALUES(28,datetime('now'))")
+                            connection.commit()
+                        except BaseException:
+                            connection.rollback()
+                            raise
+                        finally:
+                            connection.execute("PRAGMA legacy_alter_table=OFF")
+                            connection.execute("PRAGMA foreign_keys=ON")
+                        continue
                     if version == 27:
                         connection.execute("PRAGMA foreign_keys=OFF")
                         connection.execute("PRAGMA legacy_alter_table=ON")
