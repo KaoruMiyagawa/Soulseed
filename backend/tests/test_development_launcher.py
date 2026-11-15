@@ -35,6 +35,8 @@ def test_launcher_discards_inherited_database_and_uses_only_local_model_file(tmp
     assert env["SOULSEED_DATABASE_PATH"] == str(launcher.DATABASE.resolve())
     assert env["SOULSEED_MODEL_API_KEY"] == "fake-local-key"
     assert env["SOULSEED_MODEL_ENABLED"] == "false"
+    assert env["SOULSEED_MODEL_DAILY_REQUEST_LIMIT"] == "20"
+    assert env["SOULSEED_EXPLORATION_DAILY_MODEL_REQUEST_LIMIT"] == "8"
     assert env["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "false"
     assert "SOULSEED_LOCAL_PAIRING_SECRET" not in env
     frontend = launcher._frontend_environment(env)
@@ -51,6 +53,20 @@ def test_contact_model_generation_requires_explicit_launcher_opt_in(monkeypatch)
     assert default["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "false"
     assert enabled["SOULSEED_CONTACT_MODEL_GENERATION_ENABLED"] == "true"
     assert enabled["SOULSEED_MODEL_ENABLED"] == "true"
+
+
+def test_real_async_launcher_switch_is_explicit_and_rollback_keeps_strict_budget(monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", "C:/fake-appdata")
+    default = launcher._child_environment()
+    assert "SOULSEED_CHAT_ASYNC_REAL_ENABLED" not in default
+    assert "SOULSEED_MODEL_BUDGET_STRICT_ENABLED" not in default
+    enabled = launcher._child_environment(async_chat_real_conversation="explicit-test-conversation")
+    assert enabled["SOULSEED_CHAT_ASYNC_REAL_ENABLED"] == "true"
+    assert enabled["SOULSEED_CHAT_ASYNC_CONVERSATION_ID"] == "explicit-test-conversation"
+    assert enabled["SOULSEED_MODEL_BUDGET_STRICT_ENABLED"] == "true"
+    rollback = launcher._child_environment(strict_budget_enabled=True)
+    assert "SOULSEED_CHAT_ASYNC_REAL_ENABLED" not in rollback
+    assert rollback["SOULSEED_MODEL_BUDGET_STRICT_ENABLED"] == "true"
 
 
 @pytest.mark.asyncio

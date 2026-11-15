@@ -176,10 +176,10 @@ def test_production_migration_requires_exact_backup_and_confirmation(tmp_path, m
 
     Database(
         str(database_path), environment="production",
-            migration_backup_path=str(backup_path), migration_confirmation="13->21",
+            migration_backup_path=str(backup_path), migration_confirmation="13->27",
     ).initialize()
     with Database(str(database_path), environment="testing", test_data_root=str(tmp_path)).connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27
 
 
 def test_test_launcher_fails_on_port_conflict_then_restarts_isolated(tmp_path):
@@ -196,9 +196,10 @@ def test_test_launcher_fails_on_port_conflict_then_restarts_isolated(tmp_path):
         assert "environment=testing database=<test-root>/soulseed-test.db" in failed.stdout
         assert "backend\\data\\soulseed.db" not in (failed.stdout + failed.stderr)
 
+    # The duration includes interpreter import and temporary SQLite migrations.
     restarted = subprocess.run(
-        [sys.executable, str(launcher), "api", "--port", str(port), "--duration", "3"],
-        cwd=launcher.parents[2], capture_output=True, text=True, timeout=20,
+        [sys.executable, str(launcher), "api", "--port", str(port), "--duration", "12"],
+        cwd=launcher.parents[2], capture_output=True, text=True, timeout=30,
     )
     assert restarted.returncode == 0, restarted.stdout + restarted.stderr
     assert "environment=testing database=<test-root>/soulseed-test.db" in restarted.stdout
@@ -229,7 +230,7 @@ def test_development_uses_its_independent_database_normally(tmp_path, monkeypatc
     )
     database.initialize()
     with database.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27
 
 
 def test_development_rejects_protected_database_before_sqlite_connect(tmp_path, monkeypatch):
@@ -285,4 +286,4 @@ def test_authorized_protected_database_access_is_available_without_migration(tmp
     )
     approved.initialize()
     with approved.connection() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27

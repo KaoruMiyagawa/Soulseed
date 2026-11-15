@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-desktop-request"
+description = "Allows the packaged webview to reach the managed Soulseed API."
+commands.allow = ["desktop_request"]

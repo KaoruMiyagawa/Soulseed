@@ -31,14 +31,18 @@ def _trusted_description(path) -> str:
     return description
 
 
-def resolve_trusted_persona(database: Database, character_id: str) -> PersonaProfile:
-    """Resolve code-managed persona only for the currently authorized owned role."""
-    if not character_id or current_character.get() != character_id:
-        raise PersonaConfigurationError("角色作用域不匹配")
+def _catalog_profile(character_id: str) -> PersonaProfile:
     config = _CONFIGURED_PERSONAS.get(character_id)
     if config is None:
         raise PersonaConfigurationError("该角色没有已审核的人格配置")
     path, styles, version = config
+    return PersonaProfile(character_id, _trusted_description(path), styles, version)
+
+
+def resolve_trusted_persona(database: Database, character_id: str) -> PersonaProfile:
+    """Resolve code-managed persona only for the currently authorized owned role."""
+    if not character_id or current_character.get() != character_id:
+        raise PersonaConfigurationError("角色作用域不匹配")
     with database.connection() as db:
         if db.in_transaction:
             raise PersonaConfigurationError("人格解析需要独立只读连接")
@@ -52,7 +56,7 @@ def resolve_trusted_persona(database: Database, character_id: str) -> PersonaPro
         finally:
             db.rollback()
             db.execute(f"PRAGMA query_only={int(previous)}")
-    return PersonaProfile(character_id, _trusted_description(path), styles, version)
+    return _catalog_profile(character_id)
 
 
 def trusted_persona_registry(database: Database, character_id: str) -> PersonaRegistry:

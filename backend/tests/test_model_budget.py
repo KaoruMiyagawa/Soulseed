@@ -10,14 +10,14 @@ from app.ownership import character_scope
 
 
 @pytest.fixture
-def budget(tmp_path):
+def budget(tmp_path, seed_budget_gate):
     db = Database(str(tmp_path/'budget.db'))
     db.initialize()
     LifeRepository(db).ensure_state('big_fish')
     LifeRepository(db).ensure_state('other')
     instant = [datetime(2030, 1, 2, 12, tzinfo=UTC)]
     service = ModelBudgetService(db, global_limit=2, source_limits={'autonomous': 1}, clock=lambda: instant[0])
-    service.set_compatibility_gate('2030-01-02', ready=True)
+    seed_budget_gate(service, '2030-01-02')
     return db, service, instant
 
 
@@ -73,17 +73,16 @@ def test_unstarted_release_fences_original_id(budget):
     assert s.usage_snapshot('big_fish')['global_used'] == 0
 
 
-def test_independent_connections_and_characters_compete_for_one_slot(budget):
+def test_independent_connections_and_characters_compete_for_one_slot(budget, seed_budget_gate):
     db, _, instant = budget
-    day = instant[0].date().isoformat()
     # Use next UTC day to establish a different, explicitly trusted test policy.
     instant[0] += timedelta(days=1)
+    seed_budget_gate(ModelBudgetService(db, global_limit=1, clock=lambda: instant[0]), instant[0].date().isoformat())
     def run(i):
         other_db = Database(db.path)
         s = ModelBudgetService(other_db, global_limit=1, clock=lambda: instant[0])
         character = 'big_fish' if i%2 else 'other'
         with character_scope(character):
-            s.set_compatibility_gate(instant[0].date().isoformat(), ready=True)
             try:
                 return s.reserve(str(i), character, 'chat').changed
             except BudgetRejected:
@@ -108,7 +107,7 @@ def test_restart_recovery_retains_started_across_midnight(budget):
         restarted.reserve('new', 'big_fish', 'chat')
 
 
-def test_policy_conflict_scope_conflict_and_history_gate(budget):
+def test_policy_conflict_scope_conflict_and_history_gate(budget, seed_budget_gate):
     db, s, instant = budget
     s.reserve('id', 'big_fish', 'chat')
     with pytest.raises(BudgetRejected, match='request_identity_conflict'):
@@ -118,16 +117,16 @@ def test_policy_conflict_scope_conflict_and_history_gate(budget):
     conflict = ModelBudgetService(db, global_limit=3, clock=lambda:instant[0])
     with pytest.raises(BudgetRejected, match='budget_policy_conflict'):
         conflict.reserve('x','big_fish','chat')
-    s.set_compatibility_gate('2030-01-02', ready=False)
+    seed_budget_gate(s, '2030-01-02', ready=False)
     with pytest.raises(BudgetRejected, match='history_not_confirmed'):
         s.mark_started('id', 'big_fish')
 
 
-def test_unlimited_global_and_utc_conversion(budget):
+def test_unlimited_global_and_utc_conversion(budget, seed_budget_gate):
     db, _, instant = budget
     instant[0] = datetime(2030,1,4,1,tzinfo=timezone(timedelta(hours=8)))
     s = ModelBudgetService(db, clock=lambda:instant[0])
-    s.set_compatibility_gate('2030-01-03',ready=True)
+    seed_budget_gate(s, '2030-01-03')
     for i in range(4):
         s.reserve(f'no-limit-{i}','big_fish','chat')
     usage=s.usage_snapshot('big_fish')
@@ -153,6 +152,12 @@ def test_migration_21_upgrade_rollback_and_idempotence(tmp_path, monkeypatch):
     db=Database(str(tmp_path/'upgrade.db'))
     with monkeypatch.context() as patch:
         patch.delitem(module.MIGRATIONS,21)
+        patch.delitem(module.MIGRATIONS,22)
+        patch.delitem(module.MIGRATIONS,23)
+        patch.delitem(module.MIGRATIONS,24)
+        patch.delitem(module.MIGRATIONS,25)
+        patch.delitem(module.MIGRATIONS,26)
+        patch.delitem(module.MIGRATIONS,27)
         db.initialize()
         LifeRepository(db).ensure_state('big_fish')
     with monkeypatch.context() as patch:
@@ -165,7 +170,7 @@ def test_migration_21_upgrade_rollback_and_idempotence(tmp_path, monkeypatch):
     db.initialize()
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==21
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==27
         assert sql.execute("SELECT 1 FROM life_states WHERE character_id='big_fish'").fetchone()
 
 

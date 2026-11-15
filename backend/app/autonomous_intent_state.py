@@ -73,7 +73,8 @@ class AutonomousIntentStateRepository:
     def __init__(self, database: Database, *, enabled: bool = False,
                  daily_model_request_limit: int = 2, daily_message_limit: int = 1,
                  lease_duration: timedelta = timedelta(minutes=2), topic_dedup_days: int = 30,
-                 contact_enabled: bool = True, handoff_enabled: bool = False):
+                 contact_enabled: bool = True, handoff_enabled: bool = False,
+                 allow_first_discovery: bool = False):
         if daily_model_request_limit < 1 or daily_message_limit < 1:
             raise ValueError("autonomous budgets must be positive")
         if lease_duration <= timedelta(0) or not 1 <= topic_dedup_days <= 365:
@@ -86,6 +87,7 @@ class AutonomousIntentStateRepository:
         self.topic_dedup_days = topic_dedup_days
         self.contact_enabled = contact_enabled
         self.handoff_enabled = handoff_enabled
+        self.allow_first_discovery = allow_first_discovery
 
     @classmethod
     def from_settings(cls, database: Database, settings) -> "AutonomousIntentStateRepository":
@@ -147,6 +149,12 @@ class AutonomousIntentStateRepository:
                                    reason_code=existing["reason_code"], retry_at=existing["retry_after"])
         snapshot = build_snapshot(self.database, candidate.character_id, now=current)
         fresh = next((item for item in generate_candidates(snapshot) if item.dedup_key == candidate.dedup_key), None)
+        if fresh is None and candidate.kind in ("smalltalk", "conversation_followup"):
+            from .desktop_contact import DesktopContact
+            # Reconstruct from the database; never accept a caller's evidence as authoritative.
+            fresh = DesktopContact.smalltalk_candidate_for_database(self.database, candidate.character_id, now=current)
+            if fresh != candidate:
+                fresh = None
         if fresh is None:
             raise ValueError("candidate_not_currently_supported")
         if fresh.expires_at <= current:
@@ -184,6 +192,16 @@ class AutonomousIntentStateRepository:
     @staticmethod
     def _evidence_valid(db, character_id: str, candidate_type: str, evidence: list[dict], now: datetime) -> bool:
         refs = {item.get("kind"): item.get("id") for item in evidence if isinstance(item, dict)}
+        if candidate_type in ("smalltalk", "conversation_followup"):
+            from .contact import ContactService
+            if len(evidence) != 1 or evidence[0].get("kind") != "message":
+                return False
+            row = db.execute("""SELECT m.id,m.content,m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id
+                WHERE c.character_id=? AND m.role='user' ORDER BY m.created_at DESC,m.id DESC LIMIT 1""", (character_id,)).fetchone()
+            if not row or row["id"] != refs.get("message"):
+                return False
+            created = _time(row["created_at"])
+            return bool(created and ContactService.smalltalk_source(row["content"], now - created) == candidate_type)
         if candidate_type == "real_discovery":
             share_id, event_id, run_id = refs.get("share"), refs.get("life_event"), refs.get("exploration")
             if not share_id or not event_id or not run_id:
@@ -311,21 +329,21 @@ class AutonomousIntentStateRepository:
         if ready:
             return "ready_message_pending", None, "deferred"
         latest = db.execute("SELECT m.created_at,m.content FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.character_id=? AND m.role='user' ORDER BY m.created_at DESC,m.id DESC LIMIT 1", (character_id,)).fetchone()
-        if not latest:
+        if not latest and not (self.allow_first_discovery and row["candidate_type"] == "real_discovery"):
             return "no_user_interaction", None, "deferred"
-        if any(stop in latest["content"] for stop in _STOP):
+        if latest and (len(latest["content"]) > 500 or any(stop in latest["content"] for stop in _STOP)):
             return "user_refusal", None, "cancelled"
-        latest_at = _time(latest["created_at"])
-        if not latest_at or latest_at > now:
+        latest_at = _time(latest["created_at"]) if latest else None
+        if latest and (not latest_at or latest_at > now):
             return "contact_policy_unknown", None, "deferred"
-        if now - latest_at < timedelta(hours=2):
+        if latest_at and now - latest_at < timedelta(hours=2):
             return "recent_user_interaction", latest_at + timedelta(hours=2), "deferred"
         delivered = db.execute("SELECT m.delivered_at,m.created_at FROM proactive_messages m JOIN contact_intents i ON i.id=m.intent_id WHERE i.character_id=? AND i.ownership_verified=1 ORDER BY m.created_at DESC,m.id DESC LIMIT 1", (character_id,)).fetchone()
         if delivered and delivered["delivered_at"]:
             delivered_at = _time(delivered["delivered_at"])
             if not delivered_at:
                 return "contact_policy_unknown", None, "deferred"
-            if latest_at <= delivered_at:
+            if latest_at is None or latest_at <= delivered_at:
                 return "awaiting_user_reply", None, "deferred"
         if delivered:
             last_at = _time(delivered["created_at"])

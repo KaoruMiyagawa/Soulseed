@@ -1,0 +1,396 @@
+.soulseed-app .chat-layout {
+  width: min(calc(100% - 80px), 1440px);
+  height: calc(100dvh - 96px);
+  min-height: 0;
+  padding: 28px 0 30px;
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 28px;
+}
+
+.chat-layout .conversation-sidebar {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-layout .conversation-heading {
+  margin: 0 12px 21px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chat-layout .conversation-heading h2 {
+  margin: 0;
+  color: #38575e;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.chat-layout .conversation-heading span,
+.chat-layout .conversation-caption {
+  color: #788e94;
+  font-size: 12px;
+}
+
+.soulseed-app .chat-layout .new-chat{
+  min-height: 44px;
+  justify-content: flex-start;
+  padding: 0 15px;
+  gap: 10px;border-width:1px;border-style:solid;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+
+
+.soulseed-app .chat-layout .conversation-sidebar nav {
+  min-height: 0;
+  margin: 20px 0 0;
+  overflow-y: auto;
+  align-content: start;
+  gap: 5px;
+}
+
+.soulseed-app .chat-layout .conversation-sidebar nav button{
+  min-width: 0;
+  min-height: 46px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 11px;border-width:1px;border-style:solid;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.chat-layout .conversation-sidebar nav button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+
+
+
+.chat-layout .conversation-caption {
+  margin: 18px 14px;
+  line-height: 1.75;
+}
+
+.soulseed-app .chat-layout svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.chat-layout .chat-panel {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid #dce8ed;
+  border-radius: 24px;
+  background: #fbfdfe;
+}
+
+.soulseed-app .chat-layout .chat-heading {
+  min-height: 106px;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 23px 30px;
+  align-items: center;
+  border-color: #e5edf0;
+  background: #fcfefe;
+}
+
+.chat-layout .chat-identity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+}
+
+.chat-layout .chat-avatar {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  display: block;
+  overflow: hidden;
+  border: 1px solid #dbe6ed;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.chat-layout .chat-avatar img {
+  position: absolute;
+  top: -10%;
+  left: -28%;
+  width: 440%;
+  height: auto;
+  max-width: none;
+  user-select: none;
+}
+
+.chat-layout .chat-heading h1 {
+  margin: 0 0 5px;
+  font: 500 23px/1.35 var(--serif);
+  color: #2f4b55;
+}
+
+.chat-layout .chat-status {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #748a91;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.chat-layout .chat-status-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #a6bcc3;
+}
+
+.chat-layout .chat-status[data-active="true"] .chat-status-dot {
+  background: #679d93;
+}
+
+.chat-layout .chat-heading .chat-header-note {
+  flex: 0 0 auto;
+  color: #82959c;
+  font-size: 11px;
+}
+
+.chat-layout .messages {
+  min-height: 0;
+  padding: 30px clamp(24px, 3.4vw, 56px) 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #cddfe4 transparent;
+  background: #f6fafc;
+}
+
+.soulseed-app .chat-layout .message {
+  width: fit-content;
+  max-width: min(90%, 780px);
+  margin: 0 0 26px !important;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.chat-layout .message .chat-avatar,
+.chat-layout .user-avatar {
+  width: 32px;
+  height: 32px;
+  margin-top: 23px;
+}
+
+.chat-layout .user-avatar {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid #dae6e9;
+  border-radius: 50%;
+  background: #eaf2f5;
+  color: #668692;
+}
+
+.chat-layout .message-body { min-width: 0; }
+
+.chat-layout .message label {
+  padding: 0 3px;
+  display: block;
+  color: #7b9099;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.chat-layout .message p {
+  margin: 7px 0 0;
+  padding: 13px 18px;
+  border: 1px solid #e1ebf0;
+  border-radius: 5px 18px 18px;
+  background: #fff;
+  color: #374e58;
+  font-size: 15px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.soulseed-app .chat-layout .message.user {
+  margin-left: auto !important;
+  flex-direction: row-reverse;
+  text-align: left;
+}
+
+.chat-layout .message.user label { text-align: right; }
+.chat-layout .message.user p {
+  border-color: #d6e6ed;
+  border-radius: 18px 5px 18px 18px;
+  background: #e7f1f6;
+}
+
+.chat-layout .message.system p {
+  border-style: dashed;
+  background: #f0f5f7;
+  color: #6b808a;
+}
+
+.chat-layout .chat-empty {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.chat-layout .chat-empty .chat-avatar { width: 64px; height: 64px; }
+.chat-layout .chat-empty h2 {
+  margin: 6px 0 0;
+  color: #526f7a;
+  font: 500 20px/1.5 var(--serif);
+}
+.chat-layout .chat-empty p {
+  max-width: 280px;
+  margin: 0;
+  color: #879ba3;
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.soulseed-app .chat-layout .proactive-preview {
+  width: fit-content;
+  max-width: 90%;
+  border-color: #dce9ec !important;
+  background: #f0f7f8 !important;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.chat-layout .chat-waiting {
+  margin: 0 0 18px 43px;
+  color: #7b9099;
+  font-size: 12px;
+}
+
+.chat-layout .chat-compose-area {
+  flex: 0 0 auto;
+  padding: 18px 24px 20px;
+  border-top: 1px solid #e5edf0;
+  background: #fcfefe;
+}
+
+.soulseed-app .chat-layout .composer {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid #d5e4ea;
+  border-radius: 16px;
+  background: #fff;
+}
+
+
+.soulseed-app .chat-layout .composer textarea {
+  width: 100%;
+  min-height: 76px;
+  max-height: 180px;
+  padding: 15px 17px 8px;
+  resize: vertical;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #374e58;
+  font-size: 14px;
+  line-height: 1.75;
+}
+.chat-layout .composer textarea::placeholder { color: #96a8af; }
+
+
+.chat-layout .composer-footer {
+  min-height: 51px;
+  padding: 0 10px 10px 17px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.chat-layout .composer-footer span { color: #8a9da5; font-size: 11px; }
+.soulseed-app .chat-layout .composer .button-primary{
+  min-height: 35px;
+  padding: 0 15px;
+  gap: 9px;border-width:1px;border-style:solid;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.chat-layout .composer button svg { width: 14px; height: 14px; }
+
+.soulseed-app .chat-layout .chat-notice {
+  max-width: 100%;
+  margin: 0 0 12px;
+  padding: 10px 13px;
+  border: 1px solid #eadfd9;
+  border-radius: 10px;
+  background: #faf5f1;
+  color: #8b6659;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.chat-layout .chat-notice button{
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  font-size: inherit;
+  text-decoration: underline;
+}
+.chat-layout .chat-sync { margin-bottom: 12px; }
+.chat-layout .chat-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (max-width: 1120px) {
+  .soulseed-app .chat-layout { height: calc(100dvh - 145px); grid-template-columns: 215px minmax(0, 1fr); gap: 20px; }
+  .chat-layout .chat-heading .chat-header-note { display: none; }
+}
+
+@media (max-width: 720px) {
+  .soulseed-app .chat-layout { width: calc(100% - 28px); height: auto; min-height: calc(100dvh - 125px); padding: 18px 0; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .chat-layout .conversation-heading { margin: 0 2px 12px; }
+  .soulseed-app .chat-layout .conversation-sidebar nav { max-height: 102px; margin-top: 10px; }
+  .chat-layout .chat-panel { height: 72dvh; min-height: 440px; border-radius: 20px; }
+  .soulseed-app .chat-layout .chat-heading { min-height: 91px; padding: 17px 18px; flex-direction: row; align-items: center; }
+  .chat-layout .chat-heading h1 { font-size: 21px; }
+  .chat-layout .messages { padding: 22px 14px 14px; }
+  .soulseed-app .chat-layout .message { max-width: 96%; gap: 7px; }
+  .chat-layout .message .chat-avatar, .chat-layout .user-avatar { width: 26px; height: 26px; }
+  .chat-layout .message p { padding: 11px 13px; font-size: 14px; }
+  .chat-layout .chat-compose-area { padding: 12px; }
+}

@@ -12,9 +12,14 @@ from typing import Protocol
 from .config import Settings
 from .exploration_repository import ExplorationRepository
 from .life import LifeRepository
-from .model_adapter import (ActionModelReply, ModelConfigurationError, ModelRequestError,
+from .model_adapter import (ActionModelReply, ModelBudgetContext, ModelConfigurationError, ModelRequestError,
                             ModelDailyQuotaExhausted, ModelQuotaUnavailable, OpenAICompatibleAdapter)
-from .ownership import character_scope
+from .model_budget import ModelBudgetService
+from .desktop_runtime import DesktopBudget
+from .model_budget import BudgetRejected
+from uuid import uuid4
+from datetime import UTC, datetime, timedelta
+from .ownership import character_scope, current_character
 from .web_research import (FallbackSearchProvider, SafeWebPageReader, WebResearchError,
                            is_page_relevant_to_topic, is_search_result_relevant_to_topic,
                            search_query_terms, search_result_read_priority)
@@ -49,6 +54,8 @@ class ExplorationAgent:
     model: TextModel | None = None
     search: SearchProvider | None = None
     reader: PageReader | None = None
+    budget_service: ModelBudgetService | None = None
+    legacy_cutover: object | None = None
 
     def __post_init__(self):
         if self.model is None and self.settings.model_enabled and self.settings.model_api_key:
@@ -57,7 +64,11 @@ class ExplorationAgent:
                 "model_daily_request_limit": self.settings.exploration_daily_model_request_limit,
                 "model_max_output_tokens": 512,
             })
-            self.model = OpenAICompatibleAdapter(budget_settings)
+            if self.settings.model_budget_strict_enabled:
+                self.model = OpenAICompatibleAdapter(self.settings, strict_budget=True,
+                                                     budget_service=self.budget_service)
+            else:
+                self.model = OpenAICompatibleAdapter(budget_settings, legacy_cutover=self.legacy_cutover)
         self.search = self.search or FallbackSearchProvider()
         self.reader = self.reader or SafeWebPageReader()
         self._cancel_modes: dict[str, str] = {}
@@ -76,6 +87,15 @@ class ExplorationAgent:
         }))
 
     def quota_snapshot(self) -> dict:
+        if isinstance(self.model, OpenAICompatibleAdapter) and self.model.strict_budget:
+            usage = self.model.budget_service.usage_snapshot(current_character.get())
+            used = usage["source_used"].get("exploration", 0) + usage["source_used"].get("autonomous_exploration", 0)
+            limit = self.settings.exploration_daily_model_request_limit
+            day = usage["day"]
+            reset = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
+            return {"limit": limit, "used": used, "remaining": max(0, limit - used),
+                    "available": used < limit, "reason": None if used < limit else "exploration_daily_quota_exhausted",
+                    "day": day, "resets_at": reset.isoformat()}
         return self.quota_adapter().quota_snapshot()
 
     async def run(self, run_id: str, character_id: str) -> dict:
@@ -207,6 +227,9 @@ class ExplorationAgent:
                 return self._terminate_timed(run_id, character_id, "failed", code)
             except ModelDailyQuotaExhausted:
                 return self._terminate_timed(run_id, character_id, "failed", "exploration_daily_quota_exhausted")
+            except BudgetRejected as exc:
+                code = "autonomous_paused" if str(exc) == "autonomous_paused" else "exploration_daily_quota_exhausted"
+                return self._terminate_timed(run_id, character_id, "failed", code)
             except ModelQuotaUnavailable:
                 return self._terminate_timed(run_id, character_id, "failed", "exploration_quota_unavailable")
             except ModelConfigurationError:
@@ -336,6 +359,11 @@ class ExplorationAgent:
                     raise ExplorationError("request_input_budget_exceeded")
                 if run.get("input_char_count", 0) + input_chars > self.settings.exploration_max_total_input_chars:
                     raise ExplorationError("task_input_budget_exceeded")
+                if isinstance(self.budget_service, DesktopBudget):
+                    if run.get("trigger_mode") == "autonomous" and self.budget_service.preferences()["autonomous_paused"]:
+                        raise ExplorationError("autonomous_paused")
+                    if not self.quota_snapshot()["available"]:
+                        raise ModelDailyQuotaExhausted("exploration_daily_quota_exhausted")
                 persistence_started = time.monotonic()
                 self.repository.step(run["id"], character_id, model_call=True, input_chars=input_chars)
                 self.repository.record_timing(run["id"], character_id, "persistence", int((time.monotonic() - persistence_started) * 1000))
@@ -344,7 +372,12 @@ class ExplorationAgent:
                 model_started = time.monotonic()
                 try:
                     if callable(action_method):
-                        reply = await action_method(messages, run_id=run["id"], step=step + 1)
+                        budget = {}
+                        if isinstance(self.budget_service, DesktopBudget) and run.get("trigger_mode") == "autonomous":
+                            budget["budget_context"] = ModelBudgetContext(
+                                uuid4().hex, character_id, "autonomous_exploration", datetime.now(UTC).date().isoformat(),
+                            )
+                        reply = await action_method(messages, run_id=run["id"], step=step + 1, **budget)
                     else:
                         # Controlled test models can implement only the existing text protocol.
                         reply = ActionModelReply(content=await self.model.reply(messages))

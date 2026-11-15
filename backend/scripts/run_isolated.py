@@ -76,6 +76,7 @@ def main() -> int:
     tests.add_argument("pytest_args", nargs=argparse.REMAINDER)
     api = subparsers.add_parser("api", help="run a local API against a disposable database")
     api.add_argument("--port", type=int, default=18081)
+    api.add_argument("--chat-async-mock", action="store_true", help="enable delayed Mock chat replies in the disposable API")
     api.add_argument("--duration", type=float, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -88,6 +89,8 @@ def main() -> int:
             command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--basetemp", str(base_temp), *args.pytest_args]
             return run_child(command, env=env, cwd=BACKEND_ROOT)
 
+        if args.chat_async_mock:
+            env["SOULSEED_CHAT_ASYNC_MOCK_ENABLED"] = "true"
         command = [
             sys.executable, "-m", "uvicorn", "app.main:app", "--app-dir", str(BACKEND_ROOT),
             "--host", "127.0.0.1", "--port", str(args.port),

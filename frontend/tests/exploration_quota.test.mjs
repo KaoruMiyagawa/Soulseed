@@ -21,3 +21,8 @@ test("unknown ledger is not represented as available; fresh day enables start", 
   assert.match(quotaMessage(null), /无法核验/);
   assert.equal(quotaAllowsStart({ ...exhausted, used: 0, remaining: 8, available: true }), true);
 });
+
+test("missing or invalid reset timestamp keeps the page readable", () => {
+  assert.match(quotaMessage({ ...exhausted, resets_at: undefined }), /重置时间暂不可用/);
+  assert.match(quotaMessage({ ...exhausted, resets_at: "invalid" }), /重置时间暂不可用/);
+});

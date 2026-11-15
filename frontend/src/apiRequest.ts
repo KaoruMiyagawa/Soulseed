@@ -38,15 +38,17 @@ export function apiErrorMessage(payload: unknown, status: number): string {
 }
 
 export function createApiRequest(API: string, onUnauthorized: () => void,
-  timing: (event: string, record: Record<string, unknown>) => void = console.info) {
+  timing: (event: string, record: Record<string, unknown>) => void = console.info,
+  transport: typeof fetch = fetch) {
   return async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const started = performance.now();
     const isChat = options?.method === "POST" && /^\/conversations\/[^/]+\/messages$/.test(path);
     let response: Response;
     try {
-      response = await fetch(`${API}${path}`, { credentials: "include", headers: { "Content-Type": "application/json" }, ...options });
-    } catch {
+      response = await transport(`${API}${path}`, { credentials: "include", headers: { "Content-Type": "application/json" }, ...options });
+    } catch (error) {
       if (isChat) timing("soulseed_chat_transport", { outcome: "network_failure", elapsedMs: performance.now() - started });
+      if (transport !== fetch && error instanceof Error) throw error;
       throw new Error("网络连接中断，无法确认服务端是否已处理请求；系统没有自动重发。");
     }
     if (response.status === 401) onUnauthorized();

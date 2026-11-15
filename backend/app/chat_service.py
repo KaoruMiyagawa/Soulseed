@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from collections.abc import Callable
 
 from .expression import ExpressionContextBuilder
 from .context_window import ContextBudgetExceeded, ModelContextWindow
@@ -45,6 +49,35 @@ from .ownership import current_character
 logger = logging.getLogger(__name__)
 
 
+class ReplyExecutionError(RuntimeError):
+    """An expired execution or a failed reply commit must not trigger a fallback reply."""
+
+    def __init__(self, message: str, *, code: str = "reply_lease_lost"):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ReplyExecution:
+    check: Callable[[], None]
+    model_start: Callable[[], None]
+    confirm: Callable[[dict], None]
+    stop_on_model_error: bool = False
+    before_user_save: Callable[[], None] | None = None
+
+
+_reply_execution: ContextVar[ReplyExecution | None] = ContextVar("reply_execution", default=None)
+
+
+@contextmanager
+def reply_execution(execution: ReplyExecution):
+    token = _reply_execution.set(execution)
+    try:
+        yield
+    finally:
+        _reply_execution.reset(token)
+
+
 class ChatService:
     def __init__(
         self,
@@ -64,7 +97,7 @@ class ChatService:
         life_repository=None,
         contact_service=None,
         context_window: ModelContextWindow | None = None,
-        runtime_features: dict[str, bool] | None = None,
+        runtime_features: dict | None = None,
     ):
         self.conversations, self.messages, self.model, self.system_prompt = conversations, messages, model, system_prompt
         self.memory_service, self.memory_extractor = memory_service, memory_extractor
@@ -87,7 +120,20 @@ class ChatService:
         # Reject an intrinsically oversized input before writing it. This makes
         # a visible 413 safe to correct and retry without creating duplicate turns.
         self.context_window.validate_current_message(content)
-        user_message = self.messages.add(conversation_id, "user", content)
+        with self.messages.database.atomic():
+            execution = _reply_execution.get()
+            if execution and execution.before_user_save:
+                execution.before_user_save()
+            user_message = self.messages.add(conversation_id, "user", content)
+        return await self._respond(user_message)
+
+    async def reply_to_saved(self, user_message: dict, execution: ReplyExecution) -> dict:
+        self.context_window.validate_current_message(user_message["content"])
+        with reply_execution(execution):
+            return await self._respond(user_message)
+
+    async def _respond(self, user_message: dict) -> dict:
+        conversation_id, content = user_message["conversation_id"], user_message["content"]
         checkpoint("contact_boundary")
         if self.contact_service is not None:
             try:
@@ -121,7 +167,6 @@ class ChatService:
             assistant_message = await self._continue_clarification(
                 conversation_id, user_message, claim.clarification, claim.clarification.processing_token
             )
-            self.conversations.touch(conversation_id)
             return {**assistant_message, "correction": self._correction_summary(())}
 
         checkpoint("memory_retrieval")
@@ -190,8 +235,8 @@ class ChatService:
                     share_service = LifeShareService(self.life_repository)
                     share_reservation = share_service.reserve_for_chat(content, character_id=current_character.get())
                 continues_topic = any(word in content for word in ("刚才", "上次", "之前说", "接着", "继续聊", "还记得"))
-                history = self.messages.list_for_conversation(conversation_id) if continues_topic else []
-                recent = ([f"{item['role']}: {item['content']}" for item in history[-4:-1]
+                history = self.messages.history_before(conversation_id, user_message["id"]) if continues_topic else []
+                recent = ([f"{item['role']}: {item['content']}" for item in history[-3:]
                            if item.get("role") in {"user", "assistant"}] if continues_topic else [])
                 expression = self.expression_context_builder.build(
                     character_id=current_character.get(), intent=content,
@@ -232,7 +277,7 @@ class ChatService:
                 ).to_system_message()
                 memory_context = expression_message["content"] if expression_message else ""
         checkpoint("history_context")
-        model_messages = self._model_messages(conversation_id, memory_context)
+        model_messages = self._model_messages(user_message, memory_context)
         clarification = self._single_clarification_context(correction_results)
         if clarification is not None and self.clarifications is not None:
             record = None
@@ -253,15 +298,17 @@ class ChatService:
                 if answer is None:
                     # Unsupported or invalid structured output: ordinary natural chat, explicitly deferred.
                     reply = await self._reply(model_messages)
-                    assistant_message, _ = self.clarifications.persist_preparing_reply(
+                    assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_preparing_reply,
                         record.id, reply, awaiting_user=False
                     )
                 else:
                     self._validate_decision_binding(answer, record.id, phase="initial")
                     awaiting = answer.action is ClarificationAction.ASK
-                    assistant_message, _ = self.clarifications.persist_preparing_reply(
+                    assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_preparing_reply,
                         record.id, answer.content, awaiting_user=awaiting
                     )
+            except ReplyExecutionError:
+                raise
             except (ModelRequestError, ModelConfigurationError, ContextBudgetExceeded):
                 if record is not None:
                     self.clarifications.defer_preparing(record.id, "model_request_failed")
@@ -285,29 +332,52 @@ class ChatService:
                     except Exception:
                         logger.exception("澄清准备失败状态无法持久化 clarification_id=%s", record.id)
             else:
-                self.conversations.touch(conversation_id)
                 return {**assistant_message, "correction": self._correction_summary(correction_results)}
+
+        def save_reply(reply: str) -> dict:
+            assistant = self.messages.add(conversation_id, "assistant", reply)
+            if share_reservation and not share_service.commit_chat_selection(share_reservation["token"]):
+                raise RuntimeError("分享候选保留已过期，聊天消息未保存")
+            return assistant
 
         try:
             reply = await self._reply(model_messages)
-            with self.messages.database.atomic():
-                assistant_message = self.messages.add(conversation_id, "assistant", reply)
-                if share_reservation and not share_service.commit_chat_selection(share_reservation["token"]):
-                    raise RuntimeError("分享候选保留已过期，聊天消息未保存")
-        except Exception:
-            if share_reservation:
+            assistant_message = self._persist_reply(user_message, save_reply, reply)
+        except Exception as exc:
+            if share_reservation and (not isinstance(exc, ReplyExecutionError) or exc.code == "reply_commit_failed"):
                 try:
                     share_service.release_chat_reservation(share_reservation["token"])
                 except Exception:
                     logger.exception("释放生活分享候选保留失败 intent_id=%s", share_reservation["intent_id"])
             raise
-        self.conversations.touch(conversation_id)
         return {**assistant_message, "correction": self._correction_summary(correction_results)}
+
+    def _persist_reply(self, user_message: dict, save, *args, **kwargs):
+        execution = _reply_execution.get()
+        try:
+            with self.messages.database.atomic() as db:
+                if execution:
+                    execution.check()
+                result = save(*args, **kwargs)
+                assistant = result[0] if isinstance(result, tuple) else result
+                db.execute("UPDATE messages SET user_message_id=? WHERE id=?",
+                           (user_message["id"], assistant["id"]))
+                assistant["server_sequence"] = db.execute(
+                    "SELECT server_sequence FROM messages WHERE id=?", (assistant["id"],),
+                ).fetchone()[0]
+                self.conversations.touch(user_message["conversation_id"])
+                if execution:
+                    execution.confirm(assistant)
+                return result
+        except Exception as exc:
+            if execution and execution.stop_on_model_error and not isinstance(exc, ReplyExecutionError):
+                raise ReplyExecutionError("角色回复事务提交失败", code="reply_commit_failed") from exc
+            raise
 
     async def _continue_clarification(
         self, conversation_id: str, user_message: dict, clarification: ClarificationRecord, token: str | None
     ) -> dict:
-        model_messages = self._model_messages(conversation_id, "")
+        model_messages = self._model_messages(user_message, "")
         model_messages.append({"role": "system", "content": self._clarification_context_message(clarification)})
         resolution_value: str | None = None
         evidence_excerpt: str | None = None
@@ -315,7 +385,7 @@ class ChatService:
             answer = await self._structured_generation(model_messages, clarification, "response", user_message["content"])
             if answer is None:
                 reply = await self._reply(model_messages)
-                assistant_message, _ = self.clarifications.persist_processing_reply(
+                assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_processing_reply,
                     clarification.id, token or "", reply, ClarificationStatus.DEFERRED, error_code="structured_output_unavailable"
                 )
                 return assistant_message
@@ -330,7 +400,7 @@ class ChatService:
                 reply = await self._generate_nonapplication_reply(
                     model_messages, "unverified_structured_decision", user_message["content"]
                 )
-                assistant_message, _ = self.clarifications.persist_processing_reply(
+                assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_processing_reply,
                     clarification.id,
                     token or "",
                     reply,
@@ -367,7 +437,7 @@ class ChatService:
                 reply = answer.content
             else:
                 reply = await self._generate_nonapplication_reply(model_messages, resolution_value, user_message["content"])
-            assistant_message, _ = self.clarifications.persist_processing_reply(
+            assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_processing_reply,
                 clarification.id,
                 token or "",
                 reply,
@@ -377,6 +447,8 @@ class ChatService:
                 evidence_excerpt=evidence_excerpt,
             )
             return assistant_message
+        except ReplyExecutionError:
+            raise
         except ContextBudgetExceeded:
             logger.info("澄清模型上下文超过预算，保留澄清状态 clarification_id=%s", clarification.id)
             try:
@@ -465,7 +537,7 @@ class ChatService:
             reply = await self._generate_nonapplication_reply(
                 model_messages, "application_failed", user_message["content"]
             )
-            assistant_message, _ = self.clarifications.persist_processing_reply(
+            assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_processing_reply,
                 clarification.id,
                 processing_token,
                 reply,
@@ -490,7 +562,7 @@ class ChatService:
             }
         )
         reply = await self._reply(final_messages)
-        assistant_message, _ = self.clarifications.persist_processing_reply(
+        assistant_message, _ = self._persist_reply(user_message, self.clarifications.persist_processing_reply,
             clarification.id,
             processing_token,
             reply,
@@ -557,7 +629,7 @@ class ChatService:
                 exc.code,
             )
             return None
-        except (ContextBudgetExceeded, ModelRequestError, ModelConfigurationError):
+        except (ContextBudgetExceeded, ModelRequestError, ModelConfigurationError, ReplyExecutionError):
             raise
         except Exception as exc:
             logger.warning(
@@ -576,7 +648,7 @@ class ChatService:
         count("plain_model_calls")
         checkpoint("model_generation")
         try:
-            return await self.model.reply(result.messages)
+            return await self._invoke_model(self.model.reply, result.messages)
         finally:
             checkpoint("reply_persistence")
 
@@ -589,16 +661,34 @@ class ChatService:
         count("structured_model_calls")
         checkpoint("model_generation")
         try:
-            return await method(result.messages)
+            return await self._invoke_model(method, result.messages)
         finally:
             checkpoint("reply_persistence")
 
-    def _model_messages(self, conversation_id: str, memory_context: str) -> list[dict[str, str]]:
-        history = self.messages.list_for_conversation(conversation_id)
+    @staticmethod
+    async def _invoke_model(method, messages):
+        execution = _reply_execution.get()
+        if execution:
+            execution.model_start()
+        try:
+            return await method(messages)
+        except (StructuredOutputError, ReplyExecutionError):
+            raise
+        except Exception as exc:
+            if execution and execution.stop_on_model_error:
+                raise ReplyExecutionError("模型调用未得到可确认的结果", code="model_outcome_unknown") from exc
+            raise
+        finally:
+            if execution:
+                execution.check()
+
+    def _model_messages(self, user_message: dict, memory_context: str) -> list[dict[str, str]]:
+        history = self.messages.history_before(user_message["conversation_id"], user_message["id"])
         messages = [{"role": "system", "content": self.system_prompt}]
         if memory_context:
             messages.append({"role": "system", "content": memory_context})
         messages.extend({"role": item["role"], "content": item["content"]} for item in history)
+        messages.append({"role": "user", "content": user_message["content"]})
         return messages
 
     def _runtime_capabilities(self, query: str, character_id: str) -> dict:
@@ -616,6 +706,9 @@ class ChatService:
                 contact = self.contact_service.delivery_context(character_id)
             contact["background_checks_enabled"] = bool(contact["enabled"] and self.runtime_features.get("contact_background_enabled"))
             contact["model_generated_contact_enabled"] = bool(contact["enabled"] and self.runtime_features.get("contact_model_generation_enabled"))
+            desktop_status = self.runtime_features.get("desktop_contact_status")
+            if desktop_status:
+                contact.update(desktop_status(character_id))
             result["proactive_contact"] = contact
         if any(cue in query for cue in ("在哪里", "在哪", "住哪里", "住在", "房间", "数字空间", "身体", "看得见", "听得见")):
             result["digital_space"] = {

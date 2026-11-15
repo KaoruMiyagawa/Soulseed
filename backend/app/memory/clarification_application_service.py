@@ -121,7 +121,9 @@ class ClarificationApplicationService:
         self.clarifications.reconcile_completed_applications()
         recovered: list[str] = []
         now = datetime.now(UTC)
-        for record in self.clarifications.list_recoverable():
+        # Async responses have their own durable execution boundary. Reconcile
+        # already committed applications above, but don't resume partial work here.
+        for record in self.clarifications.list_recoverable(legacy_responses_only=True):
             recoverable_status = record.status is ClarificationStatus.FAILED and record.error_code == "application_interrupted"
             expired_processing = (
                 record.status is ClarificationStatus.PROCESSING

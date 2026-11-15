@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Soulseed's packaged webview",
+  "windows": ["main"],
+  "permissions": ["allow-desktop-request"]
+}

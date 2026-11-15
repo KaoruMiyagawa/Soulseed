@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import json
 import os
+import sqlite3
 from datetime import UTC, datetime, timedelta, date
 from threading import RLock
 from pathlib import Path
@@ -12,9 +13,15 @@ from typing import Protocol
 from uuid import uuid4
 
 import httpx
+from contextlib import nullcontext
 
-from .config import Settings
+from .chat_attempts import active_chat_attempt, chat_attempt_factory
+
+from .config import Settings, validate_test_database_path
+from .desktop_runtime import DesktopBudget
 from .chat_diagnostics import current_trace, measure
+from .model_budget import BudgetRejected, ModelBudgetService
+from .ownership import current_character
 
 
 class ModelConfigurationError(RuntimeError):
@@ -92,6 +99,18 @@ class ModelAdapter(Protocol):
 
 
 @dataclass(frozen=True)
+class ModelBudgetContext:
+    """Server-owned identity. Limits belong to the injected budget service."""
+
+    request_id: str
+    character_id: str
+    source: str
+    utc_day: str
+    autonomous_reservation_id: str | None = None
+    claim_token: str | None = None
+
+
+@dataclass(frozen=True)
 class ActionModelReply:
     """Per-request final output and safe metadata; never exposes reasoning text."""
 
@@ -105,20 +124,52 @@ class ActionModelReply:
 
 class OpenAICompatibleAdapter:
     def __init__(self, settings: Settings, client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
-                 *, clock: Callable[[], datetime] | None = None):
+                 *, clock: Callable[[], datetime] | None = None,
+                 strict_budget: bool = False, budget_service: ModelBudgetService | None = None,
+                 budget_transport: httpx.MockTransport | None = None,
+                 budget_audit_path: Path | None = None, legacy_cutover=None):
+        isolated_strict = (settings.environment == "testing" and budget_service is not None
+                           and budget_service.database.environment == "testing"
+                           and type(budget_transport) is httpx.MockTransport)
+        development_strict = (settings.environment == "development" and budget_service is not None
+                              and budget_service.database.environment == "development"
+                              and (budget_transport is None or type(budget_transport) is httpx.MockTransport)
+                              and settings.chat_async_real_enabled
+                              and settings.model_budget_strict_enabled)
+        desktop_strict = (type(budget_service) is DesktopBudget and settings.environment == "production"
+                          and settings.database_path == budget_service.database.path
+                          and budget_transport is None)
+        if strict_budget and not (isolated_strict or development_strict or desktop_strict):
+            raise ModelConfigurationError("strict_budget_environment_mismatch")
         self.settings = settings
         self.client_factory = client_factory
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.strict_budget = strict_budget
+        self.desktop_strict = desktop_strict
+        self.budget_service = budget_service
+        self.budget_transport = budget_transport
+        self.legacy_cutover = legacy_cutover
+        self.budget_audit_path = None
+        if strict_budget and budget_audit_path is not None:
+            path = validate_test_database_path(budget_audit_path, budget_service.database.test_data_root)
+            if path.suffix.lower() != ".jsonl":
+                raise ModelConfigurationError("strict_budget_audit_requires_jsonl")
+            self.budget_audit_path = path
 
-    async def reply(self, messages: list[dict[str, str]]) -> str:
-        content = await self._request_content(messages)
+    async def reply(self, messages: list[dict[str, str]], *, budget_context: ModelBudgetContext | None = None) -> str:
+        content = await self._request_content(messages, budget_context=budget_context)
         return content
 
-    async def reply_action(self, messages: list[dict[str, str]], *, run_id: str, step: int) -> ActionModelReply:
+    async def reply_contact_plan(self, messages: list[dict[str, str]], *, budget_context: ModelBudgetContext) -> str:
+        return await self._request_content(messages, structured=True, budget_context=budget_context)
+
+    async def reply_action(self, messages: list[dict[str, str]], *, run_id: str, step: int,
+                           budget_context: ModelBudgetContext | None = None) -> ActionModelReply:
         """JSON content protocol, separate from chat clarification and native tools."""
         return await self._request_completion(
             messages, structured=True,
             request_context={"exploration_run_id": run_id, "exploration_step": step},
+            budget_context=budget_context,
         )
 
     def record_action_validation(self, reply: ActionModelReply, *, run_id: str,
@@ -136,8 +187,9 @@ class OpenAICompatibleAdapter:
             # Validation errors are also persisted as bounded task error codes.
             pass
 
-    async def reply_structured(self, messages: list[dict[str, str]]) -> StructuredChatReply:
-        content = await self._request_content(messages, structured=True)
+    async def reply_structured(self, messages: list[dict[str, str]], *,
+                               budget_context: ModelBudgetContext | None = None) -> StructuredChatReply:
+        content = await self._request_content(messages, structured=True, budget_context=budget_context)
         try:
             payload = json.loads(content)
         except json.JSONDecodeError as exc:
@@ -202,8 +254,9 @@ class OpenAICompatibleAdapter:
             ),
         )
 
-    async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False) -> str:
-        reply = await self._request_completion(messages, structured=structured)
+    async def _request_content(self, messages: list[dict[str, str]], *, structured: bool = False,
+                               budget_context: ModelBudgetContext | None = None) -> str:
+        reply = await self._request_completion(messages, structured=structured, budget_context=budget_context)
         if structured and reply.finish_reason in {"length", "max_tokens"}:
             raise StructuredOutputError("模型结构化输出达到生成长度上限", code="json_truncated")
         if not isinstance(reply.content, str) or not reply.content.strip():
@@ -211,14 +264,38 @@ class OpenAICompatibleAdapter:
         return reply.content.strip()
 
     async def _request_completion(self, messages: list[dict[str, str]], *, structured: bool = False,
-                                  request_context: dict | None = None) -> ActionModelReply:
+                                  request_context: dict | None = None,
+                                  budget_context: ModelBudgetContext | None = None) -> ActionModelReply:
+        factory = chat_attempt_factory.get()
+        if factory is None:
+            return await self._request_completion_inner(messages, structured=structured,
+                                                        request_context=request_context, budget_context=budget_context)
+        attempt = factory("structured" if structured else "plain", self.settings.model_max_output_tokens)
+        token = active_chat_attempt.set(attempt)
+        try:
+            if self.strict_budget:
+                expected = ModelBudgetContext(attempt.id, attempt.character_id, "chat",
+                                              self.clock().astimezone(UTC).date().isoformat())
+                if budget_context is not None and budget_context != expected:
+                    raise ModelConfigurationError("chat_attempt_budget_binding_mismatch")
+                budget_context = expected
+            return await self._request_completion_inner(messages, structured=structured,
+                                                        request_context=request_context, budget_context=budget_context)
+        except BaseException as exc:
+            attempt.interrupted(type(exc).__name__)
+            raise
+        finally:
+            active_chat_attempt.reset(token)
+
+    async def _request_completion_inner(self, messages: list[dict[str, str]], *, structured: bool,
+                                        request_context: dict | None,
+                                        budget_context: ModelBudgetContext | None) -> ActionModelReply:
         if not self.settings.model_enabled:
             raise ModelConfigurationError("真实模型调用已在当前环境关闭。")
         if not self.settings.model_api_key:
             raise ModelConfigurationError("模型 API 密钥未配置。请在 .env 中设置 SOULSEED_MODEL_API_KEY。")
         if not self.settings.model_name:
             raise ModelConfigurationError("模型名称未配置。请在 .env 中设置 SOULSEED_MODEL_NAME。")
-        url = self.settings.model_base_url.rstrip("/") + "/chat/completions"
         trace = current_trace.get()
         metrics = {"chat_request_id": trace.id if trace else None,
                    "input_chars": sum(len(item.get("content", "")) for item in messages),
@@ -227,17 +304,112 @@ class OpenAICompatibleAdapter:
                    "timeout_seconds": self.settings.model_timeout_seconds,
                    "trust_env": self.settings.model_trust_env}
         metrics.update(request_context or {})
-        request_id = self._reserve_request(metrics)
+        if self.strict_budget:
+            if self.desktop_strict and budget_context is None and request_context is None:
+                budget_context = ModelBudgetContext(uuid4().hex, current_character.get(), "chat",
+                                                    self.clock().astimezone(UTC).date().isoformat())
+            if budget_context is None and self.settings.environment == "development":
+                source = "exploration" if request_context and request_context.get("exploration_run_id") else "chat"
+                budget_context = ModelBudgetContext(str(uuid4()), current_character.get(), source,
+                                                    self.clock().astimezone(UTC).date().isoformat())
+            return await self._budgeted_completion(messages, structured, request_context, metrics, budget_context)
+        if budget_context is not None:
+            raise ModelConfigurationError("budget_context_requires_strict_mode")
+        attempt = active_chat_attempt.get()
+        admission = self.legacy_cutover.legacy_request() if self.legacy_cutover is not None else nullcontext()
+        with admission:
+            request_id = self._reserve_request(metrics, request_id=attempt.id if attempt else None)
+            return await self._execute_completion(messages, structured, request_context, metrics, request_id)
+
+    async def _budgeted_completion(self, messages, structured, request_context, metrics, context):
+        service = self.budget_service
+        if type(context) is not ModelBudgetContext or any(
+            not isinstance(value, str) or not value.strip()
+            for value in (context.request_id, context.character_id, context.source, context.utc_day)
+        ):
+            raise ModelConfigurationError("trusted_budget_context_required")
+        try:
+            if date.fromisoformat(context.utc_day).isoformat() != context.utc_day:
+                raise ValueError
+        except ValueError as exc:
+            raise ModelConfigurationError("invalid_budget_window") from exc
+        if service.database.in_transaction:
+            raise ModelConfigurationError("model_request_inside_transaction")
+        if context.source not in {"chat", "exploration", "contact", "autonomous", "draft_experiment", "autonomous_exploration"}:
+            raise ModelConfigurationError("unsupported_budget_source")
+        if request_context and context.source not in {"exploration", "autonomous_exploration"}:
+            raise ModelConfigurationError("exploration_budget_source_required")
+        linked = context.source == "autonomous" and self.desktop_strict and bool(
+            context.autonomous_reservation_id and context.claim_token)
+        if (context.autonomous_reservation_id is not None or context.claim_token is not None or context.source == "autonomous") and not linked:
+            raise ModelConfigurationError("d2_joint_lifecycle_not_integrated")
+        if context.source == "autonomous_exploration" and not self.desktop_strict:
+            raise ModelConfigurationError("strict_budget_environment_mismatch")
+        reservation = service.reserve(context.request_id, context.character_id, context.source,
+                                      autonomous_reservation_id=context.autonomous_reservation_id,
+                                      expected_day=context.utc_day)
+        if not reservation.changed:
+            raise BudgetRejected("request_already_reserved")
+        metrics.update(budget_mode="strict", source=context.source)
+        started = False
+        settled = False
+
+        def authorize():
+            nonlocal started
+            result = (service.mark_started(context.request_id, context.character_id, claim_token=context.claim_token)
+                      if linked else service.mark_started(context.request_id, context.character_id))
+            if not result.changed:
+                raise BudgetRejected("request_already_started")
+            started = True
+            try:
+                self._append_log({"event": "started", "day": context.utc_day,
+                                  "at": self.clock().isoformat(), "id": context.request_id,
+                                  "model": self.settings.model_name, **metrics})
+            except OSError:
+                pass
+
+        def received(response):
+            nonlocal settled
+            # Completion here describes HTTP outcome. Business/schema validation follows.
+            service.complete(context.request_id, context.character_id, success=response.is_success)
+            settled = True
+
+        try:
+            return await self._execute_completion(messages, structured, request_context, metrics,
+                                                  context.request_id, authorize=authorize, received=received)
+        except BaseException:
+            if not settled:
+                try:
+                    if started:
+                        service.mark_unknown(context.request_id, context.character_id)
+                    else:
+                        service.release_unstarted(context.request_id, context.character_id)
+                except (BudgetRejected, sqlite3.Error):
+                    # A committed started marker cannot be released. Recovery fences it.
+                    pass
+            raise
+
+    async def _execute_completion(self, messages, structured, request_context, metrics, request_id,
+                                  *, authorize=None, received=None):
+        url = self.settings.model_base_url.rstrip("/") + "/chat/completions"
+        provider = "模型服务" if self.desktop_strict else "硅基流动"
         started = perf_counter()
+        attempt = active_chat_attempt.get()
         async def headers_received(_response):
             metrics["response_headers_ms"] = round((perf_counter() - started) * 1000, 3)
         async def request_started(_request):
+            if authorize is not None:
+                authorize()
+            if attempt is not None:
+                attempt.sent()
             if request_id and request_context and request_context.get("exploration_run_id"):
                 # Runs inside client.post: an HTTP attempt, not proof of receipt/billing.
                 try:
                     self._append_log({"event": "http_started", "at": self.clock().isoformat(),
                                       "id": request_id, **request_context})
                 except OSError as exc:
+                    if authorize is not None:
+                        return
                     raise ModelQuotaUnavailable("无法持久记录探索请求，已暂停探索。") from exc
         def record(status, response=None):
             metrics["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
@@ -245,13 +417,21 @@ class OpenAICompatibleAdapter:
         try:
             # HTTPX timeouts bound inactivity per phase; also bound total elapsed time.
             with measure("model_http"):
-                async with asyncio.timeout(self.settings.model_timeout_seconds), self.client_factory(
+                factory = self.client_factory
+                options = {}
+                if authorize is not None:
+                    # A single MockTransport attempt, no custom factory, redirects or retries.
+                    factory = httpx.AsyncClient
+                    options = {"transport": self.budget_transport, "follow_redirects": False}
+                async with asyncio.timeout(self.settings.model_timeout_seconds), factory(
                     timeout=self.settings.model_timeout_seconds, trust_env=self.settings.model_trust_env,
                     event_hooks={"request": [request_started], "response": [headers_received]},
+                    **options,
                 ) as client:
                     body = {"model": self.settings.model_name, "messages": messages}
-                    if self.settings.model_max_output_tokens is not None:
-                        body["max_tokens"] = self.settings.model_max_output_tokens
+                    max_tokens = attempt.max_output_tokens if attempt else self.settings.model_max_output_tokens
+                    if max_tokens is not None:
+                        body["max_tokens"] = max_tokens
                     if structured:
                         body["response_format"] = {"type": "json_object"}
                     response = await client.post(
@@ -269,9 +449,14 @@ class OpenAICompatibleAdapter:
             raise ModelTimeoutError("deadline") from exc
         except httpx.RequestError as exc:
             record("network_error")
-            raise ModelRequestError("无法连接硅基流动模型服务，请检查网络或稍后重试。", code="model_network_error") from exc
+            raise ModelRequestError(f"无法连接{provider}，请检查网络或稍后重试。", code="model_network_error") from exc
+        if attempt is not None:
+            provider_id = response.headers.get("x-request-id")
+            attempt.responded(response.status_code, provider_id[:128] if provider_id and provider_id.isascii() else None)
+        if received is not None:
+            received(response)
         record(f"http_{response.status_code}", response)
-        if response.is_error:
+        if response.is_error or (authorize is not None and not response.is_success):
             status = response.status_code
             if status in (400, 413) and self._is_context_limit_response(response):
                 raise ModelRequestError(
@@ -280,14 +465,14 @@ class OpenAICompatibleAdapter:
                     status_code=413,
                 )
             if status in (401, 403):
-                raise ModelRequestError("硅基流动 API Key 无效、已失效或当前账号无权调用该模型。", status_code=502)
+                raise ModelRequestError(f"{provider}的 API Key 无效、已失效或当前账号无权调用该模型。", status_code=502)
             if status == 404:
-                raise ModelRequestError(f"硅基流动找不到模型 {self.settings.model_name}，请核对模型 ID。", status_code=502)
+                raise ModelRequestError(f"{provider}找不到模型，请核对模型 ID。", status_code=502)
             if status == 429:
-                raise ModelRequestError("硅基流动请求受到限流或额度限制，请检查账户余额、配额和速率限制。", status_code=429, code="model_provider_rate_limited")
+                raise ModelRequestError(f"{provider}请求受到限流或额度限制，请检查账户余额、配额和速率限制。", status_code=429, code="model_provider_rate_limited")
             if status in (500, 502, 503, 504):
-                raise ModelRequestError(f"硅基流动服务返回 HTTP {status}；当前消息已保存但未获得回复，系统未自动重试。", status_code=502)
-            raise ModelRequestError(f"硅基流动模型请求失败（HTTP {status}）。", status_code=502)
+                raise ModelRequestError(f"{provider}返回 HTTP {status}；当前消息已保存但未获得回复，系统未自动重试。", status_code=502)
+            raise ModelRequestError(f"{provider}请求失败（HTTP {status}）。", status_code=502)
         try:
             # SiliconFlow may also return reasoning_content; only final content is user-visible.
             payload = response.json()
@@ -341,7 +526,7 @@ class OpenAICompatibleAdapter:
         return any(marker in diagnostic for marker in markers)
 
     def _append_log(self, record: dict) -> None:
-        path = self.settings.model_request_log_path
+        path = self.budget_audit_path if self.strict_budget else self.settings.model_request_log_path
         if not path:
             return
         target = Path(path).expanduser()
@@ -355,7 +540,7 @@ class OpenAICompatibleAdapter:
 
     def _quota_records(self) -> list[dict]:
         """Read only, fail closed: an absent/corrupt ledger is not an empty ledger."""
-        path = self.settings.model_request_log_path
+        path = self.budget_audit_path if self.strict_budget else self.settings.model_request_log_path
         if not path:
             raise ModelQuotaUnavailable("探索额度记录未配置，已暂停探索。")
         try:
@@ -380,6 +565,8 @@ class OpenAICompatibleAdapter:
             raise ModelQuotaUnavailable("无法可靠读取探索额度记录，已暂停探索。") from exc
 
     def quota_snapshot(self, *, now: datetime | None = None) -> dict:
+        if self.strict_budget:
+            raise ModelConfigurationError("strict_budget_usage_requires_sqlite_snapshot")
         current = (now or self.clock()).astimezone(UTC)
         reset = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         result = {"limit": self.settings.model_daily_request_limit, "used": None,
@@ -415,11 +602,11 @@ class OpenAICompatibleAdapter:
                       http_attempts_complete=reserved <= proven)
         return result
 
-    def _reserve_request(self, metrics: dict | None = None) -> str | None:
+    def _reserve_request(self, metrics: dict | None = None, *, request_id: str | None = None) -> str | None:
         with _reservation_lock:
-            return self._reserve_request_locked(metrics)
+            return self._reserve_request_locked(metrics, request_id=request_id)
 
-    def _reserve_request_locked(self, metrics: dict | None = None) -> str | None:
+    def _reserve_request_locked(self, metrics: dict | None = None, *, request_id: str | None = None) -> str | None:
         path = self.settings.model_request_log_path
         limit = self.settings.model_daily_request_limit
         exploration = bool(metrics and metrics.get("exploration_run_id"))
@@ -446,7 +633,7 @@ class OpenAICompatibleAdapter:
                 raise ModelConfigurationError("无法读取模型调用记录；已拒绝本次请求。") from exc
             if used >= limit:
                 raise ModelDailyQuotaExhausted("今日模型请求次数已达到开发环境上限。")
-        request_id = str(uuid4())
+        request_id = request_id or str(uuid4())
         try:
             self._append_log({"event": "started", "day": day, "at": now.isoformat(),
                               "id": request_id, "model": self.settings.model_name, **(metrics or {})})
@@ -476,7 +663,7 @@ class OpenAICompatibleAdapter:
             except (ValueError, AttributeError, TypeError, IndexError):
                 pass
         try:
-            self._append_log({"event": "finished", "at": datetime.now(UTC).isoformat(),
+            self._append_log({"event": "finished", "at": self.clock().isoformat(),
                               "id": request_id, "status": status, "usage": usage, **(metrics or {}), **output_sizes})
         except OSError:
             # Reservation remains counted. A log write failure never causes a retry.

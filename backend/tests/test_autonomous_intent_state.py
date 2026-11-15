@@ -41,7 +41,7 @@ def candidate_setup(db, life):
 def test_migration_19_is_repeatable_and_preserves_preexisting_rows(ctx):
     db, _ = ctx
     with db.connection() as sql:
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 21
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 27
         candidate_columns = {row['name'] for row in sql.execute('PRAGMA table_info(autonomous_contact_candidates)')}
         reservation_columns = {row['name'] for row in sql.execute('PRAGMA table_info(autonomous_contact_reservations)')}
         assert {'id', 'character_id', 'candidate_type', 'evidence_json', 'topic_fingerprint', 'status', 'lease_token', 'lease_expires_at'} <= candidate_columns
@@ -59,6 +59,12 @@ def test_migration_18_to_20_preserves_existing_life_contact_and_chat_rows(tmp_pa
         patch.delitem(db_module.MIGRATIONS, 19)
         patch.delitem(db_module.MIGRATIONS, 20)
         patch.delitem(db_module.MIGRATIONS, 21)
+        patch.delitem(db_module.MIGRATIONS, 22)
+        patch.delitem(db_module.MIGRATIONS, 23)
+        patch.delitem(db_module.MIGRATIONS, 24)
+        patch.delitem(db_module.MIGRATIONS, 25)
+        patch.delitem(db_module.MIGRATIONS, 26)
+        patch.delitem(db_module.MIGRATIONS, 27)
         db.initialize()
         life = LifeRepository(db)
         life.ensure_state('big_fish')
@@ -74,7 +80,7 @@ def test_migration_18_to_20_preserves_existing_life_contact_and_chat_rows(tmp_pa
         assert sql.execute('SELECT COUNT(*) FROM life_states WHERE character_id=?', ('big_fish',)).fetchone()[0] == 1
         assert sql.execute('SELECT allowed FROM contact_preferences WHERE character_id=?', ('big_fish',)).fetchone()[0] == 1
         assert sql.execute('SELECT content FROM messages WHERE id=?', (message_row['id'],)).fetchone()[0] == 'migration old row'
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 21
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 27
 
 
 def test_migration_19_failure_rolls_back_and_can_be_retried(tmp_path, monkeypatch):
@@ -88,7 +94,7 @@ def test_migration_19_failure_rolls_back_and_can_be_retried(tmp_path, monkeypatc
             assert sql.execute("SELECT 1 FROM sqlite_master WHERE name='migration_19_partial'").fetchone() is None
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 21
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 27
         assert sql.execute("SELECT 1 FROM sqlite_master WHERE name='autonomous_contact_candidates'").fetchone()
 
 
@@ -98,6 +104,12 @@ def test_migration_20_failure_rolls_back_and_can_be_retried(tmp_path, monkeypatc
     with monkeypatch.context() as patch:
         patch.delitem(db_module.MIGRATIONS, 20)
         patch.delitem(db_module.MIGRATIONS, 21)
+        patch.delitem(db_module.MIGRATIONS, 22)
+        patch.delitem(db_module.MIGRATIONS, 23)
+        patch.delitem(db_module.MIGRATIONS, 24)
+        patch.delitem(db_module.MIGRATIONS, 25)
+        patch.delitem(db_module.MIGRATIONS, 26)
+        patch.delitem(db_module.MIGRATIONS, 27)
         db.initialize()
         patch.setitem(db_module.MIGRATIONS, 20, "CREATE TABLE draft_migration_partial(id TEXT); SELECT * FROM missing_draft_migration_table;")
         with pytest.raises(Exception):
@@ -108,7 +120,7 @@ def test_migration_20_failure_rolls_back_and_can_be_retried(tmp_path, monkeypatc
         patch.setitem(db_module.MIGRATIONS, 20, migration)
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 21
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 27
         assert sql.execute("SELECT 1 FROM sqlite_master WHERE name='autonomous_contact_drafts'").fetchone()
 
 

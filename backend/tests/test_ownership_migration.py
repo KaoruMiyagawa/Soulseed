@@ -29,14 +29,14 @@ def seed_legacy(db):
         c.execute("INSERT INTO legacy_conversation_ownership VALUES ('known','big_fish','explicit local operator confirmation for test fixture')")
         for conv in ("known", "unknown", "mixed"):
             c.execute("INSERT INTO conversations VALUES (?, ?, ?, ?)",(conv,conv,AT,AT))
-            c.execute("INSERT INTO messages VALUES (?, ?, 'user', ?, ?)",(conv+'-user',conv,conv+' evidence',AT))
+            c.execute("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES (?, ?, 'user', ?, ?)",(conv+'-user',conv,conv+' evidence',AT))
         for char in ("big_fish","legacy_other"):
             c.execute("INSERT INTO life_states(character_id,updated_at) VALUES (?,?)",(char,AT))
             c.execute("INSERT INTO life_events(id,character_id,event_type,status,occurred_at,content,source,generation_method,created_at,activity_status) VALUES (?,?,'exploring','completed',?,'shell','character','rule_engine',?,'completed')",(char+'-event',char,AT,AT))
             c.execute("INSERT INTO life_share_intents(id,character_id,event_id,status,reason,created_at) VALUES (?,?,?,'delivered','discovery',?)",(char+'-share',char,char+'-event',AT))
         for index,(conv,char) in enumerate((("known","big_fish"),("mixed","big_fish"),("mixed","legacy_other"))):
             mid, iid = f"proactive-{index}",f"intent-{index}"
-            c.execute("INSERT INTO messages VALUES (?,?,'assistant','saved share',?)",(mid,conv,AT))
+            c.execute("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES (?,?,'assistant','saved share',?)",(mid,conv,AT))
             c.execute("INSERT INTO contact_intents(id,character_id,source,source_id,event_id,share_intent_id,importance,reason,topic,status,created_at,expires_at) VALUES (?,?,'life_share',?,?,?,'normal','saved','shell','delivered',?,?)",(iid,char,str(index),char+'-event',char+'-share',AT,'2027-01-01'))
             c.execute("INSERT INTO proactive_messages(id,intent_id,attempt_no,content,status,created_at,conversation_id,chat_message_id,delivered_at) VALUES (?,?,0,'saved share','delivered',?,?,?,?)",(mid,iid,AT,conv,mid,AT))
         for name in ("known","unknown","mixed","orphan"):
@@ -56,7 +56,7 @@ def test_upgrade_v11_preserves_graph_and_quarantines_ambiguous_rows(tmp_path,mon
         before={t:c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0] for t in ('conversations','messages','memory_items','memory_sources','memory_change_proposals','memory_correction_clarifications','life_events','contact_intents','proactive_messages')}
     db.initialize();db.initialize()
     with db.connection() as c:
-        assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==21
+        assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==27
         assert all(c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0]==count for t,count in before.items())
         assert dict(c.execute('SELECT id,character_id FROM conversations').fetchall())=={'known':'big_fish','unknown':None,'mixed':None}
         assert dict(c.execute('SELECT id,character_id FROM memory_items').fetchall())=={'known-memory':'big_fish','unknown-memory':None,'mixed-memory':None,'orphan-memory':None}
@@ -82,7 +82,7 @@ def test_migration12_failure_rolls_back_entire_schema_and_marker(tmp_path,monkey
         assert 'character_id' not in {r[1] for r in c.execute('PRAGMA table_info(conversations)')}
         assert c.execute("SELECT source_proposal_id FROM memory_correction_clarifications WHERE id='clarification'").fetchone()[0]=='proposal'
     db.initialize()
-    with db.connection() as c: assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==21
+    with db.connection() as c: assert c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==27
 
 
 def test_old_proactive_delivery_alone_does_not_prove_ownership(tmp_path,monkeypatch):
@@ -101,7 +101,7 @@ def test_v1_upgrade_keeps_unattributable_messages_isolated(tmp_path,monkeypatch)
     db=legacy_database(tmp_path/'v1.db',monkeypatch,version=1)
     with db.connection() as c:
         c.execute("INSERT INTO conversations VALUES ('old','legacy',?,?)",(AT,AT))
-        c.execute("INSERT INTO messages VALUES ('old-msg','old','user','keep me',?)",(AT,))
+        c.execute("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES ('old-msg','old','user','keep me',?)",(AT,))
     db.initialize()
     with db.connection() as c:
         assert c.execute("SELECT content FROM messages WHERE id='old-msg'").fetchone()[0]=='keep me'

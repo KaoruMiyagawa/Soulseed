@@ -1,13 +1,20 @@
-import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
+import { Component, StrictMode, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./home.css";
+import "./chat.css";
+import "./interactions.css";
+import { ChatAvatar } from "./ChatAvatar";
+import { ChatTranscript } from "./ChatTranscript";
+import { AsyncChat, ChatEmpty } from "./AsyncChat";
 import { confirmDeliveryAndSync } from "./proactiveDelivery";
-import { ApiError, createApiRequest } from "./apiRequest";
+import { createApiRequest } from "./apiRequest";
+import { desktopApi, desktopTransport } from "./desktopApi";
+import { ModelSettings, modelPath, type ModelStatus } from "./ModelSettings";
 import { quotaAllowsStart, quotaMessage, type ExplorationQuota } from "./explorationQuota";
 
-type Message = { id: string; role: "user" | "assistant" | "system"; content: string };
-type Conversation = { id: string; title: string; messages?: Message[] };
+type Conversation = { id: string; title: string };
+type Session = { user_id: string; character_id: string };
 type ProactiveMessage = { id: string; content: string; status: "ready" | "delivered" | "read" };
 type DeliveryRetry = { message: ProactiveMessage; conversationId: string };
 type ExplorationEvidence = { id: string; tool_name: string; outcome: string; source_url: string | null; title: string | null; retrieved_at: string | null; excerpt: string | null; page_relevance?: string | null };
@@ -16,9 +23,26 @@ type ExplorationAutonomy = { enabled: boolean; paused_until: string | null; cool
 type LifeEvent = { id: string; content: string; event_type: string; status: string; activity_status?: string | null; effective_status?: string | null; feeling?: string | null; location?: string | null; occurred_at?: string | null; planned_start_at?: string | null; planned_end_at?: string | null };
 type LifeSnapshot = { state: { mood: string | null; timezone_id: string; current_activity: LifeEvent | null }; events: LifeEvent[]; pending_shares: unknown[] };
 type View = "world" | "chat" | "diary" | "plan" | "exploration";
-const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8001/api";
+const desktop = import.meta.env.MODE === "desktop";
+const API = desktop ? desktopApi : import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8001/api";
 
-const request = createApiRequest(API, () => window.dispatchEvent(new Event("soulseed-session-expired")));
+const request = createApiRequest(API, () => window.dispatchEvent(new Event("soulseed-session-expired")),
+  undefined, desktop ? desktopTransport : undefined);
+
+class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    if (this.state.failed) return <main className="pairing" role="alert">
+      <p>页面暂时无法显示，请返回首页后重试。</p>
+      <button className="button-primary" type="button" onClick={() => {
+        history.replaceState(null, "", location.pathname + location.search);
+        this.setState({ failed: false });
+      }}>返回首页</button>
+    </main>;
+    return this.props.children;
+  }
+}
 
 function explorationFailureMessage(code: string): string {
   const reasons: Record<string, string> = {
@@ -38,8 +62,9 @@ function explorationFailureMessage(code: string): string {
     model_provider_rate_limited: "模型服务商返回限流或供应商额度限制，请稍后再试。",
     model_network_error: "连接模型服务失败，请检查网络。",
     model_timeout: "等待模型服务超时；服务商是否收到或计费未知。",
-    model_configuration_error: "探索模型配置不可用，请检查开发环境配置。",
-    exploration_model_unavailable: "探索模型未启用或尚未配置，请检查开发环境配置。",
+    model_configuration_error: "探索模型配置不可用，请检查模型设置。",
+    exploration_model_unavailable: "探索模型未启用或尚未配置，请检查模型设置。",
+    autonomous_paused: "自主探索已暂停，没有继续调用模型。",
     search_unavailable: "搜索服务暂时不可用，没有取得资料；这次探索未完成。",
     search_format_changed: "搜索服务返回了无法识别的格式，没有把它当成搜索结果。",
     search_challenge: "搜索服务暂时要求验证，没有取得可用资料。",
@@ -93,7 +118,7 @@ function ProactivePreview({ message, hasConversation, onVisible }: {
   </article>;
 }
 
-function App({ characterId }: { characterId: string }) {
+function App({ characterId, userId }: { characterId: string; userId: string }) {
   const CONTACT = `/characters/${encodeURIComponent(characterId)}/contact`;
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [active, setActive] = useState<Conversation | null>(null);
@@ -102,25 +127,53 @@ function App({ characterId }: { characterId: string }) {
   const [proactive, setProactive] = useState<Record<string, ProactiveMessage>>({});
   const [deliveryRetries, setDeliveryRetries] = useState<Record<string, DeliveryRetry>>({});
   const receiving = useRef<Set<string>>(new Set());
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [syncAfterFailure, setSyncAfterFailure] = useState<string | null>(null);
   const [explorationTopic, setExplorationTopic] = useState("");
   const [exploration, setExploration] = useState<Exploration | null>(null);
   const [explorationBusy, setExplorationBusy] = useState(false);
   const [autonomy, setAutonomy] = useState<ExplorationAutonomy | null>(null);
   const [quota, setQuota] = useState<ExplorationQuota | null>(null);
-  const [view, setView] = useState<View>("world");
+  const [explorationLoadError, setExplorationLoadError] = useState("");
+  const [view, setView] = useState<View>(() => location.hash === "#chat" ? "chat" : "world");
+  const selectionKey = "soulseed-active-chat:" + JSON.stringify([API, userId, characterId]);
   const [life, setLife] = useState<LifeSnapshot | null>(null);
   const [lifeError, setLifeError] = useState("");
+  const [model, setModel] = useState<ModelStatus | null>(null);
+  const [modelOpen, setModelOpen] = useState(false);
+  const [modelLoadError, setModelLoadError] = useState("");
+  const [autonomousMasterPaused, setAutonomousMasterPaused] = useState<boolean | null>(null);
   const onVisible = useCallback((id: string) => setVisibleInbox((ids) => new Set(ids).add(id)), []);
+  useEffect(() => {
+    if (!desktop) return;
+    const controller = new AbortController();
+    request<ModelStatus>(modelPath, { signal: controller.signal }).then(result => {
+      if (!controller.signal.aborted) setModel(result);
+    }).catch((error: Error) => {
+      if (!controller.signal.aborted) setModelLoadError(error.message);
+    });
+    return () => controller.abort();
+  }, []);
+  useEffect(() => {
+    if (view === "chat" && location.hash !== "#chat") history.replaceState(null, "", "#chat");
+    if (view !== "chat" && location.hash === "#chat") history.replaceState(null, "", location.pathname + location.search);
+  }, [view]);
+
+  useEffect(() => {
+    if (!active) return;
+    try { sessionStorage.setItem(selectionKey, active.id); } catch { /* Optional view preference. */ }
+  }, [selectionKey, active?.id]);
   const refreshQuota = useCallback(() => {
+    if (desktop) {
+      void request<{ autonomous_paused: boolean }>("/desktop/runtime")
+        .then(state => setAutonomousMasterPaused(state.autonomous_paused))
+        .catch(() => setAutonomousMasterPaused(null));
+    }
     return request<ExplorationAutonomy>(`/characters/${encodeURIComponent(characterId)}/exploration-autonomy`)
       .then((state) => {
+        setExplorationLoadError("");
         setQuota(state.quota); setAutonomy(state);
         setExploration(state.current ?? state.latest);
-      }).catch(() => setQuota(null));
+      }).catch((error: Error) => { setQuota(null); setAutonomy(null); setExplorationLoadError(error.message); });
   }, [characterId]);
 
   useEffect(() => {
@@ -198,29 +251,41 @@ function App({ characterId }: { characterId: string }) {
   }, [CONTACT]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    request<Conversation[]>("/conversations", { signal: controller.signal })
+      .then(items => {
+        if (controller.signal.aborted) return;
+        let selected: string | null = null;
+        try { selected = sessionStorage.getItem(selectionKey); } catch { /* Use the newest conversation. */ }
+        setConversations(items);
+        setActive(current => current ?? items.find(item => item.id === selected) ?? items[0] ?? null);
+      }).catch((e: Error) => { if (!controller.signal.aborted) setError(e.message); });
+    if (desktop) return () => controller.abort();
     const load = async () => {
-      await request<{ ready_message_id: string | null }>(`${CONTACT}/check`, { method: "POST" });
-      const [items, ready, history] = await Promise.all([
-        request<Conversation[]>("/conversations"),
-        request<ProactiveMessage[]>(`${CONTACT}/inbox`),
-        request<ProactiveMessage[]>(`${CONTACT}/messages`),
+      await request<{ ready_message_id: string | null }>(`${CONTACT}/check`, { method: "POST", signal: controller.signal });
+      const [ready, history] = await Promise.all([
+        request<ProactiveMessage[]>(`${CONTACT}/inbox`, { signal: controller.signal }),
+        request<ProactiveMessage[]>(`${CONTACT}/messages`, { signal: controller.signal }),
       ]);
-      setConversations(items);
+      if (controller.signal.aborted) return;
       setInbox(ready);
       setProactive(Object.fromEntries(history.map((item) => [item.id, item])));
-      if (items[0]) setActive(await request<Conversation>(`/conversations/${items[0].id}`));
     };
-    load().catch((e: Error) => setError(e.message));
+    load().catch((e: Error) => { if (!controller.signal.aborted) setError(e.message); });
     const refresh = () => {
       if (document.visibilityState === "visible") {
-        request<{ ready_message_id: string | null }>(`${CONTACT}/check`, { method: "POST" })
-          .then(() => request<ProactiveMessage[]>(`${CONTACT}/inbox`))
-          .then(setInbox).catch((e: Error) => setError(e.message));
+        request<{ ready_message_id: string | null }>(`${CONTACT}/check`, { method: "POST", signal: controller.signal })
+          .then(() => request<ProactiveMessage[]>(`${CONTACT}/inbox`, { signal: controller.signal }))
+          .then(items => { if (!controller.signal.aborted) setInbox(items); })
+          .catch((e: Error) => { if (!controller.signal.aborted) setError(e.message); });
       }
     };
     document.addEventListener("visibilitychange", refresh);
-    return () => document.removeEventListener("visibilitychange", refresh);
-  }, []);
+    return () => {
+      controller.abort();
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [CONTACT, selectionKey]);
 
   // React runs this after the ready card is visible. Server delivery is idempotent.
   useEffect(() => {
@@ -233,51 +298,7 @@ function App({ characterId }: { characterId: string }) {
   const newConversation = async () => {
     const created = await request<Conversation>("/conversations", { method: "POST", body: JSON.stringify({}) });
     setConversations((items) => [created, ...items]);
-    setActive({ ...created, messages: [] });
-  };
-
-  const send = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!input.trim() || !active || busy || syncAfterFailure) return;
-    setBusy(true);
-    setError("");
-    const content = input;
-    const conversationId = active.id;
-    const started = performance.now();
-    try {
-      const message = await request<Message>(`/conversations/${conversationId}/messages`, {
-        method: "POST", body: JSON.stringify({ content }),
-      });
-      setActive((conversation) => conversation?.id === conversationId
-        ? { ...conversation, messages: [...(conversation.messages ?? []), { id: crypto.randomUUID(), role: "user", content }, message] }
-        : conversation);
-      setInput("");
-      requestAnimationFrame(() => console.info("soulseed_chat_display", { nextFrameMs: performance.now() - started }));
-    } catch (e) {
-      const failure = e as Error;
-      if (failure instanceof ApiError && failure.messageSaved) {
-        setInput("");
-        try {
-          const refreshed = await request<Conversation>(`/conversations/${conversationId}`);
-          setActive((current) => current?.id === conversationId ? refreshed : current);
-          setInput("");
-          setError(`模型未完成本次回复：${failure.message} 已同步会话记录；请直接继续发送，避免重复提交。`);
-        } catch {
-          setSyncAfterFailure(conversationId);
-          setError(`${failure.message} 请先刷新当前会话确认记录，再继续发送。`);
-        }
-      } else if (!(failure instanceof ApiError)) {
-        // A lost response is not evidence that the POST was not committed.
-        // Clear the submitted draft and only offer a read-only resync, never a resend.
-        setInput("");
-        setSyncAfterFailure(conversationId);
-        setError("连接或响应异常，本次发送状态未知，模型可能仍在处理。请同步会话，不要原样重发。");
-      } else {
-        setError(failure.message);
-      }
-    } finally {
-      setBusy(false);
-    }
+    setActive(created);
   };
 
   const markRead = async (id: string) => {
@@ -310,15 +331,23 @@ function App({ characterId }: { characterId: string }) {
     { id: "diary", label: "手帐" }, { id: "plan", label: "计划" }, { id: "exploration", label: "探索" },
   ];
 
+  const lifeStatus = <div className="life-status" aria-live="polite"><span className="status-dot" />{lifeError ? "生活状态暂不可用" : currentActivity?.content ?? (life ? "暂无进行中的活动" : "正在同步生活状态")}</div>;
   const header = <header className="site-header">
     <button className="wordmark" type="button" onClick={() => setView("world")} aria-label="返回她的世界">
-      <span className="wordmark-name">soulseed <span aria-hidden="true">✧</span></span>
+      <span className="wordmark-name">soulseed <img className="brand-mark" src="/brand/Soulseed-Light.png" alt="" /></span>
       <span className="wordmark-caption">HER WORLD / ACTIVITY</span>
     </button>
     <nav className="primary-nav" aria-label="主导航">
       {navItems.map((item) => <button key={item.id} type="button" className={view === item.id ? "is-active" : ""} aria-current={view === item.id ? "page" : undefined} onClick={() => setView(item.id)}>{item.label}</button>)}
     </nav>
-    <div className="life-status" aria-live="polite"><span className="status-dot" />{lifeError ? "生活状态暂不可用" : currentActivity?.content ?? (life ? "暂无进行中的活动" : "正在同步生活状态")}</div>
+    {desktop ? <div className="desktop-settings-area">
+      {lifeStatus}
+      <button className="text-button" type="button" onClick={() => setModelOpen(true)}>
+        {modelLoadError ? "模型设置 · 配置不可用" : model?.configured ? "模型设置" : "模型设置 · 未配置"}
+      </button>
+      {modelOpen && <ModelSettings status={model} request={request} characterId={characterId} onClose={() => setModelOpen(false)}
+        onChange={status => { setModel(status); setModelLoadError(""); }} />}
+    </div> : lifeStatus}
   </header>;
 
   if (view === "world") return <main className="soulseed-app">
@@ -333,8 +362,7 @@ function App({ characterId }: { characterId: string }) {
         </div>
 
         <section className="room-stage" aria-label="大肥鱼的生活世界">
-          <div className="room-art-slot"><span className="art-slot-note">生活世界场景素材待接入</span></div>
-          <div className="character-crop"><img src="/assets/characters/big-fish-turnaround.jpg" alt="大肥鱼正面形象：蓝色长发与眼睛、带鲸鱼徽记的蓝白女仆装和深蓝色鱼尾。" draggable={false} /></div>
+          <img className="room-scene" src="/assets/soulseed-hero.webp" alt="大肥鱼在鲸海小屋中抱着鲸鱼玩偶，蓝色长发与鱼尾映着海窗的阳光。" draggable={false} />
           <div className="scene-caption"><span>DA FEIYU’S LIVING WORLD</span><strong>大肥鱼的生活世界</strong><small>探索 · 发现 · 记录 · 一起成长</small></div>
           <button className="scene-action" type="button" onClick={() => setView("chat")} aria-label="与大肥鱼对话">↗</button>
         </section>
@@ -371,49 +399,87 @@ function App({ characterId }: { characterId: string }) {
   if (view === "plan") return <main className="soulseed-app">{header}<section className="content-page journal-page"><header className="view-heading"><div><p className="eyebrow">A DAY AT HER OWN PACE</p><h1>今日计划</h1></div><span>已保存的活动安排</span></header>{lifeError && <p className="error" role="alert">{lifeError}</p>}{currentActivity && <article className="plan-current"><span className="eyebrow">正在进行</span><h2>{currentActivity.content}</h2><button className="button-secondary" type="button" onClick={() => void transitionLifeEvent(currentActivity.id, "completed")}>标记完成</button></article>}{plannedEvents.length ? <div className="journal-list">{plannedEvents.map((event) => <article className="journal-entry" key={event.id}><span className="entry-date">{event.planned_start_at ? new Date(event.planned_start_at).toLocaleTimeString("zh-CN", { timeZone: timezone, hour: "2-digit", minute: "2-digit" }) : "待安排"}</span><div><h2>{event.content}</h2><p>{event.location || "已保存的计划"}</p></div><span className="plan-actions"><button className="text-button" type="button" onClick={() => void transitionLifeEvent(event.id, "active")}>开始</button><button className="text-button" type="button" onClick={() => void transitionLifeEvent(event.id, "cancelled")}>取消</button></span></article>)}</div> : <p className="panel-empty">目前没有已保存的计划。</p>}</section></main>;
 
   if (view === "exploration") return <main className="soulseed-app">{header}<section className="content-page explore-page"><header className="view-heading"><div><p className="eyebrow">CURIOSITY, AT HER OWN PACE</p><h1>探索与发现</h1></div><span>研究任务与自主探索状态</span></header>
+    {explorationLoadError && <p className="error" role="alert">探索状态读取失败：{explorationLoadError}</p>}
     <p role="status">{quotaMessage(quota)}</p><form className="explore-form" onSubmit={startExploration}><input aria-label="探索主题" value={explorationTopic} onChange={(e) => setExplorationTopic(e.target.value)} maxLength={240} placeholder="输入一个主题；留空时从已保存兴趣中选题" disabled={!quotaAllowsStart(quota) || explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)} /><button className="button-primary" disabled={!quotaAllowsStart(quota) || explorationBusy || !!exploration && ["planned", "active"].includes(exploration.status)}>{explorationBusy ? "安排中…" : "开始探索"}</button></form>
-    <section className="autonomy-panel"><div><p className="eyebrow">BACKGROUND EXPLORATION</p><h2>后台自主探索：{autonomy ? autonomy.enabled ? "已启用" : "已关闭" : "状态未知"}</h2><p>{!autonomy ? "当前后端未返回设置状态。" : `后端运行时最多每 ${autonomy.cooldown_hours} 小时一次`}{autonomy?.paused_until && ` · 暂停至 ${new Date(autonomy.paused_until).toLocaleString()}`}</p>{autonomy?.last_skip_reason && <small>最近检查未启动：{({ no_eligible_topic: "没有符合条件的已保存兴趣、目标或待查问题", cooldown: "仍在冷却时间内", paused: "自主探索已暂停", active_task: "已有探索任务进行中", exploration_daily_quota_exhausted: "今日探索请求额度已用完，重置后再检查", exploration_quota_unavailable: "探索额度记录暂时无法核验" } as Record<string, string>)[autonomy.last_skip_reason] ?? "未满足启动条件"}</small>}</div><div className="autonomy-actions"><button className="button-secondary" type="button" disabled={!autonomy} onClick={() => updateAutonomy({ enabled: !autonomy?.enabled })}>{autonomy?.enabled ? "关闭自主探索" : "启用自主探索"}</button><label>探索间隔<select aria-label="自主探索间隔" disabled={!autonomy} value={autonomy?.cooldown_hours ?? 24} onChange={(event) => updateAutonomy({ cooldown_hours: Number(event.target.value) })}><option value={24}>每天最多一次</option><option value={48}>每两天一次</option><option value={168}>每周一次</option></select></label>{autonomy?.enabled && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() })}>暂停 24 小时</button>}{autonomy?.paused_until && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: null })}>恢复</button>}</div></section>
+    <section className="autonomy-panel"><div><p className="eyebrow">BACKGROUND EXPLORATION</p><h2>后台自主探索：{autonomy ? autonomy.enabled ? "已启用" : "已关闭" : "状态未知"}{desktop && autonomousMasterPaused ? "（总暂停中）" : ""}</h2><p>{!autonomy ? "当前后端未返回设置状态。" : `后端运行时最多每 ${autonomy.cooldown_hours} 小时一次`}{autonomy?.paused_until && ` · 暂停至 ${new Date(autonomy.paused_until).toLocaleString()}`}</p>{desktop && autonomousMasterPaused && <small>模型设置中的自主探索总开关仍处于暂停状态。</small>}{autonomy?.last_skip_reason && <small>最近检查未启动：{({ no_eligible_topic: "没有符合条件的已保存兴趣、目标或待查问题", cooldown: "仍在冷却时间内", paused: "自主探索已暂停", active_task: "已有探索任务进行中", exploration_daily_quota_exhausted: "今日探索请求额度已用完，重置后再检查", exploration_quota_unavailable: "探索额度记录暂时无法核验" } as Record<string, string>)[autonomy.last_skip_reason] ?? "未满足启动条件"}</small>}</div><div className="autonomy-actions"><button className="button-secondary" type="button" disabled={!autonomy} onClick={() => updateAutonomy({ enabled: !autonomy?.enabled })}>{autonomy?.enabled ? "关闭自主探索" : "启用自主探索"}</button><label>探索间隔<select aria-label="自主探索间隔" disabled={!autonomy} value={autonomy?.cooldown_hours ?? 24} onChange={(event) => updateAutonomy({ cooldown_hours: Number(event.target.value) })}><option value={24}>每天最多一次</option><option value={48}>每两天一次</option><option value={168}>每周一次</option></select></label>{autonomy?.enabled && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() })}>暂停 24 小时</button>}{autonomy?.paused_until && <button className="text-button" type="button" onClick={() => updateAutonomy({ paused_until: null })}>恢复</button>}</div></section>
     {exploration && <article className="exploration-result" aria-live="polite"><strong>探索状态：{exploration.error_code === "insufficient_evidence" || exploration.status === "completed" && (!exploration.claims?.length || !exploration.evidence?.some((item) => item.tool_name === "read_webpage" && item.page_relevance === "relevant")) ? "资料不足，未形成可靠结论" : ({ planned: "计划中", active: "进行中", completed: "已完成", interrupted: "已中断", failed: "失败", cancelled: "已取消" } as const)[exploration.status]}</strong><span> · {exploration.selected_topic || exploration.requested_topic || "等待自主选题"} · {exploration.trigger_mode === "autonomous" ? "大肥鱼自主发起" : exploration.topic_origin === "user" ? "你指定的主题" : "根据已保存兴趣选题"}</span>{exploration.topic_basis && <span> · 依据：{({ stable_interest: "稳定兴趣", unresolved_question: "未解决问题", planned_goal: "已保存目标", derived_question: "探索衍生问题", pending_selection: "等待依据选择" } as Record<string, string>)[exploration.topic_basis] ?? exploration.topic_basis}</span>}{exploration.status === "active" && <p>当前阶段：{({ planning: "选择主题", searching: "搜索资料", reading: "安全读取网页", evaluating: "核对证据", planned: "等待开始" } as Record<string, string>)[exploration.phase ?? ""] ?? "执行中"}</p>}{<small>决策尝试 {exploration.model_call_count ?? 0} 次；请求预留 {exploration.model_diagnostics?.reservations ?? "未知"} 次；HTTP 尝试 {exploration.model_diagnostics?.http_attempts ?? "未知"}{exploration.model_diagnostics?.http_attempts_complete === false ? "（仅可确认的次数）" : ""} 次；服务商收到或计费情况未知。</small>}{exploration.timings && <small>模型 {exploration.timings.model?.count ?? 0} 次 / {Math.round((exploration.timings.model?.total_ms ?? 0) / 1000)} 秒；搜索 {Math.round((exploration.timings.search?.total_ms ?? 0) / 1000)} 秒；网页读取 {Math.round((exploration.timings.read?.total_ms ?? 0) / 1000)} 秒；总计 {Math.round((exploration.duration_ms ?? 0) / 1000)} 秒。</small>}{["planned", "active"].includes(exploration.status) && <button className="text-button" type="button" onClick={cancelExploration}>取消探索</button>}{exploration.summary && <p>{exploration.summary}</p>}{exploration.claims?.map((claim, index) => <p key={`${index}-${claim.text}`}><small>{claim.kind === "inference" ? "推断" : "来源支持"}</small> {claim.text}</p>)}{exploration.unanswered?.length > 0 && <p>还没查清：{exploration.unanswered.join("；")}</p>}{exploration.evidence?.filter((item) => item.tool_name === "read_webpage" && item.outcome === "success").map((item) => <p key={item.id}><a href={item.source_url ?? undefined} target="_blank" rel="noreferrer">{item.title || item.source_url}</a><small> · {item.retrieved_at} · {item.page_relevance === "relevant" ? "与主题相关" : item.page_relevance === "irrelevant" ? "正文无关，仅留作审计" : "旧记录未评估正文相关性"}</small></p>)}{exploration.error_code && <p className="error">{explorationFailureMessage(exploration.error_code)} 没有记作已完成探索。</p>}</article>}
     {error && <p className="error" role="alert">{error}</p>}</section></main>;
 
   return <main className="soulseed-app">{header}<div className="content-page chat-layout">
-    <aside className="conversation-sidebar"><div className="section-kicker">SOULSEED / CHAT</div><button className="button-primary new-chat" onClick={() => newConversation().catch((e: Error) => setError(e.message))}>＋ 新会话</button><nav aria-label="会话列表">{conversations.map((item) => <button className={item.id === active?.id ? "selected" : ""} key={item.id} onClick={() => request<Conversation>(`/conversations/${item.id}`).then(setActive).catch((e: Error) => setError(e.message))}>{item.title}</button>)}</nav></aside>
-    <section className="chat-panel"><header className="view-heading"><div><p className="eyebrow">A QUIET MOMENT TOGETHER</p><h1>与大肥鱼对话</h1></div><span>对话中会按需检索相关记忆</span></header>
-      <div className="messages">{active?.messages?.map((message) => <article className={`message ${message.role}`} key={message.id}><label>{message.role === "user" ? "你" : "大肥鱼"}</label><p>{message.content}</p>{proactive[message.id]?.status === "delivered" && <button className="read-button" onClick={() => markRead(message.id)}>标记已读</button>}</article>)}{inbox.map((message) => <ProactivePreview key={message.id} message={message} hasConversation={!!active} onVisible={onVisible} />)}{Object.values(deliveryRetries).map(({ message, conversationId }) => <div className="error" key={message.id}>主动消息状态待同步：{message.content}<button type="button" onClick={() => void deliverAndSync(message, conversationId)}>重试投递与同步</button></div>)}{!active && inbox.length === 0 && <div className="empty">创建一个会话，开始与大肥鱼交流。</div>}</div>
-      {error && <div className="error" role="alert">{error}</div>}
-      {syncAfterFailure && <button className="button-secondary" type="button" disabled={busy} onClick={async () => { setBusy(true); try { const refreshed = await request<Conversation>(`/conversations/${syncAfterFailure}`); setActive(refreshed); setSyncAfterFailure(null); setError("已同步当前记录。若尚无回复，模型可能仍在处理；请勿原样重复发送。"); } catch { setError("会话同步失败，请检查网络后再次同步；不会重新发送消息。"); } finally { setBusy(false); } }}>同步会话记录</button>}
-      <form className="composer" onSubmit={send}><textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="写下你想说的话…" disabled={busy || !active} /><button className="button-primary" disabled={busy || !active || !!syncAfterFailure}>{busy ? "思考中…" : "发送"}</button></form>
+    <aside className="conversation-sidebar" aria-label="对话导航">
+      <div className="conversation-heading"><h2>会话</h2><span>{conversations.length} 段对话</span></div>
+      <button className="button-primary new-chat" onClick={() => newConversation().catch((e: Error) => setError(e.message))}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>新会话
+      </button>
+      <nav aria-label="会话列表">{conversations.map((item) => <button className={item.id === active?.id ? "selected" : ""} aria-current={item.id === active?.id ? "page" : undefined} title={item.title} key={item.id} onClick={() => setActive(item)}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5a8 8 0 0 1-8 8H5l-3 2v-10a9 9 0 0 1 18 0Z" /><path d="M7 10h8M7 14h5" /></svg><span>{item.title}</span>
+      </button>)}</nav>
+      {conversations.length === 0 && <p className="conversation-caption">点击上方按钮，创建一段新的对话。</p>}
+    </aside>
+    <section className="chat-panel" aria-label="与大肥鱼对话">
+      <header className="view-heading chat-heading">
+        <div className="chat-identity"><ChatAvatar /><div><h1>大肥鱼</h1>
+          <p className="chat-status" data-active={!lifeError && !!currentActivity} aria-live="polite"><span className="chat-status-dot" aria-hidden="true" />{lifeError ? "生活状态暂不可用" : currentActivity?.content ?? (life ? "暂无进行中的活动" : "正在同步生活状态")}</p>
+        </div></div>
+        <span className="chat-header-note">对话中会按需检索相关记忆</span>
+      </header>
+      {active ? <AsyncChat key={active.id} api={API} user={userId} character={characterId}
+        conversation={active.id} request={request} extraCount={inbox.length + Object.keys(deliveryRetries).length}
+        desktopModelReady={desktop ? !!model?.configured : undefined}
+        error={error} isDelivered={id => proactive[id]?.status === "delivered"} markRead={markRead}>
+        {inbox.map(message => <ProactivePreview key={message.id} message={message} hasConversation onVisible={onVisible} />)}
+        {Object.values(deliveryRetries).filter(retry => retry.conversationId === active.id).map(({ message, conversationId }) =>
+          <div className="error chat-notice" key={message.id}>主动消息状态待同步：{message.content}
+            <button type="button" onClick={() => void deliverAndSync(message, conversationId)}>重试投递与同步</button>
+          </div>)}
+      </AsyncChat> : <ChatTranscript messageCount={0}>
+        {error && <div className="error chat-notice" role="alert">{error}</div>}
+        <ChatEmpty hasConversation={false} />
+      </ChatTranscript>}
     </section>
   </div></main>;
 
 }
 
 function LocalSession() {
-  const [character, setCharacter] = useState<string | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
   const [checking, setChecking] = useState(true);
   const [secret, setSecret] = useState("");
   const [error, setError] = useState("");
   const [pairing, setPairing] = useState(false);
   useEffect(() => {
-    const expired = () => setCharacter(null);
+    const controller = new AbortController();
+    const expired = () => setSession(null);
     window.addEventListener("soulseed-session-expired", expired);
-    request<{ character_id: string }>("/auth/session")
-      .then((session) => setCharacter(session.character_id))
-      .catch(() => setCharacter(null)).finally(() => setChecking(false));
-    return () => window.removeEventListener("soulseed-session-expired", expired);
+    request<Session>("/auth/session", { signal: controller.signal })
+      .then(result => { if (!controller.signal.aborted) setSession(result); })
+      .catch((error: Error) => {
+        if (!controller.signal.aborted) {
+          setSession(null);
+          if (desktop) setError(error.message);
+        }
+      })
+      .finally(() => { if (!controller.signal.aborted) setChecking(false); });
+    return () => {
+      controller.abort();
+      window.removeEventListener("soulseed-session-expired", expired);
+    };
   }, []);
   const pair = async (event: React.FormEvent) => {
     event.preventDefault(); setPairing(true); setError("");
     try {
-      const session = await request<{ character_id: string }>("/auth/session", {
+      const session = await request<Session>("/auth/session", {
         method: "POST", body: JSON.stringify({ secret }),
       });
-      setCharacter(session.character_id);
+      setSession(session);
     } catch (e) { setError((e as Error).message); }
     finally { setSecret(""); setPairing(false); }
   };
   if (checking) return <main className="pairing">正在确认本地会话…</main>;
-  if (character) return <App key={character} characterId={character} />;
+  if (session) return <App key={JSON.stringify([session.user_id, session.character_id])}
+    userId={session.user_id} characterId={session.character_id} />;
+  if (desktop) return <main className="pairing"><p role="alert">{error || "本地服务连接中断，请关闭后重新打开 Soulseed。"}</p></main>;
+  if (development) return <main className="pairing"><p role="alert">暂时无法连接本地后端。请确认服务可用后刷新。</p></main>;
   return <main className="pairing"><h1>进入 Soulseed</h1>
     <p>输入本地配对口令，打开你的角色空间。</p>
     <form onSubmit={pair}><input aria-label="本地配对口令" type="password" autoComplete="current-password" value={secret} onChange={(e) => setSecret(e.target.value)} required />
@@ -422,7 +488,7 @@ function LocalSession() {
   </main>;
 }
 
-const development = import.meta.env.VITE_SOULSEED_DEVELOPMENT_MODE === "true";
+const development = !desktop && import.meta.env.VITE_SOULSEED_DEVELOPMENT_MODE === "true";
 createRoot(document.getElementById("root")!).render(
-  <StrictMode>{development ? <App characterId="big_fish" /> : <LocalSession />}</StrictMode>,
+  <StrictMode><PageErrorBoundary>{development ? <App userId="local" characterId="big_fish" /> : <LocalSession />}</PageErrorBoundary></StrictMode>,
 );

@@ -160,21 +160,30 @@ def _same_decision(supplied: Decision, fresh: Decision, candidate: Candidate) ->
 
 
 def build_draft_context(database: Database, character_id: str, candidate: Candidate,
-                        decision: Decision, persona: PersonaProfile, *, now: datetime | None = None) -> DraftContext:
+                        decision: Decision, persona: PersonaProfile, *, now: datetime | None = None,
+                        allow_first_discovery: bool = False, extra_candidate: Candidate | None = None) -> DraftContext:
     """Re-read B's candidate and its saved evidence; never trust caller-made objects."""
     if current_character.get() != character_id or persona.character_id != character_id or candidate.character_id != character_id:
         raise ValueError('character_scope_mismatch')
     if not persona.description.strip() or len(persona.description) > 1200 or not persona.allowed_styles or any(s not in _STYLES for s in persona.allowed_styles):
         raise ValueError('invalid_persona')
     snapshot = build_snapshot(database, character_id, now=now)
-    fresh = dry_run(snapshot)
-    if candidate not in generate_candidates(snapshot) or not _same_decision(decision, fresh, candidate):
+    fresh = dry_run(snapshot, allow_first_discovery=allow_first_discovery, extra_candidate=extra_candidate)
+    if candidate not in (*generate_candidates(snapshot), *((extra_candidate,) if extra_candidate else ())) or not _same_decision(decision, fresh, candidate):
         raise ValueError('candidate_not_eligible')
     options: list[EvidenceOption] = []
     share = None
     interactions = []
     candidate_ids = {ref.id for ref in candidate.evidence}
-    if candidate.kind == 'shared_topic':
+    if candidate.kind in ('smalltalk', 'conversation_followup'):
+        from .desktop_contact import DesktopContact
+        if DesktopContact.smalltalk_candidate_for_database(database, character_id, now=snapshot.observed_at) != candidate:
+            raise ValueError('candidate_not_eligible')
+        with database.connection() as db:
+            anchor = db.execute("SELECT content FROM messages WHERE id=? AND role='user'", (candidate.evidence[0].id,)).fetchone()
+        options.append(EvidenceOption('message:' + candidate.evidence[0].id, candidate.kind, anchor['content'], (candidate.evidence[0].id,)))
+        interactions = ['user: ' + anchor['content']]
+    elif candidate.kind == 'shared_topic':
         anchor = next((item for item in snapshot.interactions if item.evidence.id in candidate_ids and item.role == 'user'), None)
         match = _INVITATION.search(anchor.content) if anchor else None
         topic = match.group(1).strip(' 的呀吧啊啦哦 ') if match else ''
@@ -261,6 +270,12 @@ def build_draft_context(database: Database, character_id: str, candidate: Candid
     return DraftContext(character_id, candidate, persona, expression, tuple(options), hashes)
 
 
+def render_evidence_option(style: str, candidate_type: str, option: EvidenceOption) -> str:
+    prefix, suffix = _STYLES[style][candidate_type]
+    content = f'「{option.text}」' if option.kind == 'shared_topic' else option.text
+    return prefix + content + suffix
+
+
 class DraftService:
     """Only explicitly constructed mock collaborators are accepted in this phase."""
     def __init__(self, database: Database, generator: MockDraftGenerator, reviewer: MockEvidenceReviewer, registry: PersonaRegistry,
@@ -297,10 +312,9 @@ class DraftService:
         if (current.options != context.options or current.expression != context.expression
                 or current.recent_message_hashes != context.recent_message_hashes):
             return DraftResult('rejected', failure_code='context_changed')
-        prefix, suffix = _STYLES[plan.style][candidate.kind]
         content = f'「{option.text}」' if option.kind == 'shared_topic' else option.text
         if plan.proposed_text is None:
-            text = prefix + content + suffix
+            text = render_evidence_option(plan.style, candidate.kind, option)
         else:
             text = plan.proposed_text
             if (not isinstance(text, str) or not text.strip() or len(text) > 300 or content not in text

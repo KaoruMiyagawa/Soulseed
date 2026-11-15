@@ -1,4 +1,4 @@
-"""Mock-only D3-A pipeline; it never invokes a real model adapter.
+"""Autonomous contact handoff shared by the isolated mock and desktop pipelines.
 
 The only cross-system handoff runs under one Database.atomic() transaction.
 The ContactService remains the owner of intent validation and delivery rules.
@@ -18,6 +18,7 @@ from .contact import ContactService
 from .ownership import current_character
 from .proactive_expression import (DraftResult, DraftService, MockDraftGenerator,
                                    MockEvidenceReviewer)
+from .proactive_fact_review import FactReviewService, ReviewDraft
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,8 @@ class AutonomousContactPipeline:
 
     def __init__(self, state: AutonomousIntentStateRepository, contact: ContactService,
                  drafts: DraftService, general_budget: MockGeneralBudgetGate, *,
-                 clock=lambda: datetime.now(UTC), failure_hook=None):
+                 clock=lambda: datetime.now(UTC), failure_hook=None,
+                 fact_reviews: FactReviewService | None = None):
         if (type(state) is not AutonomousIntentStateRepository or type(contact) is not ContactService
                 or type(drafts) is not DraftService or type(drafts.generator) is not MockDraftGenerator
                 or type(drafts.reviewer) is not MockEvidenceReviewer
@@ -67,7 +69,11 @@ class AutonomousContactPipeline:
             raise RuntimeError("d3a_mock_pipeline_testing_only")
         if contact.repository.database is not state.database or drafts.database is not state.database:
             raise ValueError("d3a_shared_database_required")
+        if fact_reviews is not None and (type(fact_reviews) is not FactReviewService
+                                        or fact_reviews.database is not state.database):
+            raise ValueError("d3a_shared_fact_review_database_required")
         self.state, self.contact, self.drafts = state, contact, drafts
+        self.fact_reviews = fact_reviews
         self.general_budget, self.clock, self.failure_hook = general_budget, clock, failure_hook
 
     def run(self, candidate: Candidate, decision: Decision) -> PipelineResult:
@@ -214,45 +220,63 @@ class AutonomousContactPipeline:
                 self.state._defer_or_end(db, row, "draft_or_budget_changed", None, "cancelled", current)
                 return PipelineResult("rejected", candidate_id, reason_code="draft_or_budget_changed")
             code, retry, terminal = self.state._policy(db, row, current)
+            if not code and (not self.state.handoff_enabled or not self.contact.enabled):
+                code, terminal = "autonomous_contact_disabled", "cancelled"
+            if not code and (self.fact_reviews is not None or db.execute(
+                "SELECT 1 FROM proactive_fact_reviews WHERE draft_id=? AND character_id=?",
+                (draft["id"], character_id),
+            ).fetchone()):
+                submitted = ReviewDraft(character_id, candidate_id, draft["id"], draft["content"])
+                if self.fact_reviews is None or not self.fact_reviews.verify_approval_in_transaction(db, submitted):
+                    code, terminal = "fact_review_not_currently_approved", "cancelled"
             if code:
                 db.execute("UPDATE autonomous_contact_drafts SET review_status='cancelled' WHERE id=?", (draft["id"],))
                 db.execute("UPDATE autonomous_contact_reservations SET message_status='released',updated_at=? WHERE id=?", (at, reservation["id"]))
                 self.state._defer_or_end(db, row, code, retry, terminal or "deferred", current)
                 return PipelineResult("rejected", candidate_id, reason_code=code)
-            evidence = json.loads(row["evidence_json"])
-            ids = {item["kind"]: item["id"] for item in evidence if item["kind"] != "message"}
-            if row["candidate_type"] == "real_discovery":
-                source, source_id = "life_share", ids.get("share")
-            else:
-                source = "conversation_followup"
-                message_ids = [item["id"] for item in evidence if item["kind"] == "message"]
-                source_id = None
-                if message_ids:
-                    marks = ",".join("?" for _ in message_ids)
-                    anchor = db.execute(f"SELECT m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id IN ({marks}) AND m.role='user' AND c.character_id=? ORDER BY m.created_at,m.id LIMIT 1",
-                                        (*message_ids, character_id)).fetchone()
-                    source_id = anchor["id"] if anchor else None
-            if not source_id:
-                db.execute("UPDATE autonomous_contact_drafts SET review_status='cancelled' WHERE id=?", (draft["id"],))
-                db.execute("UPDATE autonomous_contact_reservations SET message_status='released',updated_at=? WHERE id=?", (at, reservation["id"]))
-                self.state._defer_or_end(db, row, "contact_source_not_allowlisted", None, "cancelled", current)
-                return PipelineResult("rejected", candidate_id, reason_code="contact_source_not_allowlisted")
-            topic = self.state._topic_for_row(row, db)
-            intent = self.contact.create_intent_in_transaction(
-                db, character_id=character_id, source=source, source_id=source_id,
-                reason="autonomous_evidence_backed_candidate", topic=topic,
-                importance="normal", now=current, status="ready")
-            if self.failure_hook:
-                self.failure_hook("after_contact_intent")
-            message_id = str(uuid4())
-            db.execute("INSERT INTO proactive_messages(id,intent_id,attempt_no,content,status,created_at) VALUES(?,?,0,?,'ready',?)",
-                       (message_id, intent["id"], draft["content"], at))
-            changed = db.execute("UPDATE autonomous_contact_candidates SET status='completed',reason_code='handed_off_to_contact_service',lease_token=NULL,lease_expires_at=NULL WHERE id=? AND character_id=? AND status='claimed' AND lease_token=?",
-                                 (candidate_id, character_id, token)).rowcount
-            if changed != 1:
-                raise RuntimeError("candidate_handoff_race")
-            db.execute("UPDATE autonomous_contact_reservations SET message_status='committed',updated_at=? WHERE id=? AND message_status='reserved'",
-                       (at, reservation["id"]))
-            db.execute("UPDATE autonomous_contact_drafts SET review_status='consumed' WHERE id=? AND review_status='mock_approved'",
-                       (draft["id"],))
-            return PipelineResult("handed_off", candidate_id, intent["id"], message_id)
+            result = commit_contact(self.state, self.contact, db, row, token, draft["content"],
+                                    current, failure_hook=self.failure_hook)
+            db.execute("UPDATE autonomous_contact_drafts SET review_status=? WHERE id=? AND review_status='mock_approved'",
+                       ("consumed" if result.proactive_message_id else "cancelled", draft["id"]))
+            return result
+
+
+def commit_contact(state, contact, db, row, token, content, current, *, failure_hook=None):
+    candidate_id, character_id = row["id"], row["character_id"]
+    at = _iso(current)
+    reservation = db.execute("SELECT id FROM autonomous_contact_reservations WHERE candidate_id=? AND character_id=? AND attempt_no=?",
+                             (candidate_id, character_id, row["claim_count"])).fetchone()
+    evidence = json.loads(row["evidence_json"])
+    ids = {item["kind"]: item["id"] for item in evidence if item["kind"] != "message"}
+    if row["candidate_type"] == "real_discovery":
+        source, source_id = "life_share", ids.get("share")
+    else:
+        source = row["candidate_type"] if row["candidate_type"] in ("smalltalk", "conversation_followup") else "conversation_followup"
+        message_ids = [item["id"] for item in evidence if item["kind"] == "message"]
+        source_id = None
+        if message_ids:
+            marks = ",".join("?" for _ in message_ids)
+            anchor = db.execute(f"SELECT m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id IN ({marks}) AND m.role='user' AND c.character_id=? ORDER BY m.created_at,m.id LIMIT 1",
+                                (*message_ids, character_id)).fetchone()
+            source_id = anchor["id"] if anchor else None
+    if not source_id:
+        db.execute("UPDATE autonomous_contact_reservations SET message_status='released',updated_at=? WHERE id=?", (at, reservation["id"]))
+        state._defer_or_end(db, row, "contact_source_not_allowlisted", None, "cancelled", current)
+        return PipelineResult("rejected", candidate_id, reason_code="contact_source_not_allowlisted")
+    topic = state._topic_for_row(row, db)
+    intent = contact.create_intent_in_transaction(
+        db, character_id=character_id, source=source, source_id=source_id,
+        reason="autonomous_evidence_backed_candidate", topic=topic,
+        importance="normal", now=current, status="ready")
+    if failure_hook:
+        failure_hook("after_contact_intent")
+    message_id = str(uuid4())
+    db.execute("INSERT INTO proactive_messages(id,intent_id,attempt_no,content,status,created_at) VALUES(?,?,0,?,'ready',?)",
+               (message_id, intent["id"], content, at))
+    changed = db.execute("UPDATE autonomous_contact_candidates SET status='completed',reason_code='handed_off_to_contact_service',lease_token=NULL,lease_expires_at=NULL WHERE id=? AND character_id=? AND status='claimed' AND lease_token=?",
+                         (candidate_id, character_id, token)).rowcount
+    if changed != 1:
+        raise RuntimeError("candidate_handoff_race")
+    db.execute("UPDATE autonomous_contact_reservations SET message_status='committed',updated_at=? WHERE id=? AND message_status='reserved'",
+               (at, reservation["id"]))
+    return PipelineResult("handed_off", candidate_id, intent["id"], message_id)

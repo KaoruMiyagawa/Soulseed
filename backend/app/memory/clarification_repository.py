@@ -206,8 +206,7 @@ class ClarificationRepository:
         if not text:
             raise ValueError("助手消息不能为空")
         target = ClarificationStatus.AWAITING_USER if awaiting_user else ClarificationStatus.DEFERRED
-        with self.database.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.database.atomic() as db:
             current = self._record(self._row(db, clarification_id))
             if current.status is not ClarificationStatus.PREPARING:
                 raise ClarificationStateError("只有 preparing 状态可以保存初次回应")
@@ -251,8 +250,7 @@ class ClarificationRepository:
         text = content.strip()
         if not text:
             raise ValueError("助手消息不能为空")
-        with self.database.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.database.atomic() as db:
             current = self._record(self._row(db, clarification_id))
             if current.status is not ClarificationStatus.PROCESSING:
                 raise ClarificationStateError(f"状态 {current.status.value} 不在处理中")
@@ -372,7 +370,7 @@ class ClarificationRepository:
             db.execute("BEGIN IMMEDIATE")
             current = self._record(self._row(db, clarification_id))
             message = db.execute(
-                'SELECT role, conversation_id FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
+                'SELECT role, conversation_id, server_sequence FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE character_id = current_character()) AND id = ?',
                 (response_message_id,),
             ).fetchone()
             if message is None or message["role"] != "user" or message["conversation_id"] != current.conversation_id:
@@ -397,6 +395,15 @@ class ClarificationRepository:
                 and current.response_message_id == response_message_id
             ):
                 raise ClarificationStateError("该用户答复已处理，不能重复认领")
+
+            if current.response_message_id != response_message_id:
+                prompt = db.execute(
+                    "SELECT server_sequence FROM messages WHERE id=? AND conversation_id=? AND role='assistant'",
+                    (current.assistant_message_id, current.conversation_id),
+                ).fetchone()
+                # A queued message sent before the question cannot be its answer.
+                if not prompt or message["server_sequence"] <= prompt["server_sequence"]:
+                    return ClarificationClaim(current, acquired=False)
 
             token = str(uuid4())
             db.execute(
@@ -551,7 +558,7 @@ class ClarificationRepository:
             raise ClarificationStateError("会话中有多个待处理澄清，不能自动选择")
         return self._record(rows[0]) if rows else None
 
-    def list_recoverable(self, conversation_id: str | None = None) -> list[ClarificationRecord]:
+    def list_recoverable(self, conversation_id: str | None = None, *, legacy_responses_only: bool = False) -> list[ClarificationRecord]:
         now = now_iso()
         where = "(status IN (?, ?, ?, ?) OR (status = ? AND (lease_expires_at <= ? OR application_proposal_id IS NOT NULL)) OR status = ? OR (status = ? AND error_code IS NOT NULL))"
         params: list[Any] = [
@@ -567,6 +574,8 @@ class ClarificationRepository:
         if conversation_id is not None:
             where += " AND conversation_id = ?"
             params.append(conversation_id)
+        if legacy_responses_only:
+            where += " AND NOT EXISTS (SELECT 1 FROM client_message_submissions s WHERE s.message_id=response_message_id)"
         with self.database.connection() as db:
             rows = db.execute(
                 f"SELECT * FROM memory_correction_clarifications WHERE character_id = current_character() AND {where} ORDER BY updated_at, id",

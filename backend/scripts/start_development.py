@@ -32,7 +32,9 @@ def _ensure_free(port: int) -> None:
 
 
 def _child_environment(*, model_enabled: bool = True,
-                       contact_model_generation_enabled: bool = False) -> dict[str, str]:
+                       contact_model_generation_enabled: bool = False,
+                       strict_budget_enabled: bool = False,
+                       async_chat_real_conversation: str | None = None) -> dict[str, str]:
     # The parent process, including an old SOULSEED_DATABASE_PATH, is never
     # allowed to override this launcher's fixed database target.
     env = {key: value for key, value in os.environ.items()
@@ -48,6 +50,7 @@ def _child_environment(*, model_enabled: bool = True,
         "SOULSEED_MODEL_ENABLED": "true" if model_enabled else "false",
         "SOULSEED_MODEL_MAX_OUTPUT_TOKENS": "1024",
         "SOULSEED_MODEL_DAILY_REQUEST_LIMIT": "20",
+        "SOULSEED_EXPLORATION_DAILY_MODEL_REQUEST_LIMIT": "8",
         "SOULSEED_MODEL_CONVERSATION_TURN_LIMIT": "100",
         "SOULSEED_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "model-requests.jsonl"),
         "SOULSEED_EXPLORATION_MODEL_REQUEST_LOG_PATH": str(Path(os.environ["LOCALAPPDATA"]) / "Soulseed" / "development" / "exploration-model-requests.jsonl"),
@@ -56,6 +59,13 @@ def _child_environment(*, model_enabled: bool = True,
         "VITE_API_URL": f"http://127.0.0.1:{BACKEND_PORT}/api",
         "VITE_SOULSEED_DEVELOPMENT_MODE": "true",
     })
+    if strict_budget_enabled or async_chat_real_conversation:
+        env["SOULSEED_MODEL_BUDGET_STRICT_ENABLED"] = "true"
+    if async_chat_real_conversation:
+        env.update({
+            "SOULSEED_CHAT_ASYNC_REAL_ENABLED": "true",
+            "SOULSEED_CHAT_ASYNC_CONVERSATION_ID": async_chat_real_conversation,
+        })
     return env
 
 
@@ -107,12 +117,22 @@ def main() -> int:
     parser.add_argument("--model-off", action="store_true", help="disable all paid model requests for this run")
     parser.add_argument("--contact-model-generation", action="store_true",
                         help="explicitly allow model-generated proactive messages; may incur model usage")
+    parser.add_argument("--async-chat-real-conversation", metavar="CONVERSATION_ID",
+                        help="enable one strict-budget async chat worker for this Development conversation")
+    parser.add_argument("--strict-model-budget", action="store_true",
+                        help="keep all model calls on the shared SQLite ledger after the async worker is disabled")
     args = parser.parse_args()
     if args.model_off and args.contact_model_generation:
         raise RuntimeError("--contact-model-generation 需要启用模型；请移除 --model-off 并确认愿意承担模型调用。")
+    if args.model_off and args.async_chat_real_conversation:
+        raise RuntimeError("真实异步聊天需要模型；请移除 --model-off 并确认愿意承担模型调用。")
+    if args.async_chat_real_conversation and not args.async_chat_real_conversation.strip():
+        raise RuntimeError("--async-chat-real-conversation 需要一个明确会话 ID。")
     python = ROOT / ".venv" / "Scripts" / "python.exe"
     env = _child_environment(model_enabled=not args.model_off,
-                             contact_model_generation_enabled=args.contact_model_generation)
+                             contact_model_generation_enabled=args.contact_model_generation,
+                             strict_budget_enabled=args.strict_model_budget,
+                             async_chat_real_conversation=args.async_chat_real_conversation)
     build_id = _preflight(env, python)
     frontend_env = _frontend_environment(env)
     node = shutil.which("node")
@@ -124,6 +144,8 @@ def main() -> int:
     model_state = "已关闭" if args.model_off else "已启用"
     print(f"模型{model_state}；每次最多 1024 输出 Token，每 UTC 日最多 20 次请求；调用记录位于本机 LOCALAPPDATA/Soulseed/development。", flush=True)
     print(f"主动消息模型表达{'已显式开启' if args.contact_model_generation else '默认关闭'}；只有已有联系规则批准的消息才会调用。", flush=True)
+    if args.async_chat_real_conversation:
+        print("真实异步聊天已请求：仅指定会话、单 Worker；所有模型入口共用严格 SQLite 预算。", flush=True)
     print("后台自主探索默认关闭；可在 5174 开启。仅后端运行时按 LifeScheduler 检查，默认最多每 24 小时一次；每任务最多 4 次决策请求、每 UTC 日最多 8 次探索请求、每次最多 512 输出 Token，调用记录单独保存。", flush=True)
     children: list[subprocess.Popen] = []
     try:

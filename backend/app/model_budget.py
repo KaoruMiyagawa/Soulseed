@@ -3,14 +3,19 @@
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 
 from .db import Database
 from .ownership import current_character
+from .config import DEVELOPMENT_DATABASE_PATH
 
 
 class BudgetRejected(RuntimeError):
     pass
+
+
+_CUTOVER_AUTHORITY = object()
 
 
 @dataclass(frozen=True)
@@ -51,16 +56,48 @@ class ModelBudgetService:
             raise BudgetRejected('budget_policy_conflict')
         return row
 
-    def set_compatibility_gate(self, day: str, *, ready: bool):
-        """Trusted cutover hook, not proof of historical import; default is closed.
+    @staticmethod
+    def _development_cutover_ready(db, day):
+        row = db.execute("SELECT phase,utc_day,manifest_json FROM model_budget_cutover WHERE singleton=1").fetchone()
+        return bool(row and row["phase"] == "strict" and row["utc_day"] == day and row["manifest_json"])
 
-        Future integration must establish history completeness before calling.
-        Never exposed as an end-user API. This phase calls it only in tests.
-        """
+    def ready(self, *, require_development_cutover=False):
+        """Fail closed unless today's durable compatibility gate is open."""
+        now = self._now()
+        day = now.date().isoformat()
+        with self.database.connection() as db:
+            window = db.execute("SELECT history_ready,policy_json FROM model_budget_windows WHERE day=?", (day,)).fetchone()
+            cutover_ok = (self.database.environment != "development" or
+                          self._development_cutover_ready(db, day))
+        if require_development_cutover and self.database.environment == "development" and not cutover_ok:
+            return False
+        return bool(window and window["history_ready"] and window["policy_json"] == self.policy and cutover_ok)
+
+    def set_compatibility_gate(self, day: str, *, ready: bool, _authority=None):
+        """Commit a coordinator decision inside its verification transaction."""
         if datetime.strptime(day, '%Y-%m-%d').date().isoformat() != day or type(ready) is not bool:
             raise ValueError('invalid_window_gate')
-        with self.database.atomic() as db:
-            self._window(db, day)
+        approved_development = False
+        if self.database.environment == "development":
+            try:
+                database_path = Path(self.database.path).expanduser().resolve(strict=False)
+                canonical = DEVELOPMENT_DATABASE_PATH.resolve(strict=False)
+                approved_development = database_path == canonical or (
+                    self.database.allow_protected_database_access and
+                    Path(self.database.protected_database_confirmation).expanduser().resolve(strict=False)
+                    == database_path
+                )
+            except (OSError, TypeError, ValueError, RuntimeError):
+                approved_development = False
+        if (_authority is not _CUTOVER_AUTHORITY
+                or not (self.database.environment == "testing" or approved_development)
+                or not self.database.in_transaction):
+            raise BudgetRejected('verified_cutover_required')
+        with self.database.connection() as db:
+            if ready:
+                if not db.execute("SELECT 1 FROM model_budget_cutover WHERE phase='strict' AND utc_day=? AND manifest_json IS NOT NULL", (day,)).fetchone():
+                    raise BudgetRejected('verified_cutover_required')
+                self._window(db, day)
             db.execute('UPDATE model_budget_windows SET history_ready=? WHERE day=?', (int(ready), day))
 
     @staticmethod
@@ -68,12 +105,15 @@ class ModelBudgetService:
         if not character_id or character_id != current_character.get():
             raise BudgetRejected('character_scope_mismatch')
 
-    def reserve(self, request_id: str, character_id: str, source: str, *, autonomous_reservation_id=None):
+    def reserve(self, request_id: str, character_id: str, source: str, *, autonomous_reservation_id=None,
+                expected_day: str | None = None):
         self._scope(character_id)
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128 or not isinstance(source, str) or not 1 <= len(source) <= 64:
             raise ValueError('invalid_request_identity')
         now = self._now()
         day, at = now.date().isoformat(), now.isoformat()
+        if expected_day is not None and expected_day != day:
+            raise BudgetRejected('budget_window_mismatch')
         with self.database.atomic() as db:
             old = db.execute('SELECT * FROM model_budget_requests WHERE id=?', (request_id,)).fetchone()
             if old:
@@ -83,6 +123,8 @@ class ModelBudgetService:
             window = self._window(db, day)
             if not window['history_ready']:
                 raise BudgetRejected('history_not_confirmed')
+            if self.database.environment == "development" and not self._development_cutover_ready(db, day):
+                raise BudgetRejected('verified_cutover_required')
             if not db.execute("SELECT 1 FROM characters WHERE id=? AND ownership_status='owned'", (character_id,)).fetchone():
                 raise BudgetRejected('character_not_owned')
             if autonomous_reservation_id and not db.execute("SELECT 1 FROM autonomous_contact_reservations WHERE id=? AND character_id=? AND request_key=? AND request_status='reserved'", (autonomous_reservation_id, character_id, request_id)).fetchone():
@@ -113,6 +155,8 @@ class ModelBudgetService:
                     raise BudgetRejected('reservation_expired')
                 if not self._window(db, row['day'])['history_ready']:
                     raise BudgetRejected('history_not_confirmed')
+                if self.database.environment == "development" and not self._development_cutover_ready(db, row['day']):
+                    raise BudgetRejected('verified_cutover_required')
                 if not db.execute("SELECT 1 FROM characters WHERE id=? AND ownership_status='owned'", (character_id,)).fetchone():
                     raise BudgetRejected('character_not_owned')
             db.execute('UPDATE model_budget_requests SET status=?,updated_at=?,lease_expires_at=? WHERE id=?', (target, now.isoformat(), (now+self.lease).isoformat(), request_id))

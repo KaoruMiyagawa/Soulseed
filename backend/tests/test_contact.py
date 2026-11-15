@@ -158,6 +158,18 @@ async def test_smalltalk_is_derived_once_from_recent_real_interaction(context):
     assert ContactService(repo, enabled=False).inbox(now=NOW) == []
 
 
+@pytest.mark.parametrize(("text", "hours", "expected"), [
+    ("最近在听音乐", 24, "smalltalk"),
+    ("下次聊聊那本童话", 72, "conversation_followup"),
+    ("最近在听音乐", 23, None),
+    ("最近在听音乐", 73, None),
+    ("最近在听音乐？", 25, None),
+    ("不要主动联系我，最近在听音乐", 25, None),
+])
+def test_smalltalk_source_preserves_existing_boundaries(text, hours, expected):
+    assert ContactService.smalltalk_source(text, timedelta(hours=hours)) == expected
+
+
 @pytest.mark.asyncio
 async def test_quiet_busy_and_refusal_suppress_contact(context):
     db, _, service, conversation = context

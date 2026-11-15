@@ -17,6 +17,17 @@ except Exception as exc:
 TEST_PAIRING_SECRET = TEST_SETTINGS.local_pairing_secret
 
 
+@pytest.fixture
+def seed_budget_gate():
+    """Unit fixtures seed SQLite directly. Cutover tests use the verified API."""
+    def seed(service, day, *, ready=True):
+        assert service.database.environment == "testing"
+        with service.database.atomic() as sql:
+            service._window(sql, day)
+            sql.execute("UPDATE model_budget_windows SET history_ready=? WHERE day=?", (int(ready), day))
+    return seed
+
+
 @pytest.fixture(autouse=True)
 def local_pairing_settings(monkeypatch):
     import app.main as main

@@ -1,0 +1,194 @@
+:where(.soulseed-app, .pairing) {
+  --glass-ink: #39576b;
+  --glass-edge: rgba(139, 177, 204, .48);
+  --glass-fill: rgba(222, 238, 249, .84);
+  --glass-hover: rgba(239, 248, 255, .92);
+  --glass-selected: rgba(207, 228, 244, .86);
+  --glass-disabled: #e9eff4;
+  --glass-disabled-ink: #536b7d;
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, .92);
+  --glass-shadow: var(--glass-highlight), 0 2px 7px rgba(57, 87, 107, .05);
+  --glass-focus: #6b90b0;
+  --interaction-duration: 190ms;
+  --interaction-easing: cubic-bezier(.2, .75, .25, 1);
+}
+
+/* Components own their dimensions. This file owns control colors and states. */
+.soulseed-app button,
+.pairing button {
+  background: var(--control-background, var(--control-rest-background, transparent));
+  color: var(--control-ink, var(--control-rest-ink, var(--glass-ink)));
+  border-color: var(--control-border, var(--control-rest-border, transparent));
+  box-shadow: var(--control-shadow, var(--control-rest-shadow, none));
+  backdrop-filter: var(--control-blur, var(--control-rest-blur, none));
+  -webkit-backdrop-filter: var(--control-blur, var(--control-rest-blur, none));
+  transform: none;
+  transition:
+    background-color var(--interaction-duration) var(--interaction-easing),
+    color var(--interaction-duration) var(--interaction-easing),
+    border-color var(--interaction-duration) var(--interaction-easing),
+    box-shadow var(--interaction-duration) var(--interaction-easing),
+    transform var(--interaction-duration) var(--interaction-easing);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.soulseed-app :where(.button-primary, .button-secondary, .scene-action, .world-links button),
+.pairing button {
+  --control-rest-background: rgba(255, 255, 255, .76);
+  --control-rest-border: var(--glass-edge);
+  --control-rest-shadow: var(--glass-highlight);
+  --control-rest-blur: blur(8px);
+  --control-hover-background: var(--glass-hover);
+  --control-hover-shadow: var(--glass-shadow);
+}
+
+.soulseed-app :where(.button-primary),
+.pairing button {
+  --control-rest-background: var(--glass-fill);
+  --control-rest-border: rgba(125, 165, 195, .64);
+  --control-rest-ink: #2f526b;
+  --control-hover-background: rgba(232, 245, 255, .96);
+}
+
+.soulseed-app :where(.scene-action) {
+  --control-rest-background: rgba(248, 253, 255, .94);
+  --control-rest-border: rgba(255, 255, 255, .78);
+}
+
+.soulseed-app :where(.wordmark, .panel-heading button, .read-button, .text-button, .chat-notice button) {
+  border-radius: 8px;
+  --control-hover-background: rgba(221, 238, 250, .76);
+  --control-hover-shadow: var(--glass-highlight);
+  --control-rest-ink: #446b82;
+}
+
+.soulseed-app :where(.primary-nav button, .conversation-sidebar nav button) {
+  --control-rest-ink: #496373;
+  --control-hover-background: rgba(235, 246, 254, .86);
+  --control-hover-border: rgba(153, 187, 213, .42);
+  --control-hover-shadow: var(--glass-shadow);
+}
+
+.soulseed-app button:is(.is-active, .selected, [aria-current="page"], [aria-selected="true"], [aria-pressed="true"]) {
+  --control-rest-background: var(--glass-selected);
+  --control-rest-border: rgba(138, 175, 203, .58);
+  --control-rest-shadow: var(--glass-shadow);
+  --control-rest-blur: blur(8px);
+  --control-rest-ink: #31536b;
+  --control-hover-background: rgba(222, 239, 252, .96);
+  --control-hover-border: rgba(128, 168, 198, .68);
+}
+
+/* Extend the glass within the existing navigation gap, without moving labels. */
+.soulseed-app .primary-nav button {
+  isolation: isolate;
+  border-radius: 13px;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  font-weight: 500;
+}
+
+.soulseed-app .primary-nav button::before {
+  position: absolute;
+  z-index: -1;
+  inset: 5px -12px 4px;
+  border: 1px solid var(--control-border, var(--control-rest-border, transparent));
+  border-radius: 13px;
+  background: var(--control-background, var(--control-rest-background, transparent));
+  box-shadow: var(--control-shadow, var(--control-rest-shadow, none));
+  backdrop-filter: var(--control-blur, var(--control-rest-blur, none));
+  -webkit-backdrop-filter: var(--control-blur, var(--control-rest-blur, none));
+  pointer-events: none;
+  content: "";
+  transition: inherit;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .soulseed-app button:hover:not(:disabled),
+  .pairing button:hover:not(:disabled) {
+    --control-background: var(--control-hover-background, var(--glass-hover));
+    --control-border: var(--control-hover-border, var(--glass-edge));
+    --control-shadow: var(--control-hover-shadow, var(--glass-highlight));
+  }
+}
+
+.soulseed-app button:active:not(:disabled),
+.pairing button:active:not(:disabled) {
+  --control-background: rgba(200, 224, 243, .92);
+  --control-border: rgba(124, 165, 197, .7);
+  --control-shadow: inset 0 1px 2px rgba(88, 124, 151, .09), var(--glass-highlight);
+  transform: scale(.985);
+}
+
+.soulseed-app :is(button, input, textarea, select, a[href], [tabindex]):focus-visible,
+.pairing :is(button, input):focus-visible {
+  outline: 2px solid var(--glass-focus);
+  outline-offset: 3px;
+}
+
+.soulseed-app .primary-nav button:focus-visible {
+  outline: none;
+}
+.soulseed-app .primary-nav button:focus-visible::before {
+  outline: 2px solid var(--glass-focus);
+  outline-offset: 3px;
+}
+
+/* The textarea's containing composer draws the complete, unclipped focus ring. */
+.soulseed-app .composer:has(textarea:focus-visible) {
+  outline: 2px solid var(--glass-focus);
+  outline-offset: 3px;
+}
+.soulseed-app .composer textarea:focus-visible { outline: none; }
+.soulseed-app .composer:focus-within { border-color: #98b6cd; }
+
+.soulseed-app button:disabled,
+.pairing button:disabled {
+  --control-background: var(--glass-disabled);
+  --control-ink: var(--glass-disabled-ink);
+  --control-border: #d3e0e9;
+  --control-shadow: inset 0 1px 0 rgba(255, 255, 255, .62);
+  --control-blur: none;
+  opacity: 1;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.soulseed-app :is(input, textarea, select),
+.pairing input {
+  transition: border-color var(--interaction-duration) var(--interaction-easing),
+    box-shadow var(--interaction-duration) var(--interaction-easing);
+}
+.soulseed-app :is(input, textarea, select):disabled,
+.pairing input:disabled {
+  background: #f0f5f8;
+  color: var(--glass-disabled-ink);
+  opacity: 1;
+  cursor: not-allowed;
+}
+.soulseed-app input::placeholder,
+.soulseed-app textarea::placeholder { color: #667f90; }
+
+.soulseed-app .world-links small { color: #647b89; }
+.soulseed-app .life-status { color: #4e7080; }
+
+@media (max-width: 720px) {
+  .soulseed-app .primary-nav button::before { inset-inline: -8px; }
+  .soulseed-app .primary-nav button:first-child::before { inset-inline-start: 1px; }
+  .soulseed-app .primary-nav button:last-child::before { inset-inline-end: 1px; }
+  .soulseed-app .primary-nav button:focus-visible::before { outline-offset: -2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .soulseed-app :is(button, input, textarea, select),
+  .soulseed-app .primary-nav button::before,
+  .pairing :is(button, input) {
+    transition: none;
+    scroll-behavior: auto;
+  }
+  .soulseed-app button:active:not(:disabled),
+  .pairing button:active:not(:disabled) { transform: none; }
+}

@@ -327,7 +327,7 @@ def generate_candidates(snapshot: CharacterSnapshot) -> tuple[Candidate, ...]:
     return tuple(candidates[:20])
 
 
-def dry_run(snapshot: CharacterSnapshot) -> Decision:
+def dry_run(snapshot: CharacterSnapshot, *, allow_first_discovery: bool = False, extra_candidate: Candidate | None = None) -> Decision:
     """Evaluate only this snapshot; CONTACT is not a send authorization."""
     now, contact = snapshot.observed_at, snapshot.contact
     if contact.allowed is not True:
@@ -342,7 +342,7 @@ def dry_run(snapshot: CharacterSnapshot) -> Decision:
         local = now.astimezone(ZoneInfo(snapshot.timezone_id))
     except (ZoneInfoNotFoundError, ValueError):
         return Decision(DecisionKind.SILENT, None, (), ('contact_policy_unknown',), False)
-    candidates = generate_candidates(snapshot)
+    candidates = generate_candidates(snapshot) or ((extra_candidate,) if extra_candidate else ())
     candidate = candidates[0] if candidates else None
     ids = tuple(ref.id for ref in candidate.evidence) if candidate else ()
     def deferred(reason: str, retry: datetime | None = None) -> Decision:
@@ -361,19 +361,19 @@ def dry_run(snapshot: CharacterSnapshot) -> Decision:
             return deferred(reason, parsed)
     if contact.ready_exists:
         return deferred('ready_message_pending')
-    if not snapshot.latest_user:
+    user_at = _time(snapshot.latest_user.evidence.observed_at) if snapshot.latest_user else None
+    if not snapshot.latest_user and not (allow_first_discovery and candidate and candidate.kind == 'real_discovery'):
         return deferred('no_user_interaction')
-    user_at = _time(snapshot.latest_user.evidence.observed_at)
-    if user_at is None or user_at > now:
+    if snapshot.latest_user and (user_at is None or user_at > now):
         return deferred('user_interaction_time_unknown')
-    if now - user_at < timedelta(hours=2):
+    if user_at and now - user_at < timedelta(hours=2):
         return deferred('recent_user_interaction', user_at + timedelta(hours=2))
     delivered = _time(contact.latest_delivered_at)
     if contact.last_status in ('delivered', 'read') and not contact.latest_delivered_at:
         return deferred('contact_time_unknown')
     if contact.latest_delivered_at and delivered is None:
         return deferred('contact_time_unknown')
-    if delivered and user_at <= delivered:
+    if delivered and (user_at is None or user_at <= delivered):
         return deferred('awaiting_user_reply')
     last_at = _time(contact.latest_created_at)
     if contact.latest_created_at and last_at is None:

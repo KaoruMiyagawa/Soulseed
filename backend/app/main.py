@@ -1,27 +1,38 @@
 import asyncio
 import ipaddress
 import logging
+from hmac import compare_digest
 from pathlib import Path
 from contextlib import asynccontextmanager
+from copy import copy
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
+from uuid import uuid4
 from zoneinfo import ZoneInfoNotFoundError
 
-from .chat_service import ChatService
+from .chat_service import ChatService, reply_execution
+from .chat_reply_worker import ChatReplyWorker, ConversationReplyBusy, DelayedMockChatModel, ReplyQueue
+from .chat_reply_review import ChatReplyReview
 from .context_window import ContextBudgetExceeded, ContextWindowLimits, ModelContextWindow
 from .config import get_settings
 from .db import Database
+from .desktop_runtime import ModelInput, RuntimeLimitsInput, runtime as desktop
+from .desktop_contact import DesktopContact
 from .model_adapter import (ModelConfigurationError, ModelRequestError, OpenAICompatibleAdapter,
-                            ModelDailyQuotaExhausted, ModelQuotaUnavailable)
+                            ModelDailyQuotaExhausted, ModelQuotaUnavailable, ModelBudgetContext)
+from .model_budget import BudgetRejected, ModelBudgetService
+from .model_budget_history import ModelBudgetCutover
 from .memory import ClarificationApplicationService, ClarificationRepository, CorrectionFlowService, DeterministicMemoryExtractor, MemoryContextBuilder, MemoryCorrectionService, MemoryProposalRepository, MemoryProposalService, MemoryRepository, MemoryRetriever, MemoryService
 from .persona import resolve_system_prompt
 from .proposal_api import create_proposal_router
 from .repositories import ConversationRepository, MessageRepository
+from .message_delivery import MessageDeliveryRepository
 from .life import LifeRepository
 from .life_engine import LifeEngine
 from .life_scheduler import LifeScheduler
@@ -34,7 +45,7 @@ from .contact_scheduler import ContactScheduler
 from .autonomous_intent_shadow import ShadowModeScheduler
 from .build_info import BUILD_ID, STARTUP_ID
 from .local_auth import LocalAuth, COOKIE, ALLOWED_ORIGINS
-from .ownership import character_scope
+from .ownership import character_scope, current_character
 
 
 class CreateConversationRequest(BaseModel):
@@ -43,6 +54,20 @@ class CreateConversationRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
+
+
+class IndependentMessageRequest(BaseModel):
+    client_message_id: str = Field(min_length=8, max_length=120)
+    client_stream_id: str = Field(min_length=8, max_length=120)
+    client_sequence: int = Field(ge=1, le=2**63 - 1)
+    content: str = Field(min_length=1, max_length=20000)
+
+
+class ChatReplyReviewRequest(BaseModel):
+    snapshot_token: str = Field(min_length=64, max_length=64)
+    decision: Literal["close_without_reply", "confirm_saved_reply"]
+    evidence_reference: str = Field(min_length=8, max_length=500)
+    provider_checked: bool = False
 
 
 class LifeEventRequest(BaseModel):
@@ -109,8 +134,10 @@ class ExplorationAutonomyRequest(BaseModel):
     cooldown_hours: int | None = Field(default=None, ge=24, le=720)
 
 
-settings = get_settings()
+settings = desktop.settings if desktop else get_settings()
 allowed_origins = set(ALLOWED_ORIGINS)
+if desktop:
+    allowed_origins.clear()
 if settings.environment == "testing" and settings.test_frontend_origin:
     allowed_origins.add(settings.test_frontend_origin.rstrip("/"))
 if settings.environment == "development" and settings.development_frontend_origin:
@@ -124,7 +151,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("soulseed.startup")
 logger.info("Soulseed environment=%s database=%s", settings.environment, database_path_label)
 logger.info("Soulseed runtime build_id=%s startup_id=%s", BUILD_ID, STARTUP_ID)
-database = Database(
+database = desktop.database if desktop else Database(
     settings.database_path,
     environment=settings.environment,
     test_data_root=settings.test_data_root,
@@ -133,20 +160,73 @@ database = Database(
     allow_protected_database_access=settings.allow_protected_database_access,
     protected_database_confirmation=settings.protected_database_confirmation,
 )
+model_budget_service = None
+legacy_budget_cutover = None
+if settings.model_budget_strict_enabled:
+    model_budget_service = ModelBudgetService(
+        database,
+        global_limit=(settings.model_daily_request_limit or 20) + settings.exploration_daily_model_request_limit,
+        source_limits={"chat": settings.model_daily_request_limit or 20,
+                      "contact": settings.model_daily_request_limit or 20,
+                      "exploration": settings.exploration_daily_model_request_limit},
+    )
+    model_adapter = OpenAICompatibleAdapter(settings, strict_budget=True, budget_service=model_budget_service)
+else:
+    model_adapter = OpenAICompatibleAdapter(settings)
+    if (settings.environment == "development" and settings.model_request_log_path
+            and settings.exploration_model_request_log_path):
+        legacy_budget_service = ModelBudgetService(database, global_limit=1)
+        legacy_budget_cutover = ModelBudgetCutover(
+            legacy_budget_service,
+            files={"general": Path(settings.model_request_log_path),
+                   "exploration": Path(settings.exploration_model_request_log_path)},
+            inventory={},
+        )
+        model_adapter.legacy_cutover = legacy_budget_cutover
+
+if desktop:
+    class DesktopModelAdapter(OpenAICompatibleAdapter):
+        async def _request_completion(self, messages, **kwargs):
+            if kwargs.get("request_context") and kwargs.get("budget_context") is None:
+                kwargs["budget_context"] = ModelBudgetContext(
+                    uuid4().hex, current_character.get(), "exploration",
+                    datetime.now(UTC).date().isoformat(),
+                )
+            live = OpenAICompatibleAdapter(
+                desktop.model_settings(), strict_budget=True, budget_service=desktop.budget,
+            )
+            return await live._request_completion(messages, **kwargs)
+
+    model_adapter = DesktopModelAdapter(settings, strict_budget=True, budget_service=desktop.budget)
+
+
+def _new_exploration_agent(repository):
+    if desktop:
+        return ExplorationAgent(repository, life_repository, settings, model=model_adapter,
+                                budget_service=desktop.budget)
+    if settings.model_budget_strict_enabled:
+        return ExplorationAgent(repository, life_repository, settings, model=model_adapter,
+                                budget_service=model_budget_service)
+    if legacy_budget_cutover is not None:
+        return ExplorationAgent(repository, life_repository, settings, legacy_cutover=legacy_budget_cutover)
+    return ExplorationAgent(repository, life_repository, settings)
+
+
 conversations = ConversationRepository(database)
 messages = MessageRepository(database)
+message_delivery = MessageDeliveryRepository(database)
 memory_service = MemoryService(MemoryRepository(database))
 life_repository = LifeRepository(database, default_timezone=settings.life_timezone)
 exploration_repository = ExplorationRepository(database, life_repository)
-exploration_agent = ExplorationAgent(exploration_repository, life_repository, settings)
+exploration_agent = _new_exploration_agent(exploration_repository)
 active_exploration_tasks: dict[str, asyncio.Task] = {}
 active_exploration_characters: dict[str, str] = {}
-model_adapter = OpenAICompatibleAdapter(settings)
 contact_generator = (
     AdapterContactGenerator(model_adapter, resolve_system_prompt(settings.system_prompt), life_repository)
     if settings.contact_model_generation_enabled else None
 )
 contact_service = ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled)
+desktop_contact = DesktopContact(desktop, life_repository, model_adapter) if desktop else None
 proposal_service = MemoryProposalService(MemoryProposalRepository(database))
 memory_correction_service = MemoryCorrectionService(database)
 correction_flow = CorrectionFlowService(memory_service, proposal_service)
@@ -187,15 +267,16 @@ chat = ChatService(
     runtime_features={
         "contact_background_enabled": settings.contact_background_enabled,
         "contact_model_generation_enabled": settings.contact_model_generation_enabled,
+        **({"desktop_contact_status": desktop_contact.capability_status} if desktop_contact else {}),
     },
 )
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
     global exploration_repository, exploration_agent
     exploration_repository = ExplorationRepository(database, life_repository)
-    exploration_agent = ExplorationAgent(exploration_repository, life_repository, settings)
+    exploration_agent = _new_exploration_agent(exploration_repository)
     runtime = LifeInstance(database, life_repository)
     runtime.acquire()
     with database.connection() as db:
@@ -205,8 +286,22 @@ async def lifespan(_: FastAPI):
             exploration_repository.recover_active(character_id)
     stop = asyncio.Event()
     tasks = []
+    application.state.chat_worker = None
+    worker = None
+    contact_task = None
     try:
+        if desktop:
+            with character_scope("big_fish"):
+                desktop.budget.recover("big_fish")
+            # The exclusive desktop instance lock proves the last sync turn exited.
+            with database.atomic() as db:
+                db.execute("DELETE FROM chat_legacy_turns")
         life_repository.ensure_state()
+        if desktop_contact:
+            application.state.contact_settings_changed = asyncio.Event()
+            contact_task = asyncio.create_task(
+                desktop_contact.run(stop, application.state.contact_settings_changed), name="desktop-contact",
+            )
         LifeShareService(life_repository).reconcile_recent()
         recovery_clarifications = ClarificationRepository(database)
         recovery_proposals = MemoryProposalService(MemoryProposalRepository(database))
@@ -224,7 +319,7 @@ async def lifespan(_: FastAPI):
                                   after_tick=_autonomous_exploration_tick)
         if scheduler.enabled:
             tasks.append(asyncio.create_task(scheduler.run_forever(stop)))
-        if settings.contact_enabled and settings.contact_background_enabled:
+        if not desktop and settings.contact_enabled and settings.contact_background_enabled:
             tasks.append(asyncio.create_task(ContactScheduler(
                 ContactService(life_repository, generator=contact_generator, enabled=settings.contact_enabled),
                 interval=timedelta(minutes=settings.contact_check_interval_minutes),
@@ -237,10 +332,36 @@ async def lifespan(_: FastAPI):
                 interval=timedelta(minutes=settings.autonomous_intent_shadow_interval_minutes),
             ).run_forever(stop)))
         tasks.append(asyncio.create_task(runtime.run_heartbeat(stop)))
+        if settings.environment == "testing" and settings.chat_async_mock_enabled:
+            mock_chat = copy(chat)
+            mock_chat.model = DelayedMockChatModel(settings.chat_async_mock_delay_seconds)
+            queue = ReplyQueue(database, conversation_id=settings.chat_async_conversation_id,
+                               max_messages=settings.chat_async_max_messages, max_attempts=settings.chat_async_max_attempts,
+                               max_output_tokens=settings.chat_async_max_output_tokens)
+            worker = ChatReplyWorker(queue, mock_chat)
+            worker.start(concurrency=1 if queue.conversation_id is not None else 2)
+            application.state.chat_worker = worker
+        if settings.chat_async_real_enabled or desktop:
+            if (desktop or settings.environment == "development" and settings.model_budget_strict_enabled
+                    and model_budget_service is not None and model_budget_service.ready(require_development_cutover=True)):
+                queue = ReplyQueue(database, conversation_id=settings.chat_async_conversation_id,
+                                   max_messages=settings.chat_async_max_messages,
+                                   max_attempts=settings.chat_async_max_attempts,
+                                   max_output_tokens=settings.chat_async_max_output_tokens)
+                worker = ChatReplyWorker(queue, chat)
+                worker.start(concurrency=1)
+                application.state.chat_worker = worker
+            else:
+                logger.warning("chat_async_real_blocked reason=verified_budget_cutover_required")
         yield
     finally:
         stop.set()
         try:
+            if contact_task:
+                contact_task.cancel()
+                await asyncio.gather(contact_task, return_exceptions=True)
+            if worker is not None:
+                await worker.drain(settings.chat_async_drain_seconds)
             for run_id, task in list(active_exploration_tasks.items()):
                 character_id = active_exploration_characters.get(run_id, "big_fish")
                 exploration_agent.stop(run_id, status="interrupted")
@@ -255,7 +376,46 @@ async def lifespan(_: FastAPI):
             runtime.release()
 
 
-app = FastAPI(title="Soulseed API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Soulseed API", version="1.0.0", lifespan=lifespan,
+    **({"docs_url": None, "redoc_url": None, "openapi_url": None} if desktop else {}),
+)
+
+
+if desktop:
+    @app.exception_handler(RequestValidationError)
+    async def desktop_validation_error(request: Request, exc: RequestValidationError):
+        return JSONResponse({"detail": "请求参数无效，请检查填写内容。"}, status_code=422)
+
+    @app.get("/api/desktop/model")
+    def desktop_model_status() -> dict:
+        return desktop.status()
+
+    @app.put("/api/desktop/model")
+    async def desktop_model_save(request: ModelInput) -> dict:
+        result = desktop.save(request)
+        app.state.contact_settings_changed.set()
+        return result
+
+    @app.delete("/api/desktop/model")
+    def desktop_model_clear() -> dict:
+        return desktop.clear()
+
+    @app.get("/api/desktop/runtime")
+    def desktop_runtime_status() -> dict:
+        worker = getattr(app.state, "chat_worker", None)
+        return {**desktop.runtime_status(), "chat_worker_active": bool(worker and worker.accepting),
+                "active_explorations": len(active_exploration_tasks), "contact_available": True}
+
+    @app.put("/api/desktop/runtime")
+    async def desktop_runtime_save(request: RuntimeLimitsInput) -> dict:
+        desktop.save_runtime_limits(request)
+        app.state.contact_settings_changed.set()
+        return desktop_runtime_status()
+
+    @app.post("/api/desktop/native/contact-notification")
+    def desktop_contact_notification(foreground: bool) -> dict:
+        return {"message_id": desktop_contact.consume_notification(foreground=foreground)}
 
 
 @app.middleware("http")
@@ -271,10 +431,20 @@ async def authorize_local_request(request: Request, call_next):
     if origin and origin.rstrip("/") not in allowed_origins:
         return JSONResponse({"detail": "不允许的请求来源"}, status_code=403)
     path = request.url.path
-    if request.method == "OPTIONS" or not path.startswith("/api/") or path in {"/api/health", "/api/auth/session", "/api/auth/logout"}:
+    if desktop:
+        supplied = request.headers.get("x-soulseed-desktop-token", "").encode()
+        if not compare_digest(supplied, desktop.token.encode()):
+            return JSONResponse({"detail": "桌面会话不可用"}, status_code=401)
+        parts = path.split("/")
+        if (path.startswith("/api/admin/") or path == "/api/auth/logout"
+                or path == "/api/auth/session" and request.method != "GET"
+                or len(parts) > 4 and parts[2] == "characters"
+                and parts[4] == "contact" and parts[5:] != ["preferences"]):
+            return JSONResponse({"detail": "此功能在当前 Windows 体验版中未启用"}, status_code=403)
+    elif request.method == "OPTIONS" or not path.startswith("/api/") or path in {"/api/health", "/api/auth/session", "/api/auth/logout"}:
         return await call_next(request)
     try:
-        if settings.environment == "development":
+        if desktop or settings.environment == "development":
             # Development is loopback-only and binds every request to one
             # fixed local character; no client-supplied identity is accepted.
             principal = {"user_id": "local", "character_id": "big_fish", "expires_at": None}
@@ -337,7 +507,7 @@ def pair_local(request: PairRequest, response: Response) -> dict:
 @app.get("/api/auth/session")
 def get_local_session(request: Request, response: Response) -> dict:
     response.headers["Cache-Control"] = "no-store"
-    if settings.environment == "development":
+    if desktop or settings.environment == "development":
         return {"user_id": "local", "character_id": "big_fish", "expires_at": None}
     return LocalAuth(database, settings.local_pairing_secret).authenticate(request.cookies.get(COOKIE))
 
@@ -364,11 +534,16 @@ app.include_router(create_proposal_router(get_proposal_service, get_memory_corre
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
+    worker = getattr(app.state, "chat_worker", None)
     return {
         "status": "ok",
         "environment": settings.environment,
         "build_id": BUILD_ID,
         "startup_id": STARTUP_ID,
+        "chat_reply_mode": ("real" if worker is not None and worker.accepting and (settings.chat_async_real_enabled or desktop)
+                            else "mock" if worker is not None and worker.accepting else "disabled"),
+        "chat_reply_blocker": ("verified_budget_cutover_required"
+                               if settings.chat_async_real_enabled and worker is None else ""),
     }
 
 
@@ -387,6 +562,8 @@ def _launch_exploration(run_id: str, character_id: str) -> None:
 
 async def _autonomous_exploration_tick() -> None:
     if not settings.exploration_enabled:
+        return
+    if desktop and (desktop.budget.preferences()["autonomous_paused"] or not desktop.status()["configured"]):
         return
     with database.connection() as db:
         character_ids = [row[0] for row in db.execute("SELECT character_id FROM exploration_autonomy WHERE enabled=1")]
@@ -639,17 +816,62 @@ def get_conversation(conversation_id: str) -> dict:
     return {**conversation, "messages": messages.list_for_conversation(conversation_id)}
 
 
+@app.post("/api/conversations/{conversation_id}/user-messages", status_code=201)
+def save_user_message(conversation_id: str, request: IndependentMessageRequest, http_request: Request) -> dict:
+    principal = http_request.state.principal
+    def admit(db, conversation_id: str) -> None:
+        worker = getattr(http_request.app.state, "chat_worker", None)
+        if worker is None:
+            raise HTTPException(503, {"code": "async_chat_unavailable", "message": "异步回复当前不可用，消息未保存"})
+        worker.admit(db, conversation_id)
+
+    return message_delivery.submit(
+        user_id=principal["user_id"], character_id=principal["character_id"],
+        conversation_id=conversation_id, client_message_id=request.client_message_id,
+        client_stream_id=request.client_stream_id, client_sequence=request.client_sequence,
+        content=request.content, admit=admit,
+    )
+
+
+@app.get("/api/conversations/{conversation_id}/user-messages/{client_message_id}")
+def get_user_message_submission(conversation_id: str, client_message_id: str, http_request: Request) -> dict:
+    principal = http_request.state.principal
+    return message_delivery.lookup(
+        user_id=principal["user_id"], character_id=principal["character_id"],
+        conversation_id=conversation_id, client_message_id=client_message_id,
+    )
+
+
 @app.post("/api/conversations/{conversation_id}/messages")
 async def send_message(conversation_id: str, request: SendMessageRequest) -> dict:
     try:
         conversations.get(conversation_id)
+        service = chat
+        if desktop:
+            service = copy(chat)
+            service.model = OpenAICompatibleAdapter(
+                desktop.model_settings(), strict_budget=True, budget_service=desktop.budget,
+            )
         if (settings.model_conversation_turn_limit is not None
                 and sum(item["role"] == "user" for item in messages.list_for_conversation(conversation_id))
                 >= settings.model_conversation_turn_limit):
             raise HTTPException(status_code=429, detail="当前会话已达到开发环境聊天轮次上限；请新建会话。")
-        return await chat.send(conversation_id, request.content.strip())
+        with ReplyQueue(conversations.database).legacy_turn(conversation_id) as execution:
+            with reply_execution(execution):
+                return await service.send(conversation_id, request.content.strip())
+    except ConversationReplyBusy as exc:
+        raise HTTPException(409, {"code": "conversation_reply_pending", "message": str(exc)}) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
+    except BudgetRejected as exc:
+        if not desktop:
+            return JSONResponse(status_code=502, content={"detail": str(exc), "message_saved": True})
+        exhausted = str(exc) in {"global_budget_exhausted", "source_budget_exhausted"}
+        return JSONResponse(
+            status_code=429 if exhausted else 503,
+            content={"detail": "今日模型请求额度已用完（UTC 午夜重置）。" if exhausted else "无法核验模型请求额度。",
+                     "message_saved": True},
+        )
     except ModelConfigurationError as exc:
         return JSONResponse(
             status_code=503,
@@ -670,4 +892,48 @@ async def send_message(conversation_id: str, request: SendMessageRequest) -> dic
             status_code=502,
             content={"detail": str(exc), "message_saved": True},
         )
+
+
+@app.get("/api/conversations/{conversation_id}/messages")
+def get_message_feed(conversation_id: str, request: Request,
+                     after_sequence: int = Query(0, ge=0, le=2**63 - 1),
+                     limit: int = Query(100, ge=1, le=200)) -> dict:
+    principal = request.state.principal
+    feed = message_delivery.feed(
+        user_id=principal["user_id"], character_id=principal["character_id"],
+        conversation_id=conversation_id, after_sequence=after_sequence, limit=limit,
+    )
+    worker = getattr(request.app.state, "chat_worker", None)
+    feed["async_chat_accepting"] = bool(worker and worker.accepting
+                                         and worker.queue.conversation_id in (None, conversation_id))
+    return feed
+
+
+def chat_operator(request: Request) -> dict:
+    secret = settings.chat_operator_secret
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if not secret or scheme.lower() != "bearer" or not compare_digest(value.encode(), secret.encode()):
+        raise HTTPException(401, "需要有效的聊天管理凭据", headers={"WWW-Authenticate": "Bearer"})
+    return request.state.principal
+
+
+@app.get("/api/admin/chat/replies/{message_id}")
+def inspect_chat_reply(message_id: str, request: Request) -> dict:
+    actor = chat_operator(request)
+    return ChatReplyReview(database).inspect(message_id, actor["user_id"])
+
+
+@app.post("/api/admin/chat/replies/{message_id}/resolution")
+def resolve_chat_reply(message_id: str, review: ChatReplyReviewRequest, request: Request) -> dict:
+    actor = chat_operator(request)
+    return ChatReplyReview(database).resolve(message_id, actor["user_id"], **review.model_dump())
+
+
+@app.post("/api/admin/chat/drain")
+async def drain_chat(request: Request) -> dict:
+    chat_operator(request)
+    worker = getattr(request.app.state, "chat_worker", None)
+    if worker is not None:
+        await worker.drain(settings.chat_async_drain_seconds)
+    return {"accepting": False}
 

@@ -45,7 +45,7 @@ def test_database_migration_is_idempotent(repositories):
     database, _, _ = repositories
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 21
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 27
 
 
 def test_health_exposes_non_secret_runtime_build_and_startup_ids():
@@ -54,6 +54,7 @@ def test_health_exposes_non_secret_runtime_build_and_startup_ids():
     response = health()
     assert response["status"] == "ok"
     assert response["environment"] == "testing"
+    assert response["chat_reply_mode"] == "disabled"
     assert response["build_id"].startswith("dev-") and len(response["build_id"]) == 20
     assert len(response["startup_id"]) == 16
 

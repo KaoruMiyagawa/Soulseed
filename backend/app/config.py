@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     model_timeout_seconds: float = Field(default=60, gt=0, le=300)
     model_trust_env: bool = True
     model_enabled: bool = True
+    chat_async_mock_enabled: bool = False
+    chat_async_mock_delay_seconds: float = Field(default=0.25, ge=0.05, le=10)
+    chat_async_real_enabled: bool = False
+    model_budget_strict_enabled: bool = False
+    chat_async_conversation_id: str | None = Field(default=None, min_length=1, max_length=120)
+    chat_async_max_messages: int = Field(default=20, ge=1, le=100)
+    chat_async_max_attempts: int = Field(default=3, ge=1, le=3)
+    chat_async_max_output_tokens: int = Field(default=512, ge=64, le=1024)
+    chat_async_drain_seconds: float = Field(default=10, ge=0, le=30)
+    chat_operator_secret: str | None = Field(default=None, repr=False, min_length=32)
     model_max_output_tokens: int | None = Field(default=None, ge=64, le=4096)
     model_daily_request_limit: int | None = Field(default=None, ge=1, le=1000)
     model_conversation_turn_limit: int | None = Field(default=None, ge=1, le=1000)
@@ -125,6 +135,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_environment(self) -> "Settings":
+        if self.chat_async_mock_enabled and self.environment != "testing":
+            raise ValueError("异步聊天 Mock Worker 仅可在 testing 环境启用")
+        if self.chat_async_real_enabled and (
+            self.environment != "development" or not (self.chat_async_conversation_id or "").strip()
+        ):
+            raise ValueError("真实异步聊天必须明确指定 Development 测试会话")
+        if self.chat_async_real_enabled and not self.model_budget_strict_enabled:
+            raise ValueError("真实异步聊天必须启用统一严格模型预算")
+        if self.model_budget_strict_enabled and self.environment != "development":
+            raise ValueError("统一真实模型预算仅允许在 Development 中启用")
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("当前身份方案仅支持本地回环地址")
 

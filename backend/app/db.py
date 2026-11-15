@@ -634,6 +634,202 @@ BEGIN SELECT RAISE(ABORT, 'invalid model budget transition'); END;
 """
 
 
+MIGRATIONS[22] = """
+UPDATE model_budget_windows SET history_ready=0;
+CREATE TABLE model_budget_cutover (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    phase TEXT NOT NULL CHECK(phase IN ('legacy','draining','sealed','strict','invalidated')),
+    manifest_json TEXT,
+    utc_day TEXT
+);
+INSERT INTO model_budget_cutover(singleton, phase) VALUES(1, 'legacy');
+CREATE TABLE model_budget_legacy_inflight (token TEXT PRIMARY KEY);
+"""
+
+
+MIGRATIONS[23] = """
+CREATE TABLE proactive_fact_reviews (
+    id TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    draft_id TEXT NOT NULL UNIQUE,
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
+    evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json) AND json_type(evidence_json)='array'),
+    policy_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('APPROVED','REVIEW_REQUIRED','REJECTED')),
+    method TEXT NOT NULL CHECK(method IN ('controlled_render','free_text','human')),
+    reason_code TEXT NOT NULL,
+    reviewer_id TEXT,
+    reviewed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(candidate_id, character_id) REFERENCES autonomous_contact_candidates(id, character_id) ON DELETE CASCADE,
+    CHECK((method='human' AND reviewer_id IS NOT NULL AND status<>'REVIEW_REQUIRED')
+       OR (method='controlled_render' AND reviewer_id IS NULL AND status<>'REVIEW_REQUIRED')
+       OR (method='free_text' AND reviewer_id IS NULL AND status<>'APPROVED'))
+);
+CREATE TRIGGER proactive_fact_review_owner_insert BEFORE INSERT ON proactive_fact_reviews
+WHEN NEW.character_id IS NOT current_character()
+ OR NOT EXISTS(SELECT 1 FROM characters WHERE id=NEW.character_id AND ownership_status='owned')
+ OR NEW.method='human'
+BEGIN SELECT RAISE(ABORT, 'invalid fact review issuer or character scope'); END;
+CREATE TRIGGER proactive_fact_review_binding_immutable BEFORE UPDATE OF
+    id,character_id,candidate_id,draft_id,content_sha256,evidence_json,policy_version,expires_at
+ON proactive_fact_reviews
+BEGIN SELECT RAISE(ABORT, 'fact review binding is immutable'); END;
+CREATE TRIGGER proactive_fact_review_human_transition BEFORE UPDATE ON proactive_fact_reviews
+WHEN OLD.character_id IS NOT current_character()
+ OR NOT EXISTS(SELECT 1 FROM characters WHERE id=OLD.character_id AND ownership_status='owned')
+ OR OLD.status<>'REVIEW_REQUIRED' OR NEW.method<>'human' OR NEW.status='REVIEW_REQUIRED'
+BEGIN SELECT RAISE(ABORT, 'invalid fact review transition'); END;
+"""
+
+MIGRATIONS[24] = """
+ALTER TABLE messages ADD COLUMN server_sequence INTEGER;
+DROP TRIGGER IF EXISTS messages_scope_update;
+WITH ordered AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at, id) AS sequence
+    FROM messages
+)
+UPDATE messages SET server_sequence=(SELECT sequence FROM ordered WHERE ordered.id=messages.id);
+CREATE TRIGGER messages_scope_update BEFORE UPDATE ON messages
+WHEN (SELECT character_id FROM conversations WHERE id=OLD.conversation_id) IS NOT current_character()
+    OR NEW.conversation_id IS NOT OLD.conversation_id
+BEGIN SELECT RAISE(ABORT, 'message ownership is immutable'); END;
+CREATE UNIQUE INDEX idx_messages_server_sequence ON messages(conversation_id, server_sequence);
+CREATE TRIGGER messages_assign_server_sequence AFTER INSERT ON messages
+WHEN NEW.server_sequence IS NULL
+BEGIN
+    UPDATE messages SET server_sequence=(
+        SELECT COALESCE(MAX(server_sequence),0)+1 FROM messages
+        WHERE conversation_id=NEW.conversation_id AND id<>NEW.id
+    ) WHERE id=NEW.id;
+END;
+CREATE TABLE client_message_streams (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    client_stream_id TEXT NOT NULL,
+    next_client_sequence INTEGER NOT NULL DEFAULT 1 CHECK(next_client_sequence > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, client_stream_id)
+);
+CREATE TABLE client_message_submissions (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_message_id TEXT NOT NULL,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role='user'),
+    client_stream_id TEXT NOT NULL,
+    client_sequence INTEGER NOT NULL CHECK(client_sequence > 0),
+    content_sha256 TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+    save_status TEXT NOT NULL DEFAULT 'saved' CHECK(save_status='saved'),
+    role_status TEXT NOT NULL DEFAULT 'waiting' CHECK(role_status IN ('waiting','processing','completed','failed','unknown')),
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, client_message_id),
+    UNIQUE(user_id, client_stream_id, client_sequence)
+);
+CREATE INDEX idx_client_message_submissions_conversation
+    ON client_message_submissions(user_id, character_id, conversation_id, created_at, client_message_id);
+"""
+
+
+MIGRATIONS[25] = """
+ALTER TABLE messages ADD COLUMN user_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE;
+CREATE UNIQUE INDEX idx_messages_reply_source ON messages(user_message_id) WHERE user_message_id IS NOT NULL;
+CREATE TRIGGER messages_reply_source_insert BEFORE INSERT ON messages
+WHEN NEW.user_message_id IS NOT NULL AND (NEW.role<>'assistant' OR NOT EXISTS(
+    SELECT 1 FROM messages WHERE id=NEW.user_message_id AND role='user' AND conversation_id=NEW.conversation_id
+))
+BEGIN SELECT RAISE(ABORT, 'invalid reply source'); END;
+CREATE TRIGGER messages_reply_source_update BEFORE UPDATE OF user_message_id ON messages
+WHEN (OLD.user_message_id IS NOT NULL AND OLD.user_message_id IS NOT NEW.user_message_id)
+ OR (NEW.user_message_id IS NOT NULL AND (NEW.role<>'assistant' OR NOT EXISTS(
+    SELECT 1 FROM messages WHERE id=NEW.user_message_id AND role='user' AND conversation_id=NEW.conversation_id
+)))
+BEGIN SELECT RAISE(ABORT, 'invalid reply source'); END;
+
+ALTER TABLE client_message_submissions ADD COLUMN reply_lease_token TEXT;
+ALTER TABLE client_message_submissions ADD COLUMN reply_lease_until TEXT;
+ALTER TABLE client_message_submissions ADD COLUMN reply_started_at TEXT;
+ALTER TABLE client_message_submissions ADD COLUMN model_started_at TEXT;
+ALTER TABLE client_message_submissions ADD COLUMN reply_error_code TEXT;
+UPDATE client_message_submissions SET role_status='unknown',reply_error_code='missing_execution_lease'
+WHERE role_status='processing';
+CREATE INDEX idx_client_message_reply_work ON client_message_submissions(role_status, conversation_id);
+CREATE TRIGGER client_message_reply_state BEFORE UPDATE OF role_status ON client_message_submissions
+WHEN NOT (
+    (OLD.role_status='waiting' AND NEW.role_status='processing'
+        AND NEW.reply_lease_token IS NOT NULL AND NEW.reply_lease_until IS NOT NULL) OR
+    (OLD.role_status='processing' AND NEW.role_status='waiting' AND OLD.reply_started_at IS NULL
+        AND NEW.reply_lease_token IS NULL AND NEW.reply_lease_until IS NULL) OR
+    (OLD.role_status='processing' AND NEW.role_status IN ('completed','failed','unknown')
+        AND NEW.reply_lease_token IS NULL AND NEW.reply_lease_until IS NULL
+        AND (NEW.role_status<>'completed' OR EXISTS(SELECT 1 FROM messages WHERE user_message_id=NEW.message_id)))
+)
+BEGIN SELECT RAISE(ABORT, 'invalid chat reply transition'); END;
+
+CREATE TABLE chat_legacy_turns (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    token TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX idx_chat_legacy_turns_conversation ON chat_legacy_turns(conversation_id, expires_at);
+"""
+
+
+MIGRATIONS[26] = """
+CREATE TABLE chat_model_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    user_message_id TEXT NOT NULL REFERENCES client_message_submissions(message_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    phase TEXT NOT NULL CHECK(phase IN ('structured','plain')),
+    started_at TEXT NOT NULL,
+    sent_at TEXT,
+    ended_at TEXT,
+    outcome TEXT NOT NULL CHECK(outcome IN ('prepared','sent','local_failure','response','unknown')),
+    http_status INTEGER,
+    error_code TEXT,
+    provider_request_id TEXT,
+    max_output_tokens INTEGER NOT NULL CHECK(max_output_tokens > 0),
+    reply_message_id TEXT UNIQUE REFERENCES messages(id),
+    UNIQUE(user_message_id, ordinal)
+);
+CREATE TABLE chat_reply_reviews (
+    user_message_id TEXT PRIMARY KEY REFERENCES client_message_submissions(message_id),
+    reviewer_user_id TEXT NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('close_without_reply','confirm_saved_reply')),
+    snapshot_token TEXT NOT NULL,
+    evidence_reference TEXT NOT NULL,
+    provider_checked INTEGER NOT NULL CHECK(provider_checked IN (0,1)),
+    reviewed_at TEXT NOT NULL
+);
+DROP TRIGGER client_message_reply_state;
+CREATE TRIGGER client_message_reply_state BEFORE UPDATE OF role_status ON client_message_submissions
+WHEN NOT (
+    (OLD.role_status='waiting' AND NEW.role_status='processing'
+        AND NEW.reply_lease_token IS NOT NULL AND NEW.reply_lease_until IS NOT NULL) OR
+    (OLD.role_status='processing' AND NEW.role_status='waiting' AND OLD.reply_started_at IS NULL
+        AND NEW.reply_lease_token IS NULL AND NEW.reply_lease_until IS NULL) OR
+    (OLD.role_status='processing' AND NEW.role_status IN ('completed','failed','unknown')
+        AND NEW.reply_lease_token IS NULL AND NEW.reply_lease_until IS NULL
+        AND (NEW.role_status<>'completed' OR EXISTS(SELECT 1 FROM messages WHERE user_message_id=NEW.message_id))) OR
+    (OLD.role_status='unknown' AND NEW.reply_lease_token IS NULL AND NEW.reply_lease_until IS NULL
+        AND EXISTS (SELECT 1 FROM chat_reply_reviews r WHERE r.user_message_id=OLD.message_id
+          AND ((r.decision='close_without_reply' AND NEW.role_status='failed'
+                AND NOT EXISTS(SELECT 1 FROM messages WHERE user_message_id=NEW.message_id))
+            OR (r.decision='confirm_saved_reply' AND NEW.role_status='completed'
+                AND EXISTS(SELECT 1 FROM messages WHERE user_message_id=NEW.message_id)))))
+)
+BEGIN SELECT RAISE(ABORT, 'invalid chat reply transition'); END;
+"""
+
+# The table rebuild is performed specially below so existing foreign keys keep
+# referring to the original table name throughout the atomic migration.
+MIGRATIONS[27] = "-- extend autonomous candidate types"
+
+
 class Database:
     def __init__(self, path: str, *, environment: str | None = None,
                  test_data_root: str | None = None, migration_backup_path: str | None = None,
@@ -780,6 +976,10 @@ class Database:
             finally:
                 self._active_transaction.reset(token)
 
+    @property
+    def in_transaction(self) -> bool:
+        return self._active_transaction.get() is not None
+
     def initialize(self) -> None:
         self._validate_path_before_access()
         protected = self._protected_database_target()
@@ -787,6 +987,9 @@ class Database:
             self._require_protected_database_access(protected)
         if self.environment == "production" or protected is not None:
             self._require_migration_approval()
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
@@ -794,6 +997,31 @@ class Database:
             current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
             for version, sql in sorted(MIGRATIONS.items()):
                 if version > current:
+                    if version == 27:
+                        connection.execute("PRAGMA foreign_keys=OFF")
+                        connection.execute("PRAGMA legacy_alter_table=ON")
+                        try:
+                            connection.execute("BEGIN IMMEDIATE")
+                            schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='autonomous_contact_candidates'").fetchone()[0]
+                            objects = connection.execute("SELECT sql FROM sqlite_master WHERE tbl_name='autonomous_contact_candidates' AND type IN ('index','trigger') AND sql IS NOT NULL").fetchall()
+                            schema = schema.replace("CREATE TABLE autonomous_contact_candidates", "CREATE TABLE autonomous_contact_candidates_new", 1).replace("'real_discovery','shared_topic'", "'real_discovery','shared_topic','smalltalk','conversation_followup'", 1)
+                            connection.execute(schema)
+                            connection.execute("INSERT INTO autonomous_contact_candidates_new SELECT * FROM autonomous_contact_candidates")
+                            connection.execute("DROP TABLE autonomous_contact_candidates")
+                            connection.execute("ALTER TABLE autonomous_contact_candidates_new RENAME TO autonomous_contact_candidates")
+                            for obj in objects:
+                                connection.execute(obj[0])
+                            if connection.execute("PRAGMA foreign_key_check").fetchone():
+                                raise RuntimeError("candidate_migration_foreign_key_check_failed")
+                            connection.execute("INSERT INTO schema_migrations VALUES(27,datetime('now'))")
+                            connection.commit()
+                        except BaseException:
+                            connection.rollback()
+                            raise
+                        finally:
+                            connection.execute("PRAGMA legacy_alter_table=OFF")
+                            connection.execute("PRAGMA foreign_keys=ON")
+                        continue
                     # Keep each migration and its marker atomic. If any DDL or
                     # the marker insert fails, the connection context rolls
                     # back the whole migration instead of leaving a half-schema.

@@ -307,6 +307,19 @@ class ContactService:
             rows = db.execute("SELECT s.id FROM life_share_intents s JOIN life_events e ON e.id=s.event_id AND e.character_id=s.character_id LEFT JOIN contact_intents c ON c.share_intent_id = s.id WHERE s.character_id = ? AND s.status = 'pending' AND (s.delivery_channel IS NULL OR s.delivery_channel = 'contact') AND (s.selection_token IS NULL OR s.selection_expires_at <= ?) AND s.created_at >= ? AND c.id IS NULL AND NOT (e.event_type='exploring' AND e.generation_method='rule_engine') ORDER BY s.created_at LIMIT 5", (character_id, _iso(current), cutoff)).fetchall()
         return [self.create_intent(character_id=character_id, source="life_share", source_id=row["id"], reason="saved_life_experience", now=current) for row in rows]
 
+    @staticmethod
+    def smalltalk_source(text: str, age: timedelta) -> str | None:
+        """Return the existing intent type for an eligible recent user message."""
+        if not timedelta(hours=24) <= age <= timedelta(hours=72):
+            return None
+        text = text.strip()
+        if (len(text) < 4 or len(text) > 120 or "?" in text or "？" in text
+                or not any(word in text for word in ("聊", "喜欢", "最近", "听", "看", "读", "故事", "音乐", "发现"))
+                or any(word in text for word in ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "我在忙", "别打扰", "不要联系", "不要主动联系", "密码", "密钥"))):
+            return None
+        followup = any(word in text for word in ("下次聊", "回头聊", "改天聊", "等会聊"))
+        return "conversation_followup" if followup else "smalltalk"
+
     def maybe_create_smalltalk(self, character_id: str = "big_fish", *, now: datetime | None = None) -> dict | None:
         current = now or datetime.now(UTC)
         with self.repository.database.connection() as db:
@@ -314,16 +327,12 @@ class ContactService:
         if not row:
             return None
         age = current.astimezone(UTC) - datetime.fromisoformat(row["created_at"])
-        if not timedelta(hours=24) <= age <= timedelta(hours=72):
-            return None
         text = row["content"].strip()
-        if (len(text) < 4 or len(text) > 120 or "?" in text or "？" in text
-                or not any(word in text for word in ("聊", "喜欢", "最近", "听", "看", "读", "故事", "音乐", "发现"))
-                or any(word in text for word in ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "我在忙", "别打扰", "不要联系", "不要主动联系", "密码", "密钥"))):
+        source = self.smalltalk_source(text, age)
+        if source is None:
             return None
-        followup = any(word in text for word in ("下次聊", "回头聊", "改天聊", "等会聊"))
-        return self.create_intent(character_id=character_id, source="conversation_followup" if followup else "smalltalk",
-                                  source_id=row["id"], reason="recent_conversation_followup" if followup else "recent_conversation",
+        return self.create_intent(character_id=character_id, source=source,
+                                  source_id=row["id"], reason="recent_conversation_followup" if source == "conversation_followup" else "recent_conversation",
                                   topic=text[:60], now=current)
 
     def _claim(self, character_id: str, now: datetime) -> tuple[dict, str, int] | None:
