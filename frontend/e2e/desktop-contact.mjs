@@ -11,6 +11,8 @@ import { chromium, expect } from "@playwright/test";
 
 const [binary, isolatedData, evidenceDirectory] = process.argv.slice(2, 5).map(value => resolve(value));
 const selfSocial = process.argv[5] === "self";
+const growthActivity = process.argv[6];
+assert(!growthActivity || (selfSocial && ["music", "reading"].includes(growthActivity)));
 assert(process.platform === "win32" && binary && isolatedData && evidenceDirectory);
 const installedFixture = resolve(process.env.LOCALAPPDATA, "com.soulseed.desktop", "data");
 assert(isolatedData.toLowerCase().includes("\\desktop-build\\qa\\") ||
@@ -28,6 +30,19 @@ assert(conversation);
 
 const requests = [];
 let chatPayload;
+let mockFailure;
+const interestText = growthActivity === "music" ? "音乐" : "读书";
+const proactiveText = growthActivity
+  ? `好想和你聊聊${interestText}呀，光想想就有点雀跃！`
+  : "今天想给你丢一颗快乐泡泡，希望它不会在半路上啪的一声破掉！";
+const chatReply = growthActivity ? `比起别的，我更想聊聊${interestText}！` : "我接住啦，泡泡还在！";
+function checkGrowth(growth) {
+  assert.equal(growth.length, 1);
+  assert.equal(growth[0].activity_type, growthActivity);
+  assert.equal(growth[0].tendency, "established");
+  assert.equal(growth[0].negative_experiences, 0);
+  assert(growth[0].positive_experiences >= 20);
+}
 let allowContact;
 const contactRelease = new Promise(resolve => { allowContact = resolve; });
 const mock = createServer(async (request, response) => {
@@ -37,16 +52,31 @@ const mock = createServer(async (request, response) => {
   let signals;
   try { signals = JSON.parse(body.messages.at(-1).content); } catch {}
   const kind = signals?.choices ? "contact" : "chat";
-  if (kind === "contact" && selfSocial) assert.equal(signals.candidate_type, "self_social");
-  if (kind === "contact" && selfSocial) assert(signals.memories.some(item => item.includes("蓝色玻璃珠")));
+  try {
+    if (kind === "contact" && selfSocial) {
+      assert.equal(signals.candidate_type, "self_social");
+      assert(signals.memories.some(item => item.includes("蓝色玻璃珠")));
+    }
+    if (growthActivity) {
+      const expression = kind === "chat" && body.messages.find(item =>
+        item.role === "system" && item.content.includes("<expression_context"));
+      const growth = kind === "contact" ? signals.personal_growth
+        : JSON.parse(expression.content.split("\n").find(line => line.startsWith("{"))).personal_growth;
+      checkGrowth(growth);
+    }
+  } catch (error) {
+    mockFailure = error;
+    response.writeHead(400).end();
+    return;
+  }
   requests.push(kind);
   if (kind === "chat") chatPayload = body;
   if (kind === "contact") await contactRelease;
   const content = kind === "contact"
     ? JSON.stringify({ decision: "contact", choice: signals.choices[0].id, style: "curious",
-      message: "今天想给你丢一颗快乐泡泡，希望它不会在半路上啪的一声破掉！", evidence_ids: signals.choices[0].evidence_ids,
+      message: proactiveText, evidence_ids: signals.choices[0].evidence_ids,
       claims: [] })
-    : "我接住啦，泡泡还在！";
+    : chatReply;
   response.setHeader("Content-Type", "application/json");
   response.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: "stop" }] }));
 });
@@ -61,6 +91,7 @@ async function waitFor(read, ms = 25_000) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
     try { const value = await read(); if (value) return value; } catch {}
+    if (mockFailure) throw mockFailure;
     await sleep(250);
   }
   throw new Error("Desktop contact QA timed out");
@@ -109,6 +140,13 @@ async function start() {
 let app;
 try {
   app = await start();
+  if (growthActivity) {
+    const active = await waitFor(() => database.prepare(
+      "SELECT event_type, selection_reason FROM life_events WHERE generation_method='rule_engine' AND activity_status='active'"
+    ).get());
+    assert.equal(active.event_type, growthActivity);
+    assert.match(active.selection_reason, /^preference=2\.00;/);
+  }
   assert.equal((await app.call("/desktop/runtime")).body.contact_enabled, false);
   assert.equal((await app.call("/desktop/model", "PUT", {
     base_url: `http://127.0.0.1:${mockPort}/v1`, model: "qa", api_key: "qa-only-no-secret",
@@ -149,17 +187,18 @@ try {
   }
   execFileSync("powershell.exe", ["-NoProfile", "-File", fileURLToPath(new URL("./contact-window.ps1", import.meta.url)),
     "-ProcessId", String(app.child.pid), "-Command", "Restore"], { windowsHide: true });
-  await expect(app.page.getByText(/今天想给你丢一颗快乐泡泡/)).toBeVisible();
+  await expect(app.page.getByText(proactiveText, { exact: true })).toBeVisible();
   await app.page.getByLabel("写给大肥鱼的消息").fill("我接住了，也喜欢蓝色玻璃珠手链！");
   await app.page.getByRole("button", { name: "发送", exact: true }).click();
-  await expect(app.page.getByText("我接住啦，泡泡还在！")).toBeVisible();
+  if (growthActivity) await waitFor(() => requests.length === 2);
+  await expect(app.page.getByText(chatReply, { exact: true })).toBeVisible();
   await app.page.screenshot({ path: join(evidenceDirectory, "contact-conversation.png") });
   assert.deepEqual(requests, ["contact", "chat"]);
   assert.equal(chatPayload.max_tokens, 1024);
   const chatContext = chatPayload.messages.map(item => item.content).join("\n");
   assert.match(chatContext, /童真、活泼、好奇、淘气/);
   if (!selfSocial) assert.match(chatContext, /最近在听音乐/);
-  assert.match(chatContext, /今天想给你丢一颗快乐泡泡/);
+  assert(chatContext.includes(proactiveText));
   if (selfSocial) assert.match(chatContext, /蓝色玻璃珠/);
   await app.page.getByRole("button", { name: /模型设置/ }).click();
   await app.page.getByRole("button", { name: "一键暂停自主功能" }).click();
@@ -182,9 +221,18 @@ try {
   assert.throws(() => process.kill(oldPid, 0));
   app = await start();
   await app.page.getByRole("button", { name: "对话", exact: true }).click();
-  await expect(app.page.getByText(/今天想给你丢一颗快乐泡泡/)).toHaveCount(1);
+  await expect(app.page.getByText(proactiveText, { exact: true })).toHaveCount(1);
   assert.deepEqual(requests, ["contact", "chat"]);
-  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=1.`);
+  if (growthActivity) {
+    await app.page.getByLabel("写给大肥鱼的消息").fill("重启后，还想继续聊刚才的话题吗？");
+    await app.page.getByRole("button", { name: "发送", exact: true }).click();
+    await waitFor(() => requests.length === 3);
+    await expect(app.page.getByText(chatReply, { exact: true })).toHaveCount(2);
+    assert.equal(chatPayload.max_tokens, 1024);
+    assert.deepEqual(requests, ["contact", "chat", "chat"]);
+    console.log(`Growth ${growthActivity}: saved experiences drove activity, contact and chat; restart retained growth.`);
+  }
+  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=${growthActivity ? 2 : 1}.`);
   assert(toast, "Windows toast did not appear");
   assert.equal(toastRows(tag).length, 1);
   console.log("Windows AUMID toast verified.");

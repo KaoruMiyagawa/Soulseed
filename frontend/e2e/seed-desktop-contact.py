@@ -7,6 +7,7 @@ sys.path.insert(0, str(root / 'backend'))
 from app.contact import ContactService
 from app.desktop_runtime import DesktopRuntime
 from app.life import LifeRepository
+from app.life_engine import ACTIVITIES, LifeEngine
 from app.memory import EvidenceType, MemoryCreate, MemoryRepository, MemoryService, MemoryType, SourceRole
 from app.ownership import character_scope
 from app.repositories import ConversationRepository, MessageRepository
@@ -36,6 +37,20 @@ with character_scope('big_fish'):
         )
         with runtime.database.connection() as db:
             db.execute("UPDATE life_states SET mood='好奇' WHERE character_id='big_fish'")
+        if len(sys.argv) > 3:
+            activity = sys.argv[3]
+            assert activity in {'music', 'reading'}
+            engine = LifeEngine(life)
+            today = datetime.now(UTC)
+            for index in range(27):
+                at = today - timedelta(days=35 - index)
+                event = life.record(ACTIVITIES[activity][0], event_type=activity, feeling='开心', now=at)
+                engine.learn_from_completion(event, at)
+            # Match the recent activity history so the preference weight determines the choice.
+            for index, kind in enumerate(('tidying', 'cooking', 'resting', 'exploring', 'daydreaming')):
+                life.record(ACTIVITIES[kind][0], event_type=kind,
+                            now=today - timedelta(days=7 - index))
+            assert life.preference_growth()[0]['tendency'] == 'established'
     else:
         message = MessageRepository(runtime.database).add(conversation['id'], 'user', '最近在听音乐')
         with runtime.database.connection() as db:

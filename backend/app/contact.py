@@ -44,11 +44,12 @@ class AdapterContactGenerator:
         character_id = str(intent.get("character_id") or "")
         if not character_id:
             raise ValueError("主动联系意图缺少角色范围")
-        evidence, recent, prefs = [], [], []
+        evidence, recent, prefs, personal_growth = [], [], [], []
         if self.repository is not None:
             snapshot = self.repository.expression_snapshot("最近在干嘛", character_id=character_id)
             evidence = snapshot["events"]
             prefs = snapshot["preferences"]
+            personal_growth = snapshot["personal_growth"]
             with self.repository.database.connection() as db:
                 if intent.get("source") == "life_share":
                     row = db.execute(
@@ -118,7 +119,7 @@ class AdapterContactGenerator:
             context = ExpressionContextBuilder().build(
                 character_id=character_id, intent=str(intent.get("topic") or ""),
                 intent_source=str(intent.get("source") or "saved_intent"), life_events=evidence,
-                share=share, preferences=prefs, recent_interactions=recent,
+                share=share, preferences=prefs, personal_growth=personal_growth, recent_interactions=recent,
                 boundaries=("消息不得催促或要求回复",),
                 local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],
             ).to_system_message()

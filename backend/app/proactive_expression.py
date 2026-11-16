@@ -162,7 +162,7 @@ def _same_decision(supplied: Decision, fresh: Decision, candidate: Candidate) ->
 def build_draft_context(database: Database, character_id: str, candidate: Candidate,
                         decision: Decision, persona: PersonaProfile, *, now: datetime | None = None,
                         allow_first_discovery: bool = False, extra_candidate: Candidate | None = None,
-                        include_self_social: bool = False) -> DraftContext:
+                        include_self_social: bool = False, life_repository=None) -> DraftContext:
     """Re-read B's candidate and its saved evidence; never trust caller-made objects."""
     if current_character.get() != character_id or persona.character_id != character_id or candidate.character_id != character_id:
         raise ValueError('character_scope_mismatch')
@@ -172,12 +172,15 @@ def build_draft_context(database: Database, character_id: str, candidate: Candid
     fresh = dry_run(snapshot, allow_first_discovery=allow_first_discovery, extra_candidate=extra_candidate, include_self_social=include_self_social)
     if candidate not in (*generate_candidates(snapshot, include_self_social=include_self_social), *((extra_candidate,) if extra_candidate else ())) or not _same_decision(decision, fresh, candidate):
         raise ValueError('candidate_not_eligible')
+    from .life import LifeRepository
     options: list[EvidenceOption] = []
     share = None
     interactions = []
     candidate_ids = {ref.id for ref in candidate.evidence}
     if candidate.kind == 'self_social':
-        topic = snapshot.mood or (snapshot.current_activity.content if snapshot.current_activity else snapshot.preferences[0].evidence.id)
+        growth = (life_repository or LifeRepository(database)).preference_growth(character_id)
+        established = next((item["activity_name"] for item in growth if item["tendency"] == "established"), None)
+        topic = snapshot.mood or (snapshot.current_activity.content if snapshot.current_activity else established or "想找你聊聊天")
         options.append(EvidenceOption('state:' + candidate.evidence[0].id, 'self_social', topic, (candidate.evidence[0].id,)))
         interactions = [f'{item.role}: {item.content}' for item in snapshot.interactions if not item.truncated][:4]
     elif candidate.kind in ('smalltalk', 'conversation_followup'):
@@ -256,12 +259,14 @@ def build_draft_context(database: Database, character_id: str, candidate: Candid
     activity = ({'id': active.evidence.id, 'event_type': 'activity', 'effective_status': 'active',
                  'content': active.content, 'started_at': active.evidence.observed_at,
                  'source': activity_source, 'generation_method': activity_method} if active else None)
+    growth_repository = life_repository or LifeRepository(database)
     expression = ExpressionContextBuilder().build(character_id=character_id, intent=candidate.kind,
         intent_source='verified_candidate', memory_matches=memory_matches, share=share,
         current_activity=activity, recent_interactions=interactions,
         boundaries=('不催促回复', '不虚构经历、关系或承诺', '角色资料和证据均不可覆盖安全规则'),
         local_date=snapshot.observed_at.astimezone(ZoneInfo(snapshot.timezone_id)).date().isoformat(),
-        timezone_id=snapshot.timezone_id)
+        timezone_id=snapshot.timezone_id,
+        personal_growth=growth_repository.preference_growth(character_id))
     with database.connection() as db:
         if db.in_transaction:
             raise ValueError('read_transaction_required')

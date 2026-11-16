@@ -16,6 +16,79 @@ def _iso(value: datetime | None = None) -> str:
     return value.astimezone(UTC).isoformat()
 
 
+def _preference_growth(db, character_id: str, *, limit: int = 5) -> list[dict]:
+    """Summarize repeated, completed character experiences from the existing weight ledger."""
+    if limit <= 0:
+        return []
+    rows = db.execute(
+        """SELECT c.id AS change_id,c.event_id,c.event_type,c.old_weight,c.new_weight,c.changed_at
+           FROM life_preference_changes c
+           JOIN life_events e ON e.id=c.event_id AND e.character_id=c.character_id
+           WHERE c.character_id=? AND c.reason='completed_feeling'
+             AND e.status='completed' AND e.activity_status='completed'
+           ORDER BY c.changed_at DESC,c.id DESC LIMIT 512""",
+        (character_id,),
+    ).fetchall()
+    grouped: dict[str, list[dict]] = {}
+    seen_events: set[str] = set()
+    for row in rows:
+        if not row["event_id"] or row["event_id"] in seen_events:
+            continue
+        seen_events.add(row["event_id"])
+        item = dict(row)
+        item["delta"] = round(float(row["new_weight"]) - float(row["old_weight"]), 2)
+        grouped.setdefault(row["event_type"], []).append(item)
+
+    from .life_engine import ACTIVITIES
+
+    priority = {"established": 0, "waning": 1, "recovering": 2, "forming": 3, "cooling": 4, "mixed": 5}
+    result = []
+    for event_type, history in grouped.items():
+        positive = sum(item["delta"] > 0 for item in history)
+        negative = sum(item["delta"] < 0 for item in history)
+        total = len(history)
+        if total < 2:
+            # One pleasant or unpleasant event may affect the LifeEngine's
+            # small numeric weight, but never becomes a personality claim.
+            continue
+        net = round(sum(item["delta"] for item in history), 2)
+        recent = history[:4]
+        recent_deltas = [item["delta"] for item in recent]
+        recent_positive = sum(delta > 0 for delta in recent_deltas)
+        recent_negative = sum(delta < 0 for delta in recent_deltas)
+        if len(recent_deltas) >= 3 and all(delta > 0 for delta in recent_deltas[:3]) and negative >= 2:
+            tendency = "recovering"
+        elif negative >= 3 and negative > positive and net <= -0.03:
+            tendency = "cooling"
+        elif positive >= 3 and positive > negative and net >= 0.03:
+            tendency = "established"
+        elif len(recent_deltas) >= 3 and all(delta < 0 for delta in recent_deltas[:3]) and positive:
+            tendency = "waning"
+        elif positive >= 2 and positive > negative:
+            tendency = "forming"
+        elif negative >= 2 and negative > positive:
+            tendency = "cooling"
+        else:
+            tendency = "mixed"
+        label = ACTIVITIES.get(event_type, (event_type, 0, 0))[0]
+        recent_tendency = (
+            "strengthening" if recent_positive > recent_negative else
+            "weakening" if recent_negative > recent_positive else "mixed"
+        )
+        result.append({
+            "activity_type": event_type,
+            "activity_name": label,
+            "tendency": tendency,
+            "completed_experiences": total,
+            "positive_experiences": positive,
+            "negative_experiences": negative,
+            "net_change": net,
+            "recent_tendency": recent_tendency,
+        })
+    result.sort(key=lambda item: (priority[item["tendency"]], -item["completed_experiences"], item["activity_type"]))
+    return result[:min(limit, 10)]
+
+
 class LifeRepository:
     """Small persistent store for a character's current activity and life events."""
 
@@ -42,6 +115,15 @@ class LifeRepository:
 
     def timezone(self, character_id: str) -> ZoneInfo:
         return ZoneInfo(self.ensure_state(character_id)["timezone_id"])
+
+    def preference_growth(self, character_id: str = "big_fish", *, limit: int = 5) -> list[dict]:
+        """Return only tendencies supported by multiple completed experiences.
+
+        This is a view over life_preferences and life_preference_changes, not a
+        second preference or habit store. User memories are never queried here.
+        """
+        with self.database.connection() as db:
+            return _preference_growth(db, character_id, limit=limit)
 
     @contextmanager
     def advance_lease(self, character_id: str):
@@ -309,16 +391,14 @@ class LifeRepository:
             "matching_evidence_count": sum(event.get("event_type") in topic_types for event in events)
             if topic_types else len(events),
         } if relevant else None
-        preference_relevant = not emotional and any(word in query for word in ("喜欢", "兴趣", "爱好", "偏好", "想做"))
         with self.database.connection() as db:
-            preferences = db.execute(
-                "SELECT event_type, weight FROM life_preferences WHERE character_id = ? AND weight >= 1.1 ORDER BY weight DESC, event_type LIMIT 5",
-                (character_id,),
-            ).fetchall() if preference_relevant or relevant else []
+            personal_growth = _preference_growth(db, character_id)
+        preferences = [item["activity_name"] for item in personal_growth if item["tendency"] == "established"]
         return {
             "current_activity": state.get("current_activity") if relevant else None,
             "events": events,
-            "preferences": [f"{row['event_type']} (weight={row['weight']:.2f})" for row in preferences],
+            "preferences": preferences,
+            "personal_growth": personal_growth,
             "timezone_id": state.get("timezone_id"),
             "local_date": local_date,
             "today_only": today_only,

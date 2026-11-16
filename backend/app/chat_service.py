@@ -243,7 +243,8 @@ class ChatService:
                     memory_matches=memory_matches, life_events=snapshot["events"],
                     current_activity=snapshot["current_activity"],
                     share=(share_reservation or {}).get("event"),
-                    preferences=snapshot["preferences"], recent_interactions=recent,
+                    preferences=snapshot["preferences"], personal_growth=snapshot["personal_growth"],
+                    recent_interactions=recent,
                     boundaries=(self.contact_service.expression_boundaries(current_character.get())
                                 if self.contact_service is not None and "proactive_contact" in runtime_capabilities else ()),
                     local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],

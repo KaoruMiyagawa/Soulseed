@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class AutonomousContact:
     def __init__(self, runtime, life, model):
         self.runtime, self.model = runtime, model
+        self.life = life
         self.database = runtime.database
         self.state = AutonomousIntentStateRepository(
             self.database, enabled=True, handoff_enabled=True, allow_first_discovery=True,
@@ -100,14 +101,18 @@ class AutonomousContact:
             candidate = next(item for item in (*generate_candidates(snapshot, include_self_social=True), *((smalltalk,) if smalltalk else ())) if item.dedup_key == decision.dedup_key)
             persona = resolve_trusted_persona(self.database, character)
             context = build_draft_context(self.database, character, candidate, decision, persona,
-                                          now=now, allow_first_discovery=True, extra_candidate=smalltalk, include_self_social=True)
+                                          now=now, allow_first_discovery=True, extra_candidate=smalltalk,
+                                          include_self_social=True, life_repository=self.life)
             with self.database.connection() as db:
                 if not self._conversation(db, character, candidate.kind, candidate.evidence[0].id):
                     return "no_conversation"
                 mood = db.execute("SELECT mood FROM life_states WHERE character_id=?", (character,)).fetchone()
             signals = {
                 "mood": (mood["mood"] or "")[:100] if mood else "",
+                # Keep the existing signal name for DesktopContact adapters;
+                # durable personality claims use the experience-backed view below.
                 "interests": [{"type": item.evidence.id, "weight": item.weight} for item in snapshot.preferences],
+                "personal_growth": self.life.preference_growth(character),
                 "activity": snapshot.current_activity.content if snapshot.current_activity else None,
                 "memories": [item.content for item in snapshot.memories[:4]],
                 "recent_interactions": [{"role": item.role, "text": item.content} for item in snapshot.interactions[:4] if not item.truncated],
@@ -141,6 +146,8 @@ class AutonomousContact:
                 'claims 必须逐条列出正文中有关用户记忆、已经发生的经历和探索结果的事实原句，普通问候、玩笑、感受可留空。'
                 '会打扰用户或不符合人格时保持安静。普通社交不需要事实或网页来源；具体事实只能依据给出的资料，'
                 '不要编造来源、经历或用户说过的话，不要催促回复。'
+                'personal_growth 指角色本人由多次已完成生活经历逐渐形成的倾向，与用户记忆和当前心情不同；'
+                'forming/recovering/waning/cooling/mixed 都不是固定人格。角色可以有自己的看法，不必迎合用户。'
             )},
             {"role": "user", "content": json.dumps(signals, ensure_ascii=False)},
         ]
