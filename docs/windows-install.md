@@ -2,9 +2,9 @@
 
 ## 安装
 
-1. 在 Windows 10 或 11 x64 上双击 `Soulseed_2.9.1-beta.10_x64-setup.exe`。安装器使用当前 Windows 账户。如果缺少 Microsoft Edge WebView2，安装器会联网补装。
+1. 在 Windows 10 或 11 x64 上双击 `Soulseed_2.9.1-beta.11_x64-setup.exe`。安装器使用当前 Windows 账户。如果缺少 Microsoft Edge WebView2，安装器会联网补装。
 2. 安装完成后，从「开始」菜单打开 **Soulseed**。你会进入大肥鱼的生活世界，生活手帐、计划和对话都在同一个窗口中。
-3. 此体验版目前使用未签名的安装包，Windows 可能显示 SmartScreen 提示。请通过可信来源取得文件，并核对随包提供的 `SHA256SUMS.txt`。可在 PowerShell 中运行 `Get-FileHash .\Soulseed_2.9.1-beta.10_x64-setup.exe -Algorithm SHA256`，逐字核对 SHA256。
+3. 此体验版目前使用未签名的安装包，Windows 可能显示 SmartScreen 提示。请通过可信来源取得文件，并核对随包提供的 `SHA256SUMS.txt`。可在 PowerShell 中运行 `Get-FileHash .\Soulseed_2.9.1-beta.11_x64-setup.exe -Algorithm SHA256`，逐字核对 SHA256。
 
 ## 配置模型并开始对话
 

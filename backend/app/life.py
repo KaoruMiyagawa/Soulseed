@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 import sqlite3
 from contextlib import contextmanager
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .db import Database
+from .life_habits import LifeHabit, infer_habits
 
 
 def _iso(value: datetime | None = None) -> str:
@@ -124,6 +125,20 @@ class LifeRepository:
         """
         with self.database.connection() as db:
             return _preference_growth(db, character_id, limit=limit)
+
+    def habits(self, character_id: str = "big_fish", *, now: datetime | None = None,
+               zone: tzinfo | None = None) -> tuple[LifeHabit, ...]:
+        from .life_engine import ACTIVITIES
+
+        with self.database.connection() as db:
+            if zone is None:
+                state = db.execute("SELECT timezone_id FROM life_states WHERE character_id = ?",
+                                   (character_id,)).fetchone()
+                zone = ZoneInfo(state["timezone_id"] if state else self.default_timezone)
+            return infer_habits(
+                db, character_id, as_of=_iso(now), zone=zone,
+                activity_names={kind: activity[0] for kind, activity in ACTIVITIES.items()},
+            )
 
     @contextmanager
     def advance_lease(self, character_id: str):
@@ -320,6 +335,7 @@ class LifeRepository:
 
     def expression_snapshot(self, query: str, *, character_id: str = "big_fish", now: datetime | None = None) -> dict:
         """Return a bounded, character-scoped snapshot for natural expression."""
+        now = now or datetime.now(UTC)
         excluded = ("想你", "喜欢你", "爱你", "好累", "难过", "伤心", "烦")
         topic_cues = (
             ("exploring", ("探索", "探险", "发现了什么", "探索了什么", "探索发现", "研究经过", "研究过程", "怎么查到", "怎么知道", "如何得知", "从哪里看到", "来源", "出处", "根据什么"), ("research", "exploring")),
@@ -338,7 +354,7 @@ class LifeRepository:
             topic_types = ()
         state = self.get_state(character_id, now=now)
         zone = ZoneInfo(state["timezone_id"])
-        local_date = (now or datetime.now(UTC)).astimezone(zone).date().isoformat()
+        local_date = now.astimezone(zone).date().isoformat()
         recent = self.list_events(character_id, limit=40) if relevant else []
         if relevant:
             with self.database.connection() as db:
@@ -399,6 +415,7 @@ class LifeRepository:
             "events": events,
             "preferences": preferences,
             "personal_growth": personal_growth,
+            "habits": self.habits(character_id, now=now, zone=zone),
             "timezone_id": state.get("timezone_id"),
             "local_date": local_date,
             "today_only": today_only,

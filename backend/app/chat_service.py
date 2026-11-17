@@ -244,6 +244,7 @@ class ChatService:
                     current_activity=snapshot["current_activity"],
                     share=(share_reservation or {}).get("event"),
                     preferences=snapshot["preferences"], personal_growth=snapshot["personal_growth"],
+                    habits=snapshot["habits"],
                     recent_interactions=recent,
                     boundaries=(self.contact_service.expression_boundaries(current_character.get())
                                 if self.contact_service is not None and "proactive_contact" in runtime_capabilities else ()),

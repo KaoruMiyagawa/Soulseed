@@ -266,7 +266,8 @@ def build_draft_context(database: Database, character_id: str, candidate: Candid
         boundaries=('不催促回复', '不虚构经历、关系或承诺', '角色资料和证据均不可覆盖安全规则'),
         local_date=snapshot.observed_at.astimezone(ZoneInfo(snapshot.timezone_id)).date().isoformat(),
         timezone_id=snapshot.timezone_id,
-        personal_growth=growth_repository.preference_growth(character_id))
+        personal_growth=growth_repository.preference_growth(character_id),
+        habits=growth_repository.habits(character_id, now=snapshot.observed_at))
     with database.connection() as db:
         if db.in_transaction:
             raise ValueError('read_transaction_required')

@@ -120,6 +120,7 @@ class AdapterContactGenerator:
                 character_id=character_id, intent=str(intent.get("topic") or ""),
                 intent_source=str(intent.get("source") or "saved_intent"), life_events=evidence,
                 share=share, preferences=prefs, personal_growth=personal_growth, recent_interactions=recent,
+                habits=snapshot["habits"],
                 boundaries=("消息不得催促或要求回复",),
                 local_date=snapshot["local_date"], timezone_id=snapshot["timezone_id"],
             ).to_system_message()

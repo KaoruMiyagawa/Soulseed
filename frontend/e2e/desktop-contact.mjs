@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
@@ -11,7 +12,11 @@ import { chromium, expect } from "@playwright/test";
 
 const [binary, isolatedData, evidenceDirectory] = process.argv.slice(2, 5).map(value => resolve(value));
 const selfSocial = process.argv[5] === "self";
-const growthActivity = process.argv[6];
+const habitRun = process.argv[6] === "habit";
+const habitScenario = habitRun
+  ? JSON.parse(readFileSync(join(isolatedData, "habit-scenario.json"), "utf8"))
+  : null;
+const growthActivity = habitRun ? (habitScenario.has_habit ? habitScenario.activity : null) : process.argv[6];
 assert(!growthActivity || (selfSocial && ["music", "reading"].includes(growthActivity)));
 assert(process.platform === "win32" && binary && isolatedData && evidenceDirectory);
 const installedFixture = resolve(process.env.LOCALAPPDATA, "com.soulseed.desktop", "data");
@@ -29,13 +34,16 @@ const [conversation] = database.prepare("SELECT id FROM conversations").all();
 assert(conversation);
 
 const requests = [];
+const habitContexts = [];
 let chatPayload;
 let mockFailure;
 const interestText = growthActivity === "music" ? "音乐" : "读书";
 const proactiveText = growthActivity
   ? `好想和你聊聊${interestText}呀，光想想就有点雀跃！`
   : "今天想给你丢一颗快乐泡泡，希望它不会在半路上啪的一声破掉！";
-const chatReply = growthActivity ? `比起别的，我更想聊聊${interestText}！` : "我接住啦，泡泡还在！";
+const chatReply = habitRun
+  ? (habitScenario.has_habit ? `我${habitScenario.period}常想听你聊聊${interestText}。` : "目前还没有形成固定的时段习惯。")
+  : (growthActivity ? `比起别的，我更想聊聊${interestText}！` : "我接住啦，泡泡还在！");
 function checkGrowth(growth) {
   assert.equal(growth.length, 1);
   assert.equal(growth[0].activity_type, growthActivity);
@@ -57,12 +65,27 @@ const mock = createServer(async (request, response) => {
       assert.equal(signals.candidate_type, "self_social");
       assert(signals.memories.some(item => item.includes("蓝色玻璃珠")));
     }
-    if (growthActivity) {
+    if (growthActivity || habitRun) {
       const expression = kind === "chat" && body.messages.find(item =>
         item.role === "system" && item.content.includes("<expression_context"));
-      const growth = kind === "contact" ? signals.personal_growth
-        : JSON.parse(expression.content.split("\n").find(line => line.startsWith("{"))).personal_growth;
-      checkGrowth(growth);
+      const context = kind === "contact" ? signals
+        : (expression ? JSON.parse(expression.content.split("\n").find(line => line.startsWith("{"))) : {});
+      if (growthActivity) checkGrowth(context.personal_growth);
+      if (habitRun) {
+        const habits = context.habits ?? [];
+        if (habitScenario.has_habit) {
+          const [habit] = habits;
+          assert.equal(habits.length, 1);
+          assert.equal(habit.activity_type, habitScenario.activity);
+          assert.equal(habit.period, habitScenario.period);
+          assert.equal(habit.status, "established");
+          assert.equal(habit.matching_days, 8);
+        } else {
+          assert.deepEqual(habits, []);
+          assert.deepEqual(context.personal_growth ?? [], []);
+        }
+        habitContexts.push({ request: kind, habits });
+      }
     }
   } catch (error) {
     mockFailure = error;
@@ -140,7 +163,35 @@ async function start() {
 let app;
 try {
   app = await start();
-  if (growthActivity) {
+  if (habitRun) {
+    const life = await app.call("/characters/big_fish/life");
+    assert.equal(life.status, 200);
+    assert.equal(life.body.state.timezone_id, habitScenario.zone_id);
+    const active = life.body.state.current_activity;
+    assert.equal(active.event_type, habitScenario.expected);
+    if (habitScenario.plan_id) {
+      assert.equal(active.id, habitScenario.plan_id);
+      assert.equal(active.generation_method, "manual");
+    } else {
+      assert.match(active.selection_reason, new RegExp(`slot=${habitScenario.slot};`));
+      assert.equal(active.generation_method, "rule_engine");
+      if (habitScenario.scenario === "repeat") {
+        assert.match(active.selection_reason, /recent=\['reading'/);
+      }
+      if (["evening", "morning"].includes(habitScenario.scenario)) {
+        assert.equal(habitScenario.baseline_margin, 0.12);
+        assert.match(active.selection_reason, /habit_bonus=0\.240/);
+      } else {
+        assert.doesNotMatch(active.selection_reason, /habit_bonus=/);
+      }
+    }
+    const logo = app.page.locator("img.brand-mark");
+    await expect(logo).toBeVisible();
+    await expect.poll(() => logo.evaluate(img => img.naturalWidth)).toBeGreaterThan(0);
+    await writeFile(join(evidenceDirectory, "activity-selection.json"), JSON.stringify({
+      ...habitScenario, selected: active.event_type, selectionReason: active.selection_reason,
+    }, null, 2));
+  } else if (growthActivity) {
     const active = await waitFor(() => database.prepare(
       "SELECT event_type, selection_reason FROM life_events WHERE generation_method='rule_engine' AND activity_status='active'"
     ).get());
@@ -188,9 +239,10 @@ try {
   execFileSync("powershell.exe", ["-NoProfile", "-File", fileURLToPath(new URL("./contact-window.ps1", import.meta.url)),
     "-ProcessId", String(app.child.pid), "-Command", "Restore"], { windowsHide: true });
   await expect(app.page.getByText(proactiveText, { exact: true })).toBeVisible();
-  await app.page.getByLabel("写给大肥鱼的消息").fill("我接住了，也喜欢蓝色玻璃珠手链！");
+  const replyInput = habitRun ? "我喜欢蓝色玻璃珠手链。你平时有什么生活习惯？" : "我接住了，也喜欢蓝色玻璃珠手链！";
+  await app.page.getByLabel("写给大肥鱼的消息").fill(replyInput);
   await app.page.getByRole("button", { name: "发送", exact: true }).click();
-  if (growthActivity) await waitFor(() => requests.length === 2);
+  if (growthActivity || habitRun) await waitFor(() => requests.length === 2);
   await expect(app.page.getByText(chatReply, { exact: true })).toBeVisible();
   await app.page.screenshot({ path: join(evidenceDirectory, "contact-conversation.png") });
   assert.deepEqual(requests, ["contact", "chat"]);
@@ -208,6 +260,9 @@ try {
   await expect(app.page.getByRole("heading", { name: "生活手帐" })).toBeVisible();
   await app.page.getByRole("button", { name: "计划", exact: true }).click();
   await expect(app.page.getByRole("heading", { name: "今日计划" })).toBeVisible();
+  if (habitScenario?.plan_id) {
+    await expect(app.page.getByRole("heading", { name: "先整理小角落（验收计划）", exact: true })).toBeVisible();
+  }
   await app.page.getByRole("button", { name: "探索", exact: true }).click();
   await expect(app.page.getByRole("heading", { name: "探索与发现" })).toBeVisible();
   await app.page.getByRole("button", { name: "她的世界", exact: true }).click();
@@ -223,16 +278,22 @@ try {
   await app.page.getByRole("button", { name: "对话", exact: true }).click();
   await expect(app.page.getByText(proactiveText, { exact: true })).toHaveCount(1);
   assert.deepEqual(requests, ["contact", "chat"]);
-  if (growthActivity) {
+  if (growthActivity || habitRun) {
     await app.page.getByLabel("写给大肥鱼的消息").fill("重启后，还想继续聊刚才的话题吗？");
     await app.page.getByRole("button", { name: "发送", exact: true }).click();
     await waitFor(() => requests.length === 3);
     await expect(app.page.getByText(chatReply, { exact: true })).toHaveCount(2);
     assert.equal(chatPayload.max_tokens, 1024);
     assert.deepEqual(requests, ["contact", "chat", "chat"]);
-    console.log(`Growth ${growthActivity}: saved experiences drove activity, contact and chat; restart retained growth.`);
+    if (growthActivity) console.log(`Growth ${growthActivity}: expression context retained established interests after restart.`);
   }
-  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=${growthActivity ? 2 : 1}.`);
+  if (habitRun) {
+    assert.deepEqual(habitContexts.map(entry => entry.request), ["contact", "chat", "chat"]);
+    assert.deepEqual(habitContexts[0].habits, habitContexts[2].habits);
+    await writeFile(join(evidenceDirectory, "habit-model-contexts.json"), JSON.stringify(habitContexts, null, 2));
+    console.log(`Habit ${habitScenario.scenario}: activity selection, context and restart verified.`);
+  }
+  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=${growthActivity || habitRun ? 2 : 1}.`);
   assert(toast, "Windows toast did not appear");
   assert.equal(toastRows(tag).length, 1);
   console.log("Windows AUMID toast verified.");

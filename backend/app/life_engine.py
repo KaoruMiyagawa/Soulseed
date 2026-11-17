@@ -6,6 +6,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta, tzinfo
 
 from .life import LifeRepository, _iso
+from .life_habits import local_period
 from .life_share import LifeShareService
 
 
@@ -82,6 +83,12 @@ class LifeEngine:
         zone = self.timezone or self.repository.timezone(character_id)
         local_time = now.astimezone(zone)
         local_hour = local_time.hour
+        period = local_period(local_hour)
+        habit_bonuses = {
+            habit.activity_type: habit.choice_bonus
+            for habit in self.repository.habits(character_id, now=now, zone=zone)
+            if habit.period == period
+        }
         scores = {}
         for kind in ACTIVITIES:
             repeats = sum(1 for item in recent_types[:3] if item == kind)
@@ -90,8 +97,11 @@ class LifeEngine:
             time_bias += 0.12 if kind == "cooking" and local_hour in (11, 12, 17, 18) else 0
             surprise = 0.45 if kind == "exploring" and self._unit(character_id, slot, "surprise") > 0.94 else 0
             scores[kind] = weights[kind] - 0.35 * repeats - immediate + time_bias + surprise + 0.22 * self._unit(character_id, slot, kind)
+            scores[kind] += habit_bonuses.get(kind, 0.0)
         selected = max(scores, key=lambda kind: (scores[kind], kind))
         reason = f"preference={weights[selected]:.2f}; recent={recent_types[:3]}; score={scores[selected]:.3f}; local={local_time.isoformat()}; timezone={getattr(zone, 'key', zone)}; slot={slot}; seed={self.seed}"
+        if bonus := habit_bonuses.get(selected):
+            reason += f"; habit_bonus={bonus:.3f}"
         return selected, reason
 
     def advance(self, character_id: str = "big_fish", *, now: datetime | None = None, allow_autonomous: bool = True) -> list[dict]:
