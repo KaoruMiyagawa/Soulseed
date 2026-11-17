@@ -1,6 +1,6 @@
 [package]
 name = "soulseed"
-version = "2.9.1-beta.11"
+version = "2.9.1-beta.12"
 edition = "2021"
 
 [features]

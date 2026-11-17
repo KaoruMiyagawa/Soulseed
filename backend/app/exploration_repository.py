@@ -17,6 +17,12 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def verified_read_ids(evidence: list[dict]) -> set[str]:
+    return {item["id"] for item in evidence
+            if item["tool_name"] == "read_webpage" and item["outcome"] == "success"
+            and item.get("page_relevance") == "relevant" and item["excerpt"]}
+
+
 class ExplorationRepository:
     def __init__(self, database: Database, life: LifeRepository):
         self.database = database
@@ -251,6 +257,15 @@ class ExplorationRepository:
     def list(self, character_id: str, limit: int = 20) -> list[dict]:
         with self.database.connection() as db:
             rows = db.execute("SELECT * FROM exploration_runs WHERE character_id=? ORDER BY created_at DESC,id LIMIT ?", (character_id, max(1, min(limit, 50)))).fetchall()
+            return [self._run(db, dict(row)) for row in rows]
+
+    def completed_since(self, character_id: str, since: str) -> list[dict]:
+        with self.database.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM exploration_runs
+                   WHERE character_id=? AND status='completed' AND ended_at>?
+                   ORDER BY ended_at DESC,id LIMIT 20""", (character_id, since),
+            ).fetchall()
             return [self._run(db, dict(row)) for row in rows]
 
     def _get(self, db, run_id: str, character_id: str) -> dict:

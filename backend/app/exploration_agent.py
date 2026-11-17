@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .config import Settings
-from .exploration_repository import ExplorationRepository
+from .exploration_repository import ExplorationRepository, verified_read_ids
 from .life import LifeRepository
 from .model_adapter import (ActionModelReply, ModelBudgetContext, ModelConfigurationError, ModelRequestError,
                             ModelDailyQuotaExhausted, ModelQuotaUnavailable, OpenAICompatibleAdapter)
@@ -572,7 +572,7 @@ class ExplorationAgent:
 
     @staticmethod
     def _validate_claims(raw_claims: list, evidence: list[dict]) -> list[dict]:
-        reads = {item["id"] for item in evidence if item["tool_name"] == "read_webpage" and item["outcome"] == "success" and item.get("page_relevance") == "relevant" and item["excerpt"]}
+        reads = verified_read_ids(evidence)
         if not reads:
             raise ExplorationError("insufficient_evidence")
         result = []

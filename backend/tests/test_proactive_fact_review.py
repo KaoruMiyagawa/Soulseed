@@ -327,12 +327,13 @@ def test_migrations_23_and_24_keep_the_existing_budget_cutover_state(tmp_path, m
         patch.delitem(MIGRATIONS, 26)
         patch.delitem(MIGRATIONS, 27)
         patch.delitem(MIGRATIONS, 28)
+        patch.delitem(MIGRATIONS, 29)
         db.initialize()
         with db.atomic() as sql:
             sql.execute("UPDATE model_budget_cutover SET phase='draining'")
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 28
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 29
         assert sql.execute("SELECT phase FROM model_budget_cutover").fetchone()[0] == "draining"
         assert sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_fact_reviews'").fetchone()
         assert sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='client_message_submissions'").fetchone()

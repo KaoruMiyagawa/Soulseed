@@ -412,8 +412,10 @@ async def test_desktop_worker_matches_sync_persona_context_and_output_cap(tmp_pa
     sync, queued = requests
     assert sync == queued
     assert queued["model"] == "offline-model" and queued["max_tokens"] == 1024
-    persona, expression, *dialogue = queued["messages"]
+    persona, opinion_instruction, expression, *dialogue = queued["messages"]
     assert persona == {"role": "system", "content": load_persona_profile()}
+    assert opinion_instruction["role"] == "system"
+    assert "<opinion_update>" in opinion_instruction["content"]
     assert expression["role"] == "system"
     context = json.loads(expression["content"].splitlines()[-2])
     assert context["character_id"] == "big_fish"

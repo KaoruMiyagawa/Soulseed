@@ -829,6 +829,22 @@ BEGIN SELECT RAISE(ABORT, 'invalid chat reply transition'); END;
 # referring to the original table name throughout the atomic migration.
 MIGRATIONS[27] = "-- extend autonomous candidate types"
 MIGRATIONS[28] = "-- extend autonomous social sources"
+MIGRATIONS[29] = """
+CREATE TABLE character_opinion_revisions (
+    id INTEGER PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE RESTRICT,
+    topic_key TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    stance TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    basis_json TEXT,
+    user_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    assistant_message_id TEXT UNIQUE REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_opinion_revisions_topic
+    ON character_opinion_revisions(character_id, topic_key, id DESC);
+"""
 
 
 class Database:

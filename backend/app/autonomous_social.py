@@ -12,6 +12,7 @@ from .autonomous_intent_state import AutonomousIntentStateRepository, _iso
 from .autonomous_personas import resolve_trusted_persona
 from .contact import ContactService
 from .expression import HABIT_RULES
+from .opinions import OPINION_RULES
 from .model_adapter import ModelBudgetContext
 from .model_budget import BudgetRejected
 from .ownership import character_scope
@@ -123,6 +124,8 @@ class AutonomousContact:
             }
             if context.expression.habits:
                 signals["habits"] = context.expression.habit_payload()
+            if context.expression.opinions:
+                signals["opinions"] = context.expression.opinion_payload()
             saved = self.state.persist_candidate(candidate, now=now)
             if saved.status not in {"pending", "deferred"}:
                 return saved.status
@@ -152,6 +155,7 @@ class AutonomousContact:
                 'personal_growth 指角色本人由多次已完成生活经历逐渐形成的倾向，与用户记忆和当前心情不同；'
                 'forming/recovering/waning/cooling/mixed 都不是固定人格。角色可以有自己的看法，不必迎合用户。'
                 + (HABIT_RULES if signals.get("habits") else "")
+                + (OPINION_RULES if signals.get("opinions") else "")
             )},
             {"role": "user", "content": json.dumps(signals, ensure_ascii=False)},
         ]

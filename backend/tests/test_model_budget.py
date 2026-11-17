@@ -158,7 +158,8 @@ def test_migration_21_upgrade_rollback_and_idempotence(tmp_path, monkeypatch):
         patch.delitem(module.MIGRATIONS,25)
         patch.delitem(module.MIGRATIONS,26)
         patch.delitem(module.MIGRATIONS,27)
-        patch.delitem(module.MIGRATIONS,28)
+        patch.delitem(module.MIGRATIONS, 28)
+        patch.delitem(module.MIGRATIONS, 29)
         db.initialize()
         LifeRepository(db).ensure_state('big_fish')
     with monkeypatch.context() as patch:
@@ -171,7 +172,7 @@ def test_migration_21_upgrade_rollback_and_idempotence(tmp_path, monkeypatch):
     db.initialize()
     db.initialize()
     with db.connection() as sql:
-        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]==28
+        assert sql.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 29
         assert sql.execute("SELECT 1 FROM life_states WHERE character_id='big_fish'").fetchone()
 
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 
 from .expression import ExpressionContextBuilder
+from .opinions import OpinionRepository, invites_opinion, split_reply, update_instruction
 from .context_window import ContextBudgetExceeded, ModelContextWindow
 from .chat_diagnostics import checkpoint, count, measure
 from .memory.context_builder import MemoryContextBuilder
@@ -110,6 +111,7 @@ class ChatService:
         self.life_repository = life_repository
         self.contact_service = contact_service
         self.expression_context_builder = ExpressionContextBuilder()
+        self.opinions = OpinionRepository(messages.database)
         self.context_window = context_window or ModelContextWindow()
         self.runtime_features = runtime_features or {}
         self.last_context_report = None
@@ -225,6 +227,7 @@ class ChatService:
         # Capability facts are independent of the life-history snapshot. Keep
         # them available even if life advancement or expression lookup fails.
         runtime_capabilities = self._runtime_capabilities(content, current_character.get())
+        opinions = self.opinions.relevant(content)
         if self.life_repository is not None:
             try:
                 from .life_engine import LifeEngine
@@ -244,7 +247,7 @@ class ChatService:
                     current_activity=snapshot["current_activity"],
                     share=(share_reservation or {}).get("event"),
                     preferences=snapshot["preferences"], personal_growth=snapshot["personal_growth"],
-                    habits=snapshot["habits"],
+                    habits=snapshot["habits"], opinions=opinions,
                     recent_interactions=recent,
                     boundaries=(self.contact_service.expression_boundaries(current_character.get())
                                 if self.contact_service is not None and "proactive_contact" in runtime_capabilities else ()),
@@ -261,23 +264,18 @@ class ChatService:
                 expression_message = self.expression_context_builder.build(
                     character_id=current_character.get(), intent=content,
                     memory_matches=memory_matches,
+                    opinions=opinions,
                     runtime_capabilities=runtime_capabilities,
                 ).to_system_message()
                 memory_context = expression_message["content"] if expression_message else (
                     self.memory_context_builder.build(memory_matches) if self.memory_context_builder else ""
                 )
-        elif memory_matches:
+        elif memory_matches or opinions or runtime_capabilities:
             expression_message = self.expression_context_builder.build(
                 character_id=current_character.get(), intent=content, memory_matches=memory_matches,
+                opinions=opinions, runtime_capabilities=runtime_capabilities,
             ).to_system_message()
             memory_context = expression_message["content"] if expression_message else ""
-        else:
-            if runtime_capabilities:
-                expression_message = self.expression_context_builder.build(
-                    character_id=current_character.get(), intent=content,
-                    runtime_capabilities=runtime_capabilities,
-                ).to_system_message()
-                memory_context = expression_message["content"] if expression_message else ""
         checkpoint("history_context")
         model_messages = self._model_messages(user_message, memory_context)
         clarification = self._single_clarification_context(correction_results)
@@ -340,10 +338,19 @@ class ChatService:
             assistant = self.messages.add(conversation_id, "assistant", reply)
             if share_reservation and not share_service.commit_chat_selection(share_reservation["token"]):
                 raise RuntimeError("分享候选保留已过期，聊天消息未保存")
+            if opinion_update is not None:
+                self.opinions.save(opinion_update, user_message, assistant)
             return assistant
 
         try:
-            reply = await self._reply(model_messages)
+            bases = self.opinions.revision_bases(opinions, self.life_repository) if self.life_repository else ()
+            controls = update_instruction(opinions, bases) if opinions or invites_opinion(content) else None
+            reply = await self._reply(model_messages, optional_system=controls)
+            reply, opinion_update = split_reply(reply, content, opinions, bases)
+            if controls is None:
+                opinion_update = None
+            if not reply:
+                raise ModelRequestError("模型没有返回可展示的聊天正文。")
             assistant_message = self._persist_reply(user_message, save_reply, reply)
         except Exception as exc:
             if share_reservation and (not isinstance(exc, ReplyExecutionError) or exc.code == "reply_commit_failed"):
@@ -641,9 +648,16 @@ class ChatService:
             )
             return None
 
-    async def _reply(self, messages: list[dict[str, str]]) -> str:
+    async def _reply(self, messages: list[dict[str, str]], *, optional_system: dict | None = None) -> str:
         with measure("context_budget"):
-            result = self.context_window.fit(messages)
+            try:
+                result = self.context_window.fit(
+                    [messages[0], optional_system, *messages[1:]] if optional_system else messages,
+                )
+            except ContextBudgetExceeded:
+                if optional_system is None:
+                    raise
+                result = self.context_window.fit(messages)
         self.last_context_report = result
         count("estimated_input_tokens", result.estimated_after)
         count("dropped_turns", result.dropped_turns)

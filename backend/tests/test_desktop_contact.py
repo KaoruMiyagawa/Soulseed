@@ -242,6 +242,7 @@ def test_candidate_migration_preserves_existing_reservations(tmp_path, monkeypat
         with monkeypatch.context() as old:
             old.delitem(MIGRATIONS, 27)
             old.delitem(MIGRATIONS, 28)
+            old.delitem(MIGRATIONS, 29)
             runtime, life, model, _, _ = setup_desktop(tmp_path, monkeypatch)
             pipeline = DesktopContact(runtime, life, model)
             from app.autonomous_intent import build_snapshot, generate_candidates
@@ -259,6 +260,7 @@ def test_self_social_migration_preserves_contact_rows_and_foreign_keys(tmp_path,
     with character_scope('big_fish'):
         with monkeypatch.context() as old:
             old.delitem(MIGRATIONS, 28)
+            old.delitem(MIGRATIONS, 29)
             runtime, life, model, conversation, _ = setup_desktop(tmp_path, monkeypatch, with_discovery=False)
             message = MessageRepository(runtime.database).add(conversation['id'], 'user', '最近在听音乐')
             intent = ContactService(life).create_intent(source='smalltalk', source_id=message['id'], reason='saved')

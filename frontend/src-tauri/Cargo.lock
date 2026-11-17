@@ -3281,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "soulseed"
-version = "2.9.1-beta.11"
+version = "2.9.1-beta.12"
 dependencies = [
  "getrandom 0.3.4",
  "reqwest 0.12.28",

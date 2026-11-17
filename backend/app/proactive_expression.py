@@ -17,6 +17,7 @@ from .autonomous_intent import (Candidate, Decision, DecisionKind, _INVITATION,
                                 build_snapshot, dry_run, generate_candidates)
 from .db import Database
 from .expression import ExpressionContext, ExpressionContextBuilder
+from .opinions import OpinionRepository
 from .ownership import current_character
 
 
@@ -267,7 +268,11 @@ def build_draft_context(database: Database, character_id: str, candidate: Candid
         local_date=snapshot.observed_at.astimezone(ZoneInfo(snapshot.timezone_id)).date().isoformat(),
         timezone_id=snapshot.timezone_id,
         personal_growth=growth_repository.preference_growth(character_id),
-        habits=growth_repository.habits(character_id, now=snapshot.observed_at))
+        habits=growth_repository.habits(character_id, now=snapshot.observed_at),
+        opinions=OpinionRepository(database).relevant(
+            *(option.text for option in options), *interactions,
+            recent_fallback=candidate.kind == 'self_social',
+        ))
     with database.connection() as db:
         if db.in_transaction:
             raise ValueError('read_transaction_required')

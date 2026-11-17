@@ -13,11 +13,13 @@ import { chromium, expect } from "@playwright/test";
 const [binary, isolatedData, evidenceDirectory] = process.argv.slice(2, 5).map(value => resolve(value));
 const selfSocial = process.argv[5] === "self";
 const habitRun = process.argv[6] === "habit";
+const opinionRun = process.argv[7] === "opinions";
 const habitScenario = habitRun
   ? JSON.parse(readFileSync(join(isolatedData, "habit-scenario.json"), "utf8"))
   : null;
 const growthActivity = habitRun ? (habitScenario.has_habit ? habitScenario.activity : null) : process.argv[6];
 assert(!growthActivity || (selfSocial && ["music", "reading"].includes(growthActivity)));
+assert(!opinionRun || (habitRun && growthActivity));
 assert(process.platform === "win32" && binary && isolatedData && evidenceDirectory);
 const installedFixture = resolve(process.env.LOCALAPPDATA, "com.soulseed.desktop", "data");
 assert(isolatedData.toLowerCase().includes("\\desktop-build\\qa\\") ||
@@ -37,6 +39,48 @@ const requests = [];
 const habitContexts = [];
 let chatPayload;
 let mockFailure;
+const topic = "蓝色玻璃珠展览";
+const initialStance = "我倒觉得蓝色玻璃珠展览可以留些空白，让大家自己发现光影。";
+const revisedStance = "我改主意啦，蓝色玻璃珠展览可以放一张光影示意图，再留些地方给大家自己试。";
+const opinionTurns = {
+  unknown: { question: "关于蓝色玻璃珠展览，你有过什么看法吗？", reply: "我还没想好呢，可以再琢磨琢磨。" },
+  form: { question: "我觉得蓝色玻璃珠展览应该摆满图案，你怎么看？", reply: initialStance },
+  recall: { question: "如果现在布置蓝色玻璃珠展览，你会怎么做？", reply: "我还是想留些空白，让大家自己找光影。" },
+  revise: { question: "现在对蓝色玻璃珠展览的看法变了吗？", reply: revisedStance },
+};
+let completedExperienceId;
+const opinionChecks = [];
+function opinionResponse(payload, context, key) {
+  const turn = opinionTurns[key];
+  const opinions = context.opinions ?? [];
+  if (key === "unknown" || key === "form") {
+    assert.deepEqual(opinions, []);
+    if (key === "unknown") {
+      assert(context.evidence.some(item => item.source === "long_term_memory" && item.content.includes("蓝色玻璃珠")));
+    }
+  } else {
+    assert.equal(opinions.length, 1);
+    assert.equal(opinions[0].topic, topic);
+    assert.equal(opinions[0].stance, initialStance);
+  }
+  opinionChecks.push({ turn: key, opinions, userMemoryPresent: context.evidence.some(item => item.source === "long_term_memory") });
+  if (key === "unknown" || key === "recall") return turn.reply;
+  const instruction = payload.messages.find(item => item.content.includes("供复核的话题及新依据"));
+  assert(instruction);
+  const review = JSON.parse(instruction.content.split("\n").at(-1));
+  const update = { topic, stance: turn.reply, reason: "想让参观者主动发现光影", previous: null, basis: null };
+  if (key === "form") {
+    assert.deepEqual(review, []);
+  } else {
+    const [prior] = review;
+    const [basis] = prior.new_basis;
+    assert.equal(basis.kind, "completed_experience");
+    assert.equal(basis.id, completedExperienceId);
+    assert.deepEqual(basis.source_ids, [completedExperienceId]);
+    Object.assign(update, { reason: "布置后发现一张示意图能给观众提供尝试的起点", previous: prior.previous, basis: basis.id });
+  }
+  return `${turn.reply}\n<opinion_update>${JSON.stringify(update)}`;
+}
 const interestText = growthActivity === "music" ? "音乐" : "读书";
 const proactiveText = growthActivity
   ? `好想和你聊聊${interestText}呀，光想想就有点雀跃！`
@@ -60,7 +104,9 @@ const mock = createServer(async (request, response) => {
   let signals;
   try { signals = JSON.parse(body.messages.at(-1).content); } catch {}
   const kind = signals?.choices ? "contact" : "chat";
+  let reply = chatReply;
   try {
+    if (kind === "chat") assert.equal(body.max_tokens, 1024);
     if (kind === "contact" && selfSocial) {
       assert.equal(signals.candidate_type, "self_social");
       assert(signals.memories.some(item => item.includes("蓝色玻璃珠")));
@@ -71,6 +117,10 @@ const mock = createServer(async (request, response) => {
       const context = kind === "contact" ? signals
         : (expression ? JSON.parse(expression.content.split("\n").find(line => line.startsWith("{"))) : {});
       if (growthActivity) checkGrowth(context.personal_growth);
+      if (opinionRun && kind === "chat") {
+        const key = Object.keys(opinionTurns).find(key => opinionTurns[key].question === body.messages.at(-1).content);
+        if (key) reply = opinionResponse(body, context, key);
+      }
       if (habitRun) {
         const habits = context.habits ?? [];
         if (habitScenario.has_habit) {
@@ -79,7 +129,11 @@ const mock = createServer(async (request, response) => {
           assert.equal(habit.activity_type, habitScenario.activity);
           assert.equal(habit.period, habitScenario.period);
           assert.equal(habit.status, "established");
-          assert.equal(habit.matching_days, 8);
+          if (opinionRun && completedExperienceId) {
+            assert(habit.matching_days >= 7);
+          } else {
+            assert.equal(habit.matching_days, 8);
+          }
         } else {
           assert.deepEqual(habits, []);
           assert.deepEqual(context.personal_growth ?? [], []);
@@ -99,7 +153,7 @@ const mock = createServer(async (request, response) => {
     ? JSON.stringify({ decision: "contact", choice: signals.choices[0].id, style: "curious",
       message: proactiveText, evidence_ids: signals.choices[0].evidence_ids,
       claims: [] })
-    : chatReply;
+    : reply;
   response.setHeader("Content-Type", "application/json");
   response.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: "stop" }] }));
 });
@@ -161,6 +215,24 @@ async function start() {
 }
 
 let app;
+const opinionHistory = () => database.prepare(`SELECT r.id,r.topic,r.stance,r.reason,r.basis_json,
+  r.user_message_id,r.assistant_message_id,a.conversation_id,a.content AS visible_reply
+  FROM character_opinion_revisions r JOIN messages a ON a.id=r.assistant_message_id
+  JOIN messages u ON u.id=r.user_message_id AND u.conversation_id=a.conversation_id
+  WHERE r.character_id='big_fish' AND u.role='user' AND a.role='assistant' ORDER BY r.id`).all();
+async function opinionTurn(key) {
+  const { question, reply } = opinionTurns[key];
+  const input = app.page.getByLabel("写给大肥鱼的消息");
+  await input.fill(question);
+  await app.page.getByRole("button", { name: "发送", exact: true }).click();
+  try {
+    await expect(app.page.getByText(reply, { exact: true })).toBeVisible();
+  } catch (error) {
+    throw mockFailure ?? error;
+  }
+  await expect(app.page.getByText("<opinion_update>", { exact: false })).toHaveCount(0);
+  await app.page.screenshot({ path: join(evidenceDirectory, `opinion-${key}.png`) });
+}
 try {
   app = await start();
   if (habitRun) {
@@ -188,6 +260,7 @@ try {
     const logo = app.page.locator("img.brand-mark");
     await expect(logo).toBeVisible();
     await expect.poll(() => logo.evaluate(img => img.naturalWidth)).toBeGreaterThan(0);
+    if (opinionRun) await app.page.screenshot({ path: join(evidenceDirectory, "home-official-logo.png") });
     await writeFile(join(evidenceDirectory, "activity-selection.json"), JSON.stringify({
       ...habitScenario, selected: active.event_type, selectionReason: active.selection_reason,
     }, null, 2));
@@ -202,7 +275,7 @@ try {
   assert.equal((await app.call("/desktop/model", "PUT", {
     base_url: `http://127.0.0.1:${mockPort}/v1`, model: "qa", api_key: "qa-only-no-secret",
   })).status, 200);
-  await app.call("/desktop/runtime", "PUT", { daily_limit: 3, autonomous_paused: true });
+  await app.call("/desktop/runtime", "PUT", { daily_limit: opinionRun ? 10 : 3, autonomous_paused: true });
   await app.page.reload();
   await app.page.getByRole("button", { name: /模型设置/ }).click();
   await app.page.getByRole("button", { name: "启用主动联系" }).click();
@@ -268,6 +341,18 @@ try {
   await app.page.getByRole("button", { name: "她的世界", exact: true }).click();
   await expect(app.page.getByRole("heading", { name: /大肥鱼的.*生活世界/ })).toBeVisible();
   await app.page.getByRole("button", { name: "对话", exact: true }).click();
+  let firstOpinion;
+  if (opinionRun) {
+    await opinionTurn("unknown");
+    assert.deepEqual(opinionHistory(), []);
+    await opinionTurn("form");
+    [firstOpinion] = opinionHistory();
+    assert.equal(opinionHistory().length, 1);
+    assert.equal(firstOpinion.conversation_id, conversation.id);
+    assert.equal(firstOpinion.stance, initialStance);
+    assert.equal(firstOpinion.visible_reply, initialStance);
+    assert.equal(firstOpinion.basis_json, null);
+  }
   const closed = app;
   const oldPid = app.pid;
   console.log("Verified proactive message and reply in the same chat. Closing the window.");
@@ -277,23 +362,52 @@ try {
   app = await start();
   await app.page.getByRole("button", { name: "对话", exact: true }).click();
   await expect(app.page.getByText(proactiveText, { exact: true })).toHaveCount(1);
-  assert.deepEqual(requests, ["contact", "chat"]);
+  const beforeRestartReply = opinionRun ? ["contact", "chat", "chat", "chat"] : ["contact", "chat"];
+  assert.deepEqual(requests, beforeRestartReply);
   if (growthActivity || habitRun) {
     await app.page.getByLabel("写给大肥鱼的消息").fill("重启后，还想继续聊刚才的话题吗？");
     await app.page.getByRole("button", { name: "发送", exact: true }).click();
-    await waitFor(() => requests.length === 3);
+    await waitFor(() => requests.length === beforeRestartReply.length + 1);
     await expect(app.page.getByText(chatReply, { exact: true })).toHaveCount(2);
     assert.equal(chatPayload.max_tokens, 1024);
-    assert.deepEqual(requests, ["contact", "chat", "chat"]);
+    assert.deepEqual(requests, [...beforeRestartReply, "chat"]);
     if (growthActivity) console.log(`Growth ${growthActivity}: expression context retained established interests after restart.`);
   }
   if (habitRun) {
-    assert.deepEqual(habitContexts.map(entry => entry.request), ["contact", "chat", "chat"]);
-    assert.deepEqual(habitContexts[0].habits, habitContexts[2].habits);
+    assert.deepEqual(habitContexts.map(entry => entry.request), [...beforeRestartReply, "chat"]);
+    assert.deepEqual(habitContexts[0].habits, habitContexts.at(-1).habits);
     await writeFile(join(evidenceDirectory, "habit-model-contexts.json"), JSON.stringify(habitContexts, null, 2));
     console.log(`Habit ${habitScenario.scenario}: activity selection, context and restart verified.`);
   }
-  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=${growthActivity || habitRun ? 2 : 1}.`);
+  if (opinionRun) {
+    assert.deepEqual(opinionHistory(), [firstOpinion]);
+    await app.page.locator("button.new-chat").click();
+    await expect(app.page.getByText(initialStance, { exact: true })).toHaveCount(0);
+    await opinionTurn("recall");
+    assert.deepEqual(opinionHistory(), [firstOpinion]);
+    const event = await app.call("/characters/big_fish/life/events", "POST", {
+      content: "试布置了一次蓝色玻璃珠展览，一张小图让参观的人知道从哪里开始看光影。",
+      event_type: "activity", status: "completed",
+    });
+    assert.equal(event.status, 201);
+    assert.equal(event.body.effective_status, "completed");
+    completedExperienceId = event.body.id;
+    await opinionTurn("revise");
+    const history = opinionHistory();
+    assert.equal(history.length, 2);
+    assert.deepEqual(history[0], firstOpinion);
+    assert.equal(history[1].stance, revisedStance);
+    assert.equal(history[1].visible_reply, revisedStance);
+    assert.notEqual(history[1].conversation_id, firstOpinion.conversation_id);
+    assert.deepEqual(JSON.parse(history[1].basis_json).source_ids, [completedExperienceId]);
+    assert.deepEqual(opinionChecks.map(item => item.turn), ["unknown", "form", "recall", "revise"]);
+    assert.deepEqual(requests, ["contact", ...Array(6).fill("chat")]);
+    await writeFile(join(evidenceDirectory, "opinion-history.json"), JSON.stringify({
+      completedExperienceId, history, modelContext: opinionChecks, chatOutputLimit: chatPayload.max_tokens,
+    }, null, 2));
+    console.log("Opinion formed, retained across app restart and a new conversation, then revised with a completed experience.");
+  }
+  console.log(`${selfSocial ? "Self-social state" : "Old smalltalk"}, same-thread UI reply, exit and restart verified. Calls: contact=1, chat=${requests.filter(kind => kind === "chat").length}.`);
   assert(toast, "Windows toast did not appear");
   assert.equal(toastRows(tag).length, 1);
   console.log("Windows AUMID toast verified.");

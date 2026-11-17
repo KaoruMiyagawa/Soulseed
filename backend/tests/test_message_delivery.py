@@ -203,4 +203,4 @@ def test_legacy_messages_still_wait_for_model_and_return_assistant(delivery_env,
     assert response.status_code == 200
     assert response.json()["content"] == "旧路径回复"
     with main.database.connection() as sql:
-        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 28
+        assert sql.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 29
