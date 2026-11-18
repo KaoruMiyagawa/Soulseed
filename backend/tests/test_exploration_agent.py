@@ -538,6 +538,127 @@ def test_autonomous_topic_candidates_include_unresolved_questions_and_keep_basis
         assert any(item["topic"] == "继续查清：鲸鱼为什么会唱歌？" and item["basis"] == "unresolved_question" for item in items)
 
 
+def test_completed_discovery_seeds_grounded_novel_question_with_durable_provenance(tmp_path):
+    db, life, repo, _, _ = setup(tmp_path)
+    with character_scope("big_fish"):
+        prior, _ = repo.create(character_id="big_fish", idempotency_key="prior-discovery-0001",
+                               requested_topic="music")
+        repo.activate(prior["id"], "big_fish")
+        source = repo.add_evidence(
+            prior["id"], "big_fish", tool_name="read_webpage", source_url="https://example.org/otter",
+            title="音乐中的节奏", excerpt="音乐里的节奏会形成反复的声音模式。", outcome="success",
+            page_relevance="relevant",
+        )
+        repo.complete(prior["id"], "big_fish", summary="音乐里的节奏会形成反复的声音模式。",
+                      claims=[{"text": "音乐里的节奏会形成反复的声音模式。", "kind": "sourced",
+                               "source_ids": [source["id"]]}], unanswered=[])
+        from app.life_engine import LifeEngine
+        engine = LifeEngine(life)
+        for activity in ("reading", "music", "tidying", "cooking", "resting", "exploring", "daydreaming"):
+            engine.set_preference("big_fish", activity, 1.8, reason="explicit_preference")
+        life.record("学习音乐节奏", event_type="goal", status="planned")
+        life.record("观察舞蹈", event_type="goal", status="planned")
+        candidates = life.exploration_candidate_items("big_fish")
+        research_candidate = next(item for item in candidates if item["basis"] == "completed_research")
+        assert candidates[0]["basis"] == "completed_research"
+        assert research_candidate["basis_detail"]["run_id"] == prior["id"]
+        assert research_candidate["basis_detail"]["evidence_ids"] == [source["id"]]
+        assert research_candidate["basis_detail"]["related_basis"]["basis"] == "stable_interest"
+
+        class DerivedQuestionModel:
+            def __init__(self):
+                self.payloads = []
+
+            async def reply(self, messages):
+                payload = json.loads(messages[-1]["content"])
+                self.payloads.append(payload)
+                if payload["task"]["selected_topic"] is None:
+                    return json.dumps({"action": "select_topic", "topic": "music",
+                                       "question": "音乐中的节奏如何改变舞蹈表现？"}, ensure_ascii=False)
+                if not payload["observations"]:
+                    return json.dumps({"action": "search_web", "query": "音乐节奏影响舞蹈表现"}, ensure_ascii=False)
+                page = next((item for item in payload["observations"] if "untrusted_page_text" in item), None)
+                if page:
+                    return json.dumps({"action": "finish", "summary": "资料说明音乐里的节奏能影响舞蹈表现。",
+                                       "claims": [{"text": "音乐里的节奏能影响舞蹈表现。", "kind": "sourced",
+                                                   "source_ids": [page["evidence_id"]]}], "unanswered": []}, ensure_ascii=False)
+                return json.dumps({"action": "finish", "summary": "尚无来源。", "claims": [], "unanswered": ["需要可靠来源"]}, ensure_ascii=False)
+
+        model = DerivedQuestionModel()
+        run, _ = repo.create(character_id="big_fish", idempotency_key="derived-question-0001",
+                             requested_topic=None, trigger_mode="autonomous")
+        agent = ExplorationAgent(
+            repo, life, Settings(model_enabled=False, exploration_enabled=True), model=model,
+            search=FakeSearch([SearchResult("音乐节奏与舞蹈表现", "https://example.org/stone", "音乐节奏影响舞蹈表现")]),
+            reader=FakeReader(text="音乐中的节奏可以通过速度和重拍的变化影响舞蹈表现。"),
+        )
+        result = asyncio.run(agent.run(run["id"], "big_fish"))
+        assert result["status"] == "completed"
+        assert result["selected_topic"] == "音乐中的节奏如何改变舞蹈表现？"
+        assert result["topic_basis"] == "derived_question"
+        assert result["topic_basis_detail"]["candidate_topic"] == "music"
+        assert result["topic_basis_detail"]["run_id"] == prior["id"]
+        assert result["topic_basis_detail"]["evidence_ids"] == [source["id"]]
+        assert model.payloads[0]["candidate_sources"]
+
+        restarted = ExplorationRepository(Database(db.path), LifeRepository(Database(db.path)))
+        recovered = restarted.get(run["id"], "big_fish")
+        assert recovered["selected_topic"] == "音乐中的节奏如何改变舞蹈表现？"
+        assert recovered["topic_basis_detail"]["evidence_ids"] == [source["id"]]
+        assert restarted.topic_was_explored("big_fish", " 音乐中的节奏如何改变舞蹈表现！ ")
+
+
+def test_autonomous_derived_question_must_share_candidate_evidence_subject(tmp_path):
+    _, life, repo, _, _ = setup(tmp_path)
+    from app.life_engine import LifeEngine
+
+    with character_scope("big_fish"):
+        LifeEngine(life).set_preference("big_fish", "music", 1.8, reason="explicit_preference")
+        run, _ = repo.create(character_id="big_fish", idempotency_key="ungrounded-question-0001",
+                             requested_topic=None, trigger_mode="autonomous")
+
+    class UnrelatedQuestionModel:
+        async def reply(self, messages):
+            return json.dumps({"action": "select_topic", "topic": "music", "question": "火星上有多少座火山？"}, ensure_ascii=False)
+
+    agent = ExplorationAgent(repo, life, Settings(model_enabled=False, exploration_enabled=True),
+                             model=UnrelatedQuestionModel())
+    result = asyncio.run(agent.run(run["id"], "big_fish"))
+    assert result["status"] == "failed"
+    assert result["error_code"] == "ungrounded_autonomous_question"
+    assert result["life_event_id"] is None
+
+
+def test_same_topic_same_source_claim_is_not_persisted_as_a_new_discovery(tmp_path):
+    _, _, repo, _, _ = setup(tmp_path)
+    with character_scope("big_fish"):
+        prior, _ = repo.create(character_id="big_fish", idempotency_key="duplicate-source-first",
+                               requested_topic="海獭觅食", trigger_mode="autonomous")
+        claim_text = "海獭会用石头敲开贝类外壳。"
+        for run in (prior,):
+            repo.activate(run["id"], "big_fish")
+            evidence = repo.add_evidence(run["id"], "big_fish", tool_name="read_webpage",
+                                         source_url="https://example.org/otter", title="海獭觅食",
+                                         excerpt="海獭会用石头敲开贝类外壳。", outcome="success",
+                                         page_relevance="relevant")
+            repo.complete(run["id"], "big_fish", summary="海獭会用石头敲开贝类外壳。",
+                          claims=[{"text": claim_text, "kind": "sourced", "source_ids": [evidence["id"]]}],
+                          unanswered=[])
+
+        repeated, _ = repo.create(character_id="big_fish", idempotency_key="duplicate-source-second",
+                                  requested_topic="海獭觅食", trigger_mode="autonomous")
+        repo.activate(repeated["id"], "big_fish")
+        evidence = repo.add_evidence(repeated["id"], "big_fish", tool_name="read_webpage",
+                                     source_url="https://example.org/otter", title="海獭觅食",
+                                     excerpt="海獭会用石头敲开贝类外壳。", outcome="success",
+                                     page_relevance="relevant")
+        with pytest.raises(ValueError, match="duplicate_research_evidence"):
+            repo.complete(repeated["id"], "big_fish", summary="又一次同样的结论。",
+                          claims=[{"text": claim_text, "kind": "sourced", "source_ids": [evidence["id"]]}],
+                          unanswered=[])
+        assert repo.get(repeated["id"], "big_fish")["life_event_id"] is None
+
+
 def test_model_cannot_call_disallowed_tools_or_finish_without_evidence(tmp_path):
     _, _, _, agent, run = setup(tmp_path, model=ScriptedModel(unsafe_action="shell"))
     result = asyncio.run(agent.run(run["id"], "big_fish"))

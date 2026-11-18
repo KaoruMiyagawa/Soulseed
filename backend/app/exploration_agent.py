@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .config import Settings
-from .exploration_repository import ExplorationRepository, verified_read_ids
+from .exploration_repository import DuplicateResearchFinding, ExplorationRepository, verified_read_ids
 from .life import LifeRepository
 from .model_adapter import (ActionModelReply, ModelBudgetContext, ModelConfigurationError, ModelRequestError,
                             ModelDailyQuotaExhausted, ModelQuotaUnavailable, OpenAICompatibleAdapter)
@@ -102,15 +102,22 @@ class ExplorationAgent:
         with character_scope(character_id):
             started = time.monotonic()
             calls = 0
-            selected_topic: str | None = None
             try:
+                run = self.repository.activate(run_id, character_id)
+                if run is None:
+                    return self.repository.get(run_id, character_id)
                 if not self.settings.exploration_enabled:
                     raise ExplorationError("exploration_disabled")
                 if self.model is None:
                     raise ExplorationError("exploration_model_unavailable")
-                run = self.repository.activate(run_id, character_id)
                 self.repository.set_phase(run_id, character_id, "planning")
-                candidates = self.life.exploration_candidate_items(character_id)
+                topic = run["selected_topic"] or run["requested_topic"]
+                if topic and run["retry_of"] and run["topic_origin"] == "character":
+                    if self.repository.topic_was_explored(
+                        character_id, topic, exclude_run_id=run_id, basis_detail=run["topic_basis_detail"], retry=True,
+                    ):
+                        raise ExplorationError("repeated_exploration_topic")
+                candidates = self.life.exploration_candidate_items(character_id) if not topic else []
                 async with asyncio.timeout(self.settings.exploration_timeout_seconds):
                     async for action in self._decisions(run, character_id, candidates, started):
                         if action["action"] == "select_topic":
@@ -118,15 +125,25 @@ class ExplorationAgent:
                             selected_candidate = next((item for item in candidates if item["topic"] == candidate), None)
                             if run["topic_origin"] != "character" or not selected_candidate:
                                 raise ExplorationError("invalid_topic_selection")
-                            selected_topic = candidate
-                            self.repository.set_topic(run_id, character_id, candidate)
-                            self.repository.set_topic_basis(run_id, character_id, selected_candidate["basis"])
-                            run["selected_topic"] = candidate
+                            proposed_question = action.get("question")
+                            selected_topic = proposed_question or candidate
+                            if proposed_question:
+                                if not self._question_is_grounded(proposed_question, selected_candidate):
+                                    raise ExplorationError("ungrounded_autonomous_question")
+                            provenance = {
+                                **(selected_candidate.get("basis_detail") or {}),
+                                "candidate_topic": candidate,
+                                "derived_question": proposed_question,
+                            }
+                            basis = "derived_question" if proposed_question else selected_candidate["basis"]
+                            if not self.repository.select_topic(run_id, character_id, selected_topic, basis, provenance):
+                                raise ExplorationError("repeated_exploration_topic")
+                            run["selected_topic"] = selected_topic
                             continue
                         if action["action"] == "search_web":
                             self.repository.set_phase(run_id, character_id, "searching")
                             query = action["query"].strip()
-                            if not 3 <= len(query) <= 240 or not selected_topic and not run.get("requested_topic"):
+                            if not 3 <= len(query) <= 240 or not run.get("selected_topic"):
                                 raise ExplorationError("invalid_search_query")
                             fingerprint = ("search", " ".join(query.casefold().split()))
                             if fingerprint in self._seen(run_id):
@@ -212,7 +229,13 @@ class ExplorationAgent:
                                 raise
                             self.repository.record_timing(run_id, character_id, "evaluation", int((time.monotonic() - evaluation_started) * 1000))
                             persistence_started = time.monotonic()
-                            self.repository.complete(run_id, character_id, summary=action["summary"], claims=claims, unanswered=action["unanswered"])
+                            try:
+                                self.repository.complete(run_id, character_id, summary=action["summary"], claims=claims, unanswered=action["unanswered"])
+                            except DuplicateResearchFinding:
+                                self.repository.terminate(run_id, character_id, "failed",
+                                                          error_code="no_new_research_finding")
+                                self.repository.record_timing(run_id, character_id, "persistence", int((time.monotonic() - persistence_started) * 1000))
+                                return self.repository.get(run_id, character_id)
                             self.repository.record_timing(run_id, character_id, "persistence", int((time.monotonic() - persistence_started) * 1000))
                             return self.repository.get(run_id, character_id)
                 raise ExplorationError("step_limit_reached")
@@ -250,11 +273,10 @@ class ExplorationAgent:
             except (KeyError, ValueError):
                 return self.repository.get(run_id, character_id)
 
-    async def _decisions(self, run: dict, character_id: str, candidates: list[str], started: float):
-        seen: set[tuple[str, str]] = set()
-        self._seen_calls[run["id"]] = seen
-        if run["topic_origin"] == "character" and not candidates:
+    async def _decisions(self, run: dict, character_id: str, candidates: list[dict], started: float):
+        if run["topic_origin"] == "character" and not run.get("selected_topic") and not candidates:
             raise ExplorationError("no_saved_interest")
+        self._seen_calls[run["id"]] = set()
         self._observations[run["id"]] = []
         try:
             topic = run.get("requested_topic")
@@ -321,6 +343,10 @@ class ExplorationAgent:
                 payload = {
                     "task": {"requested_topic": run.get("requested_topic"), "selected_topic": run.get("selected_topic"), "topic_origin": run["topic_origin"]},
                     "saved_interest_candidates": [item["topic"] for item in candidates] if run["topic_origin"] == "character" else [],
+                    "candidate_sources": [
+                        {"topic": item["topic"], "basis": item["basis"], "basis_detail": item.get("basis_detail", {})}
+                        for item in candidates
+                    ] if selection_required else [],
                     "progress": {
                         "current_step": step + 1,
                         "max_steps": self.settings.exploration_max_steps,
@@ -359,6 +385,11 @@ class ExplorationAgent:
                     raise ExplorationError("request_input_budget_exceeded")
                 if run.get("input_char_count", 0) + input_chars > self.settings.exploration_max_total_input_chars:
                     raise ExplorationError("task_input_budget_exceeded")
+                if run["retry_of"] and run["trigger_mode"] == "autonomous":
+                    prefs = self.repository.autonomy_preferences(character_id)
+                    if not prefs["enabled"] or (prefs["paused_until"] and
+                            datetime.fromisoformat(prefs["paused_until"]).astimezone(UTC) > datetime.now(UTC)):
+                        raise ExplorationError("autonomous_paused")
                 if isinstance(self.budget_service, DesktopBudget):
                     if run.get("trigger_mode") == "autonomous" and self.budget_service.preferences()["autonomous_paused"]:
                         raise ExplorationError("autonomous_paused")
@@ -373,9 +404,11 @@ class ExplorationAgent:
                 try:
                     if callable(action_method):
                         budget = {}
-                        if isinstance(self.budget_service, DesktopBudget) and run.get("trigger_mode") == "autonomous":
+                        if isinstance(self.model, OpenAICompatibleAdapter) and self.model.strict_budget:
+                            source = ("autonomous_exploration" if self.model.desktop_strict
+                                      and run["trigger_mode"] == "autonomous" else "exploration")
                             budget["budget_context"] = ModelBudgetContext(
-                                uuid4().hex, character_id, "autonomous_exploration", datetime.now(UTC).date().isoformat(),
+                                uuid4().hex, character_id, source, self.model.clock().astimezone(UTC).date().isoformat(),
                             )
                         reply = await action_method(messages, run_id=run["id"], step=step + 1, **budget)
                     else:
@@ -468,7 +501,7 @@ class ExplorationAgent:
             "read_webpage": {"action", "evidence_id"},
             "finish": {"action", "summary", "claims", "unanswered"},
         }
-        known_fields = set.union(*schemas.values())
+        known_fields = set.union(*schemas.values()) | {"question"}
         shape["field_types"] = {key: type(action[key]).__name__ for key in sorted(known_fields & action.keys())}
         shape["unknown_field_count"] = len(action.keys() - known_fields)
         if "action" not in action:
@@ -481,13 +514,15 @@ class ExplorationAgent:
             raise ExplorationError("disallowed_tool", reason="unknown_action")
         if schemas[kind] - action.keys():
             raise invalid("missing_field")
-        if action.keys() - schemas[kind]:
+        allowed_fields = schemas[kind] | ({"question"} if kind == "select_topic" else set())
+        if action.keys() - allowed_fields:
             raise invalid("invalid_arguments")
 
         def text(value, minimum, maximum):
             return isinstance(value, str) and minimum <= len(value.strip()) <= maximum
 
-        if kind == "select_topic" and (step != 0 or not text(action["topic"], 1, 240)):
+        if kind == "select_topic" and (step != 0 or not text(action["topic"], 1, 240)
+                                        or ("question" in action and not text(action["question"], 8, 240))):
             raise invalid("invalid_arguments")
         if kind == "search_web" and not text(action["query"], 3, 240):
             raise invalid("invalid_arguments")
@@ -517,6 +552,30 @@ class ExplorationAgent:
 
     def _remember(self, run_id: str, fingerprint: tuple[str, str]):
         self._seen(run_id).add(fingerprint)
+
+    @staticmethod
+    def _question_is_grounded(question: str, candidate: dict) -> bool:
+        anchors = search_query_terms(candidate.get("topic", ""))
+        detail = candidate.get("basis_detail") or {}
+        for key in ("claim", "content", "subject"):
+            if isinstance(detail.get(key), str):
+                anchors.update(search_query_terms(detail[key]))
+        for value in detail.get("experience_summaries", []):
+            if isinstance(value, str):
+                anchors.update(search_query_terms(value))
+        related_basis = detail.get("related_basis")
+        if isinstance(related_basis, dict):
+            related = related_basis.get("detail") or {}
+            for key in ("claim", "content", "subject"):
+                if isinstance(related.get(key), str):
+                    anchors.update(search_query_terms(related[key]))
+            for value in related.get("experience_summaries", []):
+                if isinstance(value, str):
+                    anchors.update(search_query_terms(value))
+        proposed = search_query_terms(question)
+        # A derived question must retain a concrete subject signal from its
+        # stored interest, experience, or sourced discovery.
+        return bool(anchors & proposed)
 
     def _check_budget(self, started: float, calls: int):
         if calls >= self.settings.exploration_max_tool_calls:
@@ -573,7 +632,7 @@ class ExplorationAgent:
     @staticmethod
     def _validate_claims(raw_claims: list, evidence: list[dict]) -> list[dict]:
         reads = verified_read_ids(evidence)
-        if not reads:
+        if not reads or not raw_claims:
             raise ExplorationError("insufficient_evidence")
         result = []
         for claim in raw_claims[:8]:
@@ -590,7 +649,8 @@ class ExplorationAgent:
         return (
             "你是大肥鱼的有限自主探索决策器。每次只输出一个 JSON 对象，不能输出 Markdown。"
             "动作只能是 select_topic、search_web、read_webpage、finish。用户指定主题直接围绕该主题；"
-            "角色自主探索时只能从提供的已保存兴趣候选中选 topic。完成选题后使用 search_web 查询，"
+            "角色自主探索时从提供的候选及其 basis_detail 中选 topic；可以提出一个与候选经历或已验证发现直接相关的新 question，"
+            "question 必须保留候选中的具体主题，不要重复已探索过的问题。question 会与来源依据一同持久化。完成选题后使用 search_web 查询，"
             "只能用搜索结果中的 evidence_id 调用 read_webpage。每轮请求会给出当前步数、剩余步骤、"
             "工具调用预算、已有证据、搜索历史和 available_actions；只能选择 available_actions 中的动作。"
             "search_strategy 是服务端约束：required_query_language=en 时，若选择搜索，query 必须是原主题的英文等价表达，"
@@ -611,7 +671,7 @@ class ExplorationAgent:
             "但允许以空 claims 和具体 unanswered 结束。不要声称工具没有返回的行动或经历。"
             "严格使用以下四种 JSON 对象之一，字段置于顶层，不得嵌套到 arguments/parameters，"
             "不得附加 thought/reason 等字段、代码围栏或自然语言前后缀："
-            '{"action":"select_topic","topic":"已保存兴趣中的原值"}；'
+            '{"action":"select_topic","topic":"已保存兴趣候选中的原值","question":"可选：基于候选经历或来源发现提出的新问题"}；'
             '{"action":"search_web","query":"搜索问题"}；'
             '{"action":"read_webpage","evidence_id":"搜索结果中的 evidence_id"}；'
             '{"action":"finish","summary":"简短总结","claims":[{"text":"简短发现",'

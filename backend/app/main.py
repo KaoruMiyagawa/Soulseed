@@ -127,6 +127,7 @@ class PairRequest(BaseModel):
 class StartExplorationRequest(BaseModel):
     topic: str | None = Field(default=None, min_length=3, max_length=240)
     idempotency_key: str = Field(min_length=8, max_length=120)
+    retry_run_id: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class ExplorationAutonomyRequest(BaseModel):
@@ -581,8 +582,9 @@ def _launch_exploration(run_id: str, character_id: str) -> None:
     active_exploration_tasks[run_id] = task
     active_exploration_characters[run_id] = character_id
     def clear(done, key=run_id):
-        active_exploration_tasks.pop(key, None)
-        active_exploration_characters.pop(key, None)
+        if active_exploration_tasks.get(key) is done:
+            active_exploration_tasks.pop(key, None)
+            active_exploration_characters.pop(key, None)
     task.add_done_callback(clear)
 
 
@@ -610,7 +612,14 @@ async def start_exploration(character_id: str, request: StartExplorationRequest)
                                                      idempotency_key=request.idempotency_key,
                                                      requested_topic=topic,
                                                      enforce_single_active=True,
-                                                     quota_snapshot=exploration_agent.quota_snapshot)
+                                                     quota_snapshot=exploration_agent.quota_snapshot,
+                                                     retry_run_id=request.retry_run_id,
+                                                     autonomous_paused=bool(request.retry_run_id and desktop and
+                                                                            desktop.budget.preferences()["autonomous_paused"]))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="探索记录不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ModelDailyQuotaExhausted, ModelQuotaUnavailable) as exc:
         exhausted = isinstance(exc, ModelDailyQuotaExhausted)
         raise HTTPException(status_code=429 if exhausted else 503, detail={

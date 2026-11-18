@@ -426,28 +426,50 @@ class LifeRepository:
         """Only interests reinforced by completed character experiences count as candidates."""
         return [item["topic"] for item in self.exploration_candidate_items(character_id, limit)]
 
-    def exploration_candidate_items(self, character_id: str = "big_fish", limit: int = 8) -> list[dict[str, str]]:
-        """Return attributable stable interests, unfinished questions, and planned goals."""
+    def exploration_candidate_items(self, character_id: str = "big_fish", limit: int = 8) -> list[dict]:
+        """Return deduplicated exploration themes with their life/research basis."""
         with self.database.connection() as db:
             rows = db.execute(
-                "SELECT DISTINCT p.event_type FROM life_preferences p "
+                "SELECT p.event_type, MAX(p.weight) AS weight FROM life_preferences p "
                 "JOIN life_preference_changes c ON c.character_id=p.character_id AND c.event_type=p.event_type "
                 "WHERE p.character_id=? AND c.reason IN ('completed_feeling','explicit_preference') "
-                "ORDER BY p.event_type LIMIT ?", (character_id, max(1, min(limit, 12))),
+                "GROUP BY p.event_type ORDER BY weight DESC,p.event_type LIMIT ?", (character_id, max(1, min(limit, 12))),
             ).fetchall()
-            candidates = [{"topic": str(row["event_type"]), "basis": "stable_interest"} for row in rows]
+            candidates = []
+            from .life_engine import ACTIVITIES
+            for row in rows:
+                changes = db.execute(
+                    "SELECT c.id,c.event_id,e.content,c.changed_at FROM life_preference_changes c "
+                    "LEFT JOIN life_events e ON e.id=c.event_id AND e.character_id=c.character_id "
+                    "WHERE c.character_id=? AND c.event_type=? AND c.reason IN ('completed_feeling','explicit_preference') "
+                    "ORDER BY c.changed_at DESC,c.id DESC LIMIT 3", (character_id, row["event_type"]),
+                ).fetchall()
+                candidates.append({
+                    "topic": str(row["event_type"]), "basis": "stable_interest",
+                    "basis_detail": {
+                        "source": "life_preference_history",
+                        "subject": ACTIVITIES.get(str(row["event_type"]), (str(row["event_type"]),))[0],
+                        "change_ids": [item["id"] for item in changes],
+                        "event_ids": list(dict.fromkeys(item["event_id"] for item in changes if item["event_id"])),
+                        "experience_summaries": [" ".join(str(item["content"] or "").split())[:240]
+                                                  for item in changes if item["content"]],
+                    },
+                })
             goals = db.execute(
                 "SELECT content FROM life_events WHERE character_id=? AND event_type='goal' "
                 "AND status IN ('completed','planned') ORDER BY created_at DESC LIMIT ?",
                 (character_id, max(1, min(limit, 8))),
             ).fetchall()
-            candidates.extend({"topic": "目标：" + " ".join(str(row["content"]).split())[:160], "basis": "planned_goal"} for row in goals)
+            candidates.extend({"topic": "目标：" + " ".join(str(row["content"]).split())[:160], "basis": "planned_goal",
+                               "basis_detail": {"source": "life_goal", "content": " ".join(str(row["content"]).split())[:240]}}
+                              for row in goals)
             open_runs = db.execute(
-                "SELECT requested_topic,selected_topic,unanswered_json,status,error_code FROM exploration_runs "
+                "SELECT id,requested_topic,selected_topic,unanswered_json,status,error_code FROM exploration_runs "
                 "WHERE character_id=? AND (error_code='insufficient_evidence' OR (status='completed' AND unanswered_json IS NOT NULL)) "
                 "ORDER BY updated_at DESC LIMIT 8", (character_id,),
             ).fetchall()
             import json
+            unresolved_count = 0
             for run in open_runs:
                 topic = run["selected_topic"] or run["requested_topic"]
                 if not topic:
@@ -455,9 +477,76 @@ class LifeRepository:
                 questions = json.loads(run["unanswered_json"] or "[]")
                 if not questions and run["error_code"] == "insufficient_evidence":
                     questions = [topic]
-                candidates.extend({"topic": "继续查清：" + " ".join(str(question).split())[:200], "basis": "unresolved_question"}
-                                  for question in questions if isinstance(question, str) and question.strip())
+                for question in questions:
+                    if unresolved_count >= 2:
+                        break
+                    if isinstance(question, str) and question.strip():
+                        candidates.append({"topic": "继续查清：" + " ".join(question.split())[:200],
+                                           "basis": "unresolved_question",
+                                           "basis_detail": {"source": "unresolved_exploration", "run_id": run["id"],
+                                                            "prior_topic": topic}})
+                        unresolved_count += 1
+
+            # Sourced conclusions from completed runs can seed a genuinely new,
+            # follow-up question. The exact claim and its readable evidence IDs
+            # travel with the candidate instead of becoming unattributed lore.
+            completed = db.execute(
+                "SELECT id,selected_topic,requested_topic,claims_json FROM exploration_runs "
+                "WHERE character_id=? AND status='completed' ORDER BY ended_at DESC LIMIT 12", (character_id,),
+            ).fetchall()
+            import json
+            research_count = 0
+            for run in completed:
+                if research_count >= min(3, limit):
+                    break
+                topic = run["selected_topic"] or run["requested_topic"]
+                if not topic:
+                    continue
+                try:
+                    claims = json.loads(run["claims_json"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    claims = []
+                for claim in claims:
+                    if not isinstance(claim, dict) or claim.get("kind") != "sourced":
+                        continue
+                    source_ids = claim.get("source_ids")
+                    if not isinstance(source_ids, list) or not source_ids:
+                        continue
+                    placeholders = ",".join("?" for _ in source_ids)
+                    valid = db.execute(
+                        f"SELECT id FROM exploration_evidence WHERE run_id=? AND character_id=? AND tool_name='read_webpage' "
+                        f"AND outcome='success' AND page_relevance='relevant' AND id IN ({placeholders}) ORDER BY sequence_no",
+                        (run["id"], character_id, *source_ids),
+                    ).fetchall()
+                    if not valid:
+                        continue
+                    candidates.append({
+                        "topic": str(topic), "basis": "completed_research",
+                        "basis_detail": {"source": "verified_exploration_claim", "run_id": run["id"],
+                                         "claim": " ".join(str(claim.get("text", "")).split())[:500],
+                                         "evidence_ids": [item["id"] for item in valid]},
+                    })
+                    research_count += 1
+                    if research_count >= min(3, limit):
+                        break
+
+            # De-duplicate equivalent display strings without losing the first
+            # candidate's strongest/most direct provenance.
+            import re
             unique = {}
             for item in candidates:
-                unique.setdefault(item["topic"], item)
-            return list(unique.values())[:limit]
+                key = re.sub(r"[^\w\u3400-\u9fff]+", "", item["topic"].casefold())
+                if key:
+                    existing = unique.get(key)
+                    if existing is None:
+                        unique[key] = item
+                    elif item["basis"] == "completed_research":
+                        item["basis_detail"]["related_basis"] = {
+                            "basis": existing["basis"],
+                            "detail": existing.get("basis_detail", {}),
+                        }
+                        unique[key] = item
+            priority = {"completed_research": 0, "unresolved_question": 1,
+                        "stable_interest": 2, "planned_goal": 3}
+            ranked = sorted(unique.values(), key=lambda item: priority.get(item["basis"], 9))
+            return ranked[:limit]
