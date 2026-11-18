@@ -2,137 +2,78 @@
 
 # Soulseed
 
-**A future where everyone can create a digital individual of their own—one that keeps growing.**
+**A future where everyone can create a digital individual who keeps growing.**
 
-**A World for Every Individual.** The [product vision and decision record](docs/product_vision.md) preserves the confirmed long-term direction.
+*A World for Every Individual.*
 
-[![Development](https://img.shields.io/badge/status-2.8.0%20development-476b85)](CHANGELOG.md)
-[![Local first](https://img.shields.io/badge/runtime-local%20first-527d70)](docs/setup_EN.md)
+**Current version: v2.9.1-beta.13 · Private Windows beta.** Soulseed is a local, single-user prototype in active development. The [product vision and decision record](docs/product_vision.md) describes the long-term direction.
 
-Soulseed is a platform for different digital individuals. Its long-term direction includes stable personality, memory, independent judgment, autonomous behavior, and continued growth, with distinctive relationships and interaction habits emerging over time. Character creation, interaction among multiple individuals, and a continuously unfolding digital world are future directions, not capabilities delivered by the current application.
+## What is Soulseed?
 
-**Da Feiyu (大肥鱼, “Big Fish”) is the first validation character.** The current application is a local, single-user prototype centered on her. Character creation, character selection, and a multi-user service are future work.
+Soulseed treats conversation as one part of a digital individual's life. A character can remember information with sources, develop interests and habits through experience, form a view, and revise it when new evidence appears. Records distinguish completed virtual life activities, plans, wishes, and interrupted work. Web research is backed by separate source evidence.
 
-[Capabilities](#capabilities-and-status) · [Architecture](#architecture) · [Get started](#get-started) · [Roadmap](#roadmap-and-limitations) · [Development history](CHANGELOG.md)
+## Core capabilities
 
-## From conversation to a continuing individual
-
-Soulseed treats a conversation as one part of a character's ongoing history. Its distinction from a general-purpose assistant lies in the system's goals and the records behind its behavior:
-
-| Focus | Soulseed's approach |
+| Area | Implemented |
 | --- | --- |
-| Identity | Preserve personality and expression boundaries across conversations. The current persona implementation validates Da Feiyu. |
-| Memory | Store structured memories with sources, lifecycle states, and an auditable correction process. |
-| Experience | Distinguish completed actions, plans, wishes, imagined activities, and interrupted tasks. |
-| Agency | Let a bounded Agent select a supported topic, use approved tools, and retain evidence of what it actually did. |
-| Relationship | Share worthwhile discoveries through contact permissions, quiet hours, frequency limits, and confirmed in-app delivery. |
+| Persona and conversation | A defined persona, bounded context, synchronous and asynchronous chat, and an OpenAI Chat Completions compatible adapter. Windows chat output is capped at 1024 tokens. |
+| Long-term memory | Structured memories with sources, rule-based retrieval, conflict detection, clarification, confirmed corrections, and change history. |
+| Autonomous life and growth | Activity planning, lifecycle, and state. Repeated experiences shape interests, and activities repeated across dates can form time-of-day habits. Both can influence activity choices and expression. |
+| Independent opinions | The character can disagree with the user, carry views across conversations, and revise them using completed experiences or sourced research. Revisions retain their history and basis. |
+| Autonomous exploration | A bounded agent can search, read real webpages, check their relevance, and save cited findings. It can derive new questions from saved experiences, interests, and findings, with a record of their source. |
+| Exploration reliability | Conservative deduplication detects clear rewrites and keeps distinct questions on the same topic. Interrupted work retains its question, evidence, and request records and can be retried explicitly. Windows manual exploration and retries use strict request limits. |
+| Autonomous contact | Recent conversations, saved life state, or shareable findings can create contact candidates. The character can choose silence. Approved messages go to an existing conversation, with native Windows notifications while the window is in the background. |
+| Local Windows app | Tauri stores app data per Windows account, protects model configuration with DPAPI, and offers daily request limits and controls for autonomous features. |
 
-Growth is a direction supported by these foundations. The current rule-based preference updates are an early mechanism, not a complete personality or growth engine.
+## Da Feiyu
 
-## Capabilities and status
+Da Feiyu (大肥鱼, “Big Fish”) is the first digital individual. She is playful, lively, curious, and childlike. Her [persona profile](backend/app/persona_profile.md) and [review scenarios](docs/persona_test_cases.md) guide checks of character continuity across conversations and experiences.
 
-**2.8.0 is in development.** Implementation, isolated automated tests, and live acceptance are separate milestones. Status reviewed on 2026-11-09.
+## Run and install
 
-| Area | Implemented | Verification and boundaries |
-| --- | --- | --- |
-| Chat and model integration | `ChatService`, an OpenAI-compatible adapter, bounded context assembly, timeouts, and request diagnostics | Automated coverage; the default configured provider is SiliconFlow. Streaming is not implemented. |
-| Long-term memory and correction | Structured storage, conservative extraction, deterministic retrieval, correction proposals, clarification, atomic application, sources, and audit history | Isolated regression coverage. Extraction and retrieval use rules; semantic/vector retrieval is not implemented. |
-| Personality and early growth | Persona profile, `ExpressionContext`, experience/preference boundaries, and limited updates from completed activities | Validated with the first character; general character authoring and a complete growth engine remain future work. |
-| **2.8.0-A · Exploration** | Bounded model decisions, real search, safe webpage reading, relevance checks, source-backed claims, and persistent execution records | **First live manual success confirmed:** “Why do whales need to sing?” Read *Whale vocalization*, produced three sourced claims with scientific uncertainty, and completed in about 33 seconds with two model decisions. This is one successful case, not broad topic validation. |
-| **2.8.0-B · Background exploration** | Opt-in scheduling through `LifeScheduler`, saved-topic candidates, 24/48/168-hour intervals, pause/cooldown, quotas, and restart recovery | Isolated acceptance passed, followed by one successful unattended live run. Its topic came from a saved unresolved question; independently generating a new interest remains unverified. |
-| **2.8.0-C · Discovery sharing** | Worthwhile-result selection, character-scoped sources, deduplication, contact rules, and pending → ready → delivered → read handling | Live delivery and a source follow-up were verified for the manual research result; its read status remains unconfirmed. The new autonomous run's share and contact intents remain pending, and message generation and delivery are not yet verified. |
-| **2.8.0-D · Exploration quota** | Separate UTC daily request reservations, quota snapshots, prechecks, and distinct provider/network errors | Isolated coverage. The default exploration limit is eight reservations per UTC day; it is not a monetary spending cap. |
-| Ownership and isolation | Local pairing sessions, character-scoped repositories, and database constraints against cross-character references | Isolated coverage. Fixed Development mode is limited to one local user and `big_fish`; this is not a multi-user deployment system. |
+Windows 10/11 x64 is the primary client. The installer is distributed privately and is currently unsigned. Verify the accompanying SHA256 and follow the [Windows installation and model setup guide](docs/windows-install.md) for installation or upgrade. To build from source, see the [Windows build guide](docs/windows-build.md).
 
-The B/C fixes and supplementary tests have been archived. Model-based contact generation is opt-in; the local safe generator keeps research shares pending. The [changelog](CHANGELOG.md) preserves historical checkpoints and their evidence.
-
-## Architecture
-
-```mermaid
-flowchart TB
-    UI["React + TypeScript · Web UI"] --> API["FastAPI · Authorization and character scope"]
-    API --> Chat["ChatService · ExpressionContext"]
-    API --> Life["LifeEngine · LifeScheduler"]
-    Chat --> Model["ModelAdapter"]
-    Chat --> Memory["Memory and correction"]
-    Life --> Agent["ExplorationAgent"]
-    Agent --> Tools["Search providers · Safe webpage reader"]
-    Agent -. "bounded decisions" .-> Model
-    Life --> Contact["LifeShareService · ContactService"]
-    Memory --> DB[(SQLite · Sources and audit)]
-    Agent --> DB
-    Contact --> DB
-```
-
-The server validates model-proposed actions and tool arguments. Persistence stays in services and repositories. Web content is untrusted input; public-target validation, DNS/redirect checks, TLS verification, and size/time bounds constrain access. Rule-generated virtual activities do not count as evidence of real web exploration.
-
-**Stack:** Python 3.11+, FastAPI, Pydantic, HTTPX, SQLite, React, TypeScript, and Vite. Automated checks use pytest, fake models/controlled tools, and Node's test runner.
-
-## Get started
-
-The primary development workflow is Windows PowerShell. Use Python 3.11+, Node.js 20+ with npm, and a configured model provider. Frontend tests import TypeScript directly and require Node.js 22.18+ or 24+; see the [setup guide](docs/setup_EN.md).
-
-```powershell
-git clone https://github.com/KaoruMiyagawa/Soulseed.git
-Set-Location Soulseed
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
-npm --prefix frontend install
-```
-
-Preserve any existing `.env` instead of copying over it. Set `SOULSEED_MODEL_API_KEY` in that ignored file, then start in model-disabled mode to inspect the application:
+The browser is primarily a local development, debugging, and compatibility client. Install dependencies using the [setup guide](docs/setup_EN.md), then launch with the model disabled. See [Development runtime](docs/development_runtime.md) for configuration requirements.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start-development.ps1 --model-off
 ```
 
-Open **[127.0.0.1:5174](http://127.0.0.1:5174/)**; the API runs on **[127.0.0.1:8001](http://127.0.0.1:8001/api/health)**. This launcher uses a persistent Development database, requires a configured key even with `--model-off`, and makes no model request at startup. Omit `--model-off` to enable model use; provider charges may apply. Background exploration starts disabled.
+## Architecture
 
-For configuration, pairing mode, backup/migration protection, frontend tests, and troubleshooting, use the **[setup and operations guide](docs/setup_EN.md)**. The launcher’s exact behavior is documented in [Development runtime](docs/development_runtime.md).
+**One digital individual core, multiple clients.** The Windows Tauri window and browser share the React/TypeScript interface and local FastAPI character core. Future WeChat and QQ clients should use the same core. Those channels are planned.
+
+- `ChatService` uses `ExpressionContext` to assemble persona, memory, experiences, interests, habits, and opinions. Chat and autonomous contact share character data and expression rules.
+- `LifeEngine` selects activities from saved state. `LifeScheduler` advances life and runs the optional background exploration schedule. Interests and habits use existing life records. Completing a research run does not directly raise interest weights.
+- `ExplorationAgent` searches, reads, and checks evidence under tool and model limits. Qualified findings can support opinion revisions, follow-up questions, and discovery sharing. Contact uses shared candidate, review, budget, and delivery logic. Windows adds the native notification adapter.
+- SQLite stores conversations, memories, life records, opinions, research evidence, and the request ledger. The backend uses Python, FastAPI, and HTTPX. The interface uses React, TypeScript, and Vite.
+
+## Verification and limitations
+
+| Level | Evidence |
+| --- | --- |
+| Automated tests | Isolated beta.13 tests cover question provenance, deduplication, recovery, and quotas, with regressions for chat, memory, life growth, habits, opinions, and autonomous contact. |
+| Windows with simulations | beta.13 was installed over beta.12 with user data verified. Exploration, chat, and opinion continuity were exercised with isolated data and local mocks, including simulated webpages. Native notifications were checked separately with an injected test event. Earlier Windows betas recorded simulated autonomous contact and delivery to the original conversation. |
+| Live models and network | Earlier versions recorded a small number of successful live manual and background research runs, including whale vocalization. See the [technical changelog](CHANGELOG.md). The beta.13 question selection, deduplication, and retry changes have yet to be revalidated with a live provider and real webpages. |
+| Current boundaries | Deduplication may miss cross-language equivalence or substantial rewordings. Retrying creates a linked run that uses the current quota. Quotas count requests. Providers determine actual charges. Background behavior requires the app to be running and the relevant controls enabled. |
+
+## Roadmap
+
+- Improve memory accuracy, retrieval, and conflict handling.
+- Develop traceable long-term relationship growth that can adapt over time.
+- Improve question selection, source quality, deduplication, and exploration failure handling.
+- Validate long-running operation, recovery, and expression quality with live models.
+- Immersive digital worlds, external messaging channels, and a multi-character system are long-term directions. The 2.5D world is outside the current development scope.
+
+## Development and contributions
+
+Reproducible bug reports and focused changes are welcome. [Issues](https://github.com/KaoruMiyagawa/Soulseed/issues)
 
 ```powershell
-# Isolated backend regression; temporary databases and controlled model/tool results
 .\.venv\Scripts\python.exe backend\scripts\run_isolated.py tests
-
-# TypeScript checking and production frontend build
-npm --prefix frontend run build
+npm --prefix frontend test
 ```
 
-## Project layout
+Use an isolated database and report whether verification used a mock or a live provider. Keep credentials, user data, logs, backups, build outputs, and unapproved assets out of the repository.
 
-```text
-backend/
-  app/          Chat, persona, memory, life, exploration, contact, and repositories
-    memory/     Extraction, retrieval, proposals, correction, and clarification
-  scripts/      Development and isolated-test launchers
-  tests/        Temporary-database regressions and controlled fixtures
-frontend/
-  src/          React UI and request/delivery handling
-  tests/        Transport, quota, and proactive-delivery tests
-docs/           Setup, runtime, ownership, and diagnostics
-CHANGELOG.md    Detailed technical history and verification boundaries
-```
-
-## Roadmap and limitations
-
-- **Next validation:** message generation and delivery for autonomous discoveries, independently generated new interests, and a wider range of search topics and failure conditions.
-- **Character creation:** configurable character profiles, creation/selection interfaces, and character asset management.
-- **Growth:** richer interests, habits, and development that remain attributable, correctable, and capable of change.
-- **Later infrastructure:** broader identity providers and multi-user authorization, additional interaction channels, streaming, and improved retrieval.
-
-The current system runs locally with one backend process per SQLite database. It does not support public multi-user hosting, shared multi-worker databases, or external push notifications. Background activity requires a running backend. Search availability and relevance vary by network and provider; successful page retrieval alone cannot complete a research task. Model-context token counts are conservative estimates rather than the provider's tokenizer.
-
-## Da Feiyu: the first validation character
-
-Da Feiyu is playful, lively, curious, and childlike. She gives the project a concrete way to evaluate personality continuity, memory correction, honest accounts of experience, exploration, and sharing. Her persona and artwork support that validation; Soulseed's long-term scope includes many different individuals.
-
-See the [current persona profile](backend/app/persona_profile.md) and [manual review scenarios](docs/persona_test_cases.md), both currently in Chinese.
-
-## Contributing
-
-Soulseed is an evolving MVP. Focused bug reports, reproducible cases, documentation improvements, and small, well-scoped changes are welcome through [Issues](https://github.com/KaoruMiyagawa/Soulseed/issues) and pull requests. Describe what was observed, what was expected, and whether verification used fake models or a live provider.
-
-Use isolated databases for tests. Keep credentials, conversations, databases, SQLite sidecars, logs, backups, and unapproved assets out of contributions. Discuss changes to ownership, migrations, memory semantics, or background model spending before implementation.
-
-Further reading: [setup](docs/setup_EN.md) · [runtime](docs/development_runtime.md) · [ownership and local authentication](docs/ownership_and_local_auth.md) (Chinese) · [exploration diagnostics](docs/exploration_action_diagnostics.md) · [changelog](CHANGELOG.md) (Chinese).
+Further reading: [life and growth](docs/life_growth.md) · [opinion continuity](docs/opinion_continuity.md) · [autonomous contact](docs/autonomous_social.md) · [exploration diagnostics](docs/exploration_action_diagnostics.md) · [changelog](CHANGELOG.md). Some project documentation is in Chinese.
