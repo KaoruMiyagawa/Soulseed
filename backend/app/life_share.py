@@ -9,6 +9,7 @@ from html import escape
 from uuid import uuid4
 
 from .life import LifeRepository, _iso
+from .life_feelings import SHARE_POSITIVE_TERMS, classify_feeling
 
 
 class LifeShareService:
@@ -48,7 +49,7 @@ class LifeShareService:
                 row = db.execute("SELECT i.*, e.content AS event_content, e.occurred_at FROM life_share_intents i JOIN life_events e ON e.id = i.event_id AND e.character_id=i.character_id WHERE i.event_id = ?", (event_id,)).fetchone()
                 return dict(row) if row else None
             feeling = event["feeling"] or ""
-            positive = any(word in feeling for word in ("开心", "喜欢", "有趣", "惊喜", "满足")) and "不开心" not in feeling
+            positive = classify_feeling(feeling, positive_terms=SHARE_POSITIVE_TERMS) == "positive"
             kind = event["event_type"]
             pref = db.execute("SELECT weight FROM life_preferences WHERE character_id = ? AND event_type = ?", (event["character_id"], kind)).fetchone()
             liked = bool(pref and pref[0] >= 1.25)

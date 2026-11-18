@@ -6,6 +6,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta, tzinfo
 
 from .life import LifeRepository, _iso
+from .life_feelings import classify_feeling
 from .life_habits import local_period
 from .life_share import LifeShareService
 
@@ -56,7 +57,8 @@ class LifeEngine:
         kind, feeling = event["event_type"], (event["feeling"] or "")
         if kind not in ACTIVITIES:
             return
-        step = -0.03 if any(word in feeling for word in ("难过", "讨厌", "疲惫", "不开心")) else 0.03 if any(word in feeling for word in ("开心", "喜欢", "愉快", "满足")) else 0
+        signal = classify_feeling(feeling)
+        step = 0.03 if signal == "positive" else -0.03 if signal == "negative" else 0
         if not step:
             return
         self.preferences(event["character_id"], now=now)
